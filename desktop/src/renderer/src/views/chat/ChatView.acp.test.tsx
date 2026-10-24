@@ -151,7 +151,22 @@ describe('ACP session bar', () => {
     expect(screen.getByRole('textbox')).not.toBeDisabled()
   })
 
+  it('shows a finished oneshot as Ended, with no End session, and keeps it resumable', async () => {
+    mount()
+    const bar = await screen.findByTestId('acp-bar')
+    expect(bar).toHaveAttribute('data-state', 'idle')
+    expect(bar).toHaveAttribute('data-ended', 'true')
+    expect(within(bar).getByRole('status')).toHaveTextContent(
+      'EndedYour next message resumes Claude Code',
+    )
+    expect(within(bar).queryByRole('button')).toBeNull()
+    // Ended reads as done, but the composer still sends: the next message resumes it.
+    expect(screen.getByRole('textbox')).not.toBeDisabled()
+    expect(screen.queryByRole('note')).toBeNull()
+  })
+
   it('shows Idle with what the next message does, and ends the session after an inline confirm', async () => {
+    status = { ...base, mode: 'persistent' }
     mount()
     const bar = await screen.findByTestId('acp-bar')
     expect(bar).toHaveAttribute('data-state', 'idle')
@@ -170,7 +185,7 @@ describe('ACP session bar', () => {
     expect(within(bar).queryByRole('group', { name: 'End session' })).toBeNull()
 
     fireEvent.click(within(bar).getByRole('button', { name: 'End session' }))
-    status = { ...base, closed: true, idle: false }
+    status = { ...base, mode: 'persistent', closed: true, idle: false }
     await act(async () => {
       fireEvent.click(
         within(within(bar).getByRole('group', { name: 'End session' })).getByRole('button', {
@@ -209,7 +224,7 @@ describe('ACP session bar', () => {
     expect(detail).toHaveTextContent('Stopped by you')
     expect(detail).not.toHaveAttribute('data-tone')
     const tip = bar.querySelector('.acp-bar__status')!.getAttribute('title') || ''
-    expect(tip).toBe('Idle · Stopped by you')
+    expect(tip).toBe('Ended · Stopped by you')
     expect(bar.textContent).not.toMatch(/failed|do not retry/i)
   })
 

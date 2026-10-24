@@ -67,11 +67,21 @@ function detailFor(view: AcpSessionView): Detail {
 }
 
 /**
+ * A `oneshot` session whose turn finished: its harness process is gone, so
+ * the bar reads Ended and offers no End session, yet the session stays
+ * resumable (`origin.idle`) and the next message spawns the harness again.
+ */
+export function isEndedOneshot(view: AcpSessionView): boolean {
+  return view.state === 'idle' && str(view.info?.mode) === 'oneshot' && view.info?.idle === true
+}
+
+/**
  * The bar over a coding harness's own chat (`agent:<agent>:acp:<id>`): which
  * harness, where it works, how it runs, and what it is doing now — Working
- * with its live step, Idle (the next message resumes it) or Closed. Stop
- * cancels the running turn (`acp.cancel`); End session closes the harness for
- * good (`acp.close`) after an inline confirm, never a native dialog.
+ * with its live step, Idle (the next message resumes it), Ended (a finished
+ * oneshot; the next message resumes it too) or Closed. Stop cancels the
+ * running turn (`acp.cancel`); End session closes the harness for good
+ * (`acp.close`) after an inline confirm, never a native dialog.
  */
 export function AcpSessionBar({ view }: { view: AcpSessionView }) {
   const [confirming, setConfirming] = useState(false)
@@ -80,6 +90,7 @@ export function AcpSessionBar({ view }: { view: AcpSessionView }) {
   const { info, name, state, startedAt } = view
   const working = state === 'working'
   const closed = state === 'closed'
+  const ended = isEndedOneshot(view)
 
   // The elapsed clock ticks only while a turn runs.
   useEffect(() => {
@@ -107,7 +118,13 @@ export function AcpSessionBar({ view }: { view: AcpSessionView }) {
   const mode = str(info?.mode)
   const harnessMode = str(info?.harness_mode) || str(info?.current_mode_id)
   const detail = detailFor(view)
-  const label = closed ? t('acp.bar.closed') : working ? t('acp.bar.working') : t('acp.bar.idle')
+  const label = closed
+    ? t('acp.bar.closed')
+    : working
+      ? t('acp.bar.working')
+      : ended
+        ? t('acp.bar.ended')
+        : t('acp.bar.idle')
   const elapsed =
     working && startedAt !== null ? formatElapsedClock((clock - startedAt) / 1000) : null
   const noteText =
@@ -124,6 +141,7 @@ export function AcpSessionBar({ view }: { view: AcpSessionView }) {
       <section
         className="acp-bar"
         data-state={state}
+        data-ended={ended || undefined}
         data-acp-agent={agentId}
         data-enter="true"
         aria-label={t('acp.bar.label')}
@@ -161,7 +179,7 @@ export function AcpSessionBar({ view }: { view: AcpSessionView }) {
           </div>
         ) : null}
 
-        {confirming && !closed ? (
+        {confirming && !closed && !ended ? (
           <div className="acp-bar__confirm" role="group" aria-label={t('acp.bar.end')}>
             <span className="acp-bar__confirm-text">
               {t('acp.bar.confirm').replace('{name}', name)}
@@ -219,7 +237,7 @@ export function AcpSessionBar({ view }: { view: AcpSessionView }) {
                 {noteText}
               </span>
             ) : null}
-            {!closed ? (
+            {!closed && !ended ? (
               <div className="acp-bar__actions">
                 {working ? (
                   <button
