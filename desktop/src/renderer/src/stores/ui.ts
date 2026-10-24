@@ -93,6 +93,8 @@ interface UiStore {
   requestComposerFocus(): void
   toggleFolder(id: string): void
   setFolderOpen(id: string, open: boolean): void
+  /** Replace the open set wholesale: the Projects header's collapse / expand all. */
+  setOpenFolders(ids: Iterable<string>): void
   startCreatingProject(): void
   stopCreatingProject(): void
 }
@@ -159,6 +161,11 @@ export const useUi = create<UiStore>((set) => ({
       saveOpenFolders(next)
       return { openFolders: next }
     }),
+  setOpenFolders: (ids) => {
+    const next = new Set(ids)
+    saveOpenFolders(next)
+    set({ openFolders: next })
+  },
   startCreatingProject: () => set({ creatingProject: true, sidebarOpen: true }),
   stopCreatingProject: () => set({ creatingProject: false }),
 }))
