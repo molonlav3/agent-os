@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- Desktop app: a finished `oneshot` coding-agent session (Claude Code, Codex,
+  Gemini) now reads Ended in its session bar, with no End session button to
+  click. It still resumes: the next message spawns the harness again.
+
 ## [2026.10.23] - 2026-10-23
 
 ### Added

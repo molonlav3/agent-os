@@ -1023,6 +1023,13 @@ html[data-transparency='reduced'] .acp-bar {
 .acp-bar[data-state='closed'] .acp-bar__state {
   color: var(--muted-foreground);
 }
+/* A finished oneshot reads as Ended (dim dot, muted word) though it resumes. */
+.acp-bar[data-ended] .acp-bar__dot {
+  background: var(--dim);
+}
+.acp-bar[data-ended] .acp-bar__state {
+  color: var(--muted-foreground);
+}
 /* What the harness does, or what comes next, on one clipped line. It adds no
    width of its own (inline-size containment) and takes what the row has
    left, so it never squeezes the chips or the buttons:
