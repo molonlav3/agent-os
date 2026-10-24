@@ -333,3 +333,59 @@ describe('ProjectFolders: the "+" on a folder row', () => {
     expect(screen.queryByRole('button', { name: 'New chat in Roadmap' })).toBeNull()
   })
 })
+
+describe('ProjectFolders: collapse / expand all', () => {
+  const SECOND: RawProject = { ...PROJECT, project_id: 'p2', name: 'Launch' }
+
+  function mountTwo(projects: RawProject[] = [PROJECT, SECOND]) {
+    render(
+      <MemoryRouter>
+        <QueryClientProvider client={new QueryClient()}>
+          <ProjectFolders
+            projects={projects}
+            filed={{ byProject: new Map(), unfiled: [] }}
+            loading={false}
+          />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    )
+  }
+
+  it('folds every open folder shut, then opens them all again', () => {
+    useUi.setState({ openFolders: new Set(['p1']) })
+    mountTwo()
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse all projects' }))
+    expect(useUi.getState().openFolders.size).toBe(0)
+    expect(screen.getAllByRole('button', { name: 'Show chats' })).toHaveLength(2)
+    fireEvent.click(screen.getByRole('button', { name: 'Expand all projects' }))
+    expect([...useUi.getState().openFolders].sort()).toEqual(['p1', 'p2'])
+    expect(screen.getByRole('button', { name: 'Collapse all projects' })).toBeInTheDocument()
+  })
+
+  it('offers expand when every folder is shut', () => {
+    mountTwo()
+    expect(screen.getByRole('button', { name: 'Expand all projects' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Collapse all projects' })).toBeNull()
+  })
+
+  it('ignores an open id left over from a deleted project', () => {
+    useUi.setState({ openFolders: new Set(['gone']) })
+    mountTwo()
+    expect(screen.getByRole('button', { name: 'Expand all projects' })).toBeInTheDocument()
+  })
+
+  it('remembers the result across a relaunch', () => {
+    mountTwo()
+    fireEvent.click(screen.getByRole('button', { name: 'Expand all projects' }))
+    expect(JSON.parse(localStorage.getItem('agentos-desktop.openFolders') ?? '[]').sort()).toEqual([
+      'p1',
+      'p2',
+    ])
+  })
+
+  it('is not there without projects', () => {
+    mountTwo([])
+    expect(screen.queryByRole('button', { name: /all projects/ })).toBeNull()
+    expect(screen.getByRole('button', { name: 'New project' })).toBeInTheDocument()
+  })
+})

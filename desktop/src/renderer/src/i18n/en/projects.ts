@@ -2,6 +2,8 @@
 export const projects = {
   'projects.section': 'Projects',
   'projects.new': 'New project',
+  'projects.collapseAll': 'Collapse all projects',
+  'projects.expandAll': 'Expand all projects',
   'projects.new.placeholder': 'Project name',
   'projects.new.agent': 'Agent',
   'projects.new.hint': 'Return to create, Esc to cancel',

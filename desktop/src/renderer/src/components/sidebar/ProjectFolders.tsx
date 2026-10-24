@@ -1,7 +1,16 @@
 import '~/views/projects/projects.css'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { ChevronRight, Folder, MessageSquarePlus, Pencil, Plus, Trash2 } from 'lucide-react'
+import {
+  ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  Folder,
+  MessageSquarePlus,
+  Pencil,
+  Plus,
+  Trash2,
+} from 'lucide-react'
 import { useCallback, useEffect, useRef, useState, type DragEvent, type KeyboardEvent } from 'react'
 import { NavLink, useNavigate } from 'react-router'
 import { toast } from 'sonner'
@@ -32,7 +41,8 @@ function hasSessionDrag(e: DragEvent): boolean {
  * notes: a disclosure per project with that project's chats inside, a "+"
  * that opens an inline name row (no dialog), every folder a drop target for
  * a session dragged from anywhere in the sidebar, and a context menu on each
- * folder with what the project's page offers.
+ * folder with what the project's page offers. Beside the "+", one button
+ * folds every folder shut, or opens them all when none is open.
  */
 export function ProjectFolders({
   projects,
@@ -45,21 +55,38 @@ export function ProjectFolders({
 }) {
   const creating = useUi((s) => s.creatingProject)
   const startCreating = useUi((s) => s.startCreatingProject)
+  const anyOpen = useUi((s) => projects.some((p) => s.openFolders.has(projectId(p))))
+  const setOpenFolders = useUi((s) => s.setOpenFolders)
   const showHint = !loading && !creating && projects.length === 0
+  const foldLabel = anyOpen ? t('projects.collapseAll') : t('projects.expandAll')
+  const FoldIcon = anyOpen ? ChevronsDownUp : ChevronsUpDown
 
   return (
     <div className="proj-folders">
       <div className="mac-section flex items-center justify-between">
         <span>{t('projects.section')}</span>
-        <button
-          type="button"
-          className="proj-folders__add app-no-drag"
-          aria-label={t('projects.new')}
-          title={t('projects.new')}
-          onClick={startCreating}
-        >
-          <Plus className="size-3.5" strokeWidth={2} aria-hidden />
-        </button>
+        <div className="flex items-center gap-0.5">
+          {projects.length > 0 ? (
+            <button
+              type="button"
+              className="proj-folders__add app-no-drag"
+              aria-label={foldLabel}
+              title={foldLabel}
+              onClick={() => setOpenFolders(anyOpen ? [] : projects.map(projectId))}
+            >
+              <FoldIcon className="size-3.5" strokeWidth={2} aria-hidden />
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="proj-folders__add app-no-drag"
+            aria-label={t('projects.new')}
+            title={t('projects.new')}
+            onClick={startCreating}
+          >
+            <Plus className="size-3.5" strokeWidth={2} aria-hidden />
+          </button>
+        </div>
       </div>
       {creating ? <NewProjectRow /> : null}
       {loading ? (
