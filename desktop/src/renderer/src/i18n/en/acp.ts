@@ -4,6 +4,7 @@ export const acp = {
   'acp.bar.working': 'Working',
   'acp.bar.idle': 'Idle',
   'acp.bar.closed': 'Closed',
+  'acp.bar.ended': 'Ended',
   'acp.bar.starting': 'Starting {name}…',
   'acp.bar.busy': '{name} is working',
   'acp.bar.idleHint': 'Your next message resumes {name}',
