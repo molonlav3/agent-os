@@ -17,6 +17,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Gemini) now reads Ended in its session bar, with no End session button to
   click. It still resumes: the next message spawns the harness again.
 
+### Fixed
+- Desktop app: the gateway it starts now gets the login-shell directories
+  (`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`) on its PATH, not
+  the bare PATH macOS gives an app opened from Finder or the Dock. Coding
+  agents installed with Homebrew or npm, such as Codex, failed with
+  "needs codex on PATH" even though they were installed.
+
 ## [2026.10.23] - 2026-10-23
 
 ### Added

@@ -89,6 +89,26 @@ describe('GatewaySupervisor.adopt', () => {
   })
 })
 
+/** A spawn stand-in that records each call and hands back a quiet child. */
+function fakeSpawn() {
+  const spawnCalls: { command: string; args: string[]; env: NodeJS.ProcessEnv }[] = []
+  const spawn = vi.fn((command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
+    spawnCalls.push({ command, args, env: options.env })
+    const child = new EventEmitter() as EventEmitter & {
+      pid: number
+      stdout: PassThrough
+      stderr: PassThrough
+      kill: () => boolean
+    }
+    child.pid = 4242
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.kill = () => true
+    return child
+  })
+  return { spawn: spawn as unknown as typeof import('node:child_process').spawn, spawnCalls }
+}
+
 describe('GatewaySupervisor (spawn arguments)', () => {
   it('binds host and port on the command line and passes the token through AuthConfig env', async () => {
     const managed: GatewaySettings = {
@@ -98,21 +118,7 @@ describe('GatewaySupervisor (spawn arguments)', () => {
       token: 'secret',
       cliPath: '/opt/agentos',
     }
-    const spawnCalls: { command: string; args: string[]; env: NodeJS.ProcessEnv }[] = []
-    const spawn = vi.fn((command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
-      spawnCalls.push({ command, args, env: options.env })
-      const child = new EventEmitter() as EventEmitter & {
-        pid: number
-        stdout: PassThrough
-        stderr: PassThrough
-        kill: () => boolean
-      }
-      child.pid = 4242
-      child.stdout = new PassThrough()
-      child.stderr = new PassThrough()
-      child.kill = () => true
-      return child
-    })
+    const { spawn, spawnCalls } = fakeSpawn()
     let probes = 0
     const secretDir = mkdtempSync(path.join(os.tmpdir(), 'agentos-sup-'))
     let seenSecret: string | null = null
@@ -130,7 +136,7 @@ describe('GatewaySupervisor (spawn arguments)', () => {
       },
       locate: (override) => override,
       secretDir,
-      spawn: spawn as unknown as typeof import('node:child_process').spawn,
+      spawn,
     })
     const status = await sup.start()
     expect(status).toMatchObject({ state: 'running', pid: 4242, url: 'http://127.0.0.1:18999' })
@@ -158,6 +164,33 @@ describe('GatewaySupervisor (spawn arguments)', () => {
     // The old double-underscore names never reached the gateway's settings.
     expect(spawnCalls[0]?.env.AGENTOS_GATEWAY__PORT).toBeUndefined()
     expect(spawnCalls[0]?.env.AGENTOS_AUTH__TOKEN).toBeUndefined()
+  })
+
+  it('spawns the gateway with the login-shell dirs on PATH, not the bare GUI PATH', async () => {
+    // Finder/Dock launches get PATH=/usr/bin:/bin:/usr/sbin:/sbin; the gateway
+    // resolves ACP harness CLIs (codex, npx) with which() against this PATH.
+    vi.stubEnv('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')
+    const { spawn, spawnCalls } = fakeSpawn()
+    let probes = 0
+    const sup = new GatewaySupervisor(
+      () => ({ ...external, mode: 'managed', cliPath: '/opt/agentos' }),
+      {
+        probe: async () => probes++ > 0,
+        locate: (override) => override,
+        secretDir: mkdtempSync(path.join(os.tmpdir(), 'agentos-sup-')),
+        spawn,
+      },
+    )
+    try {
+      await sup.start()
+    } finally {
+      vi.unstubAllEnvs()
+    }
+    const entries = (spawnCalls[0]?.env.PATH ?? '').split(path.delimiter)
+    expect(entries.slice(0, 4)).toEqual(['/usr/bin', '/bin', '/usr/sbin', '/sbin'])
+    expect(entries).toContain('/opt/homebrew/bin')
+    expect(entries).toContain('/usr/local/bin')
+    expect(entries).toContain(path.join(os.homedir(), '.local', 'bin'))
   })
 
   it('has no operator secret to offer for an adopted or external gateway', async () => {

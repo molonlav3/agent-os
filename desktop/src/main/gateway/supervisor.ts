@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import type { GatewaySettings } from '@shared/settings'
 import { STOPPED_GATEWAY, type GatewayStatus } from '@shared/gateway'
+import { hardenedEnv } from '../updates/engine-updater'
 import { locateCli } from './cli-locator'
 
 type Listener = (status: GatewayStatus) => void
@@ -168,14 +169,16 @@ export class GatewaySupervisor {
     // Host and port go on the command line: `gateway run --bind/--port` beat
     // config.toml, whereas an environment variable loses to a `port =` line
     // the onboarding wrote (verified against GatewayConfig.load). The auth
-    // env names follow AuthConfig's prefix, `AGENTOS_AUTH_<FIELD>`.
+    // env names follow AuthConfig's prefix, `AGENTOS_AUTH_<FIELD>`. A GUI
+    // launch hands us a bare PATH; without the login-shell dirs the gateway's
+    // harness checks miss Homebrew/npm CLIs such as `codex` and `npx`.
     const secretFile = this.writeSecretFile()
     const child = this.spawn(
       cli,
       ['gateway', 'run', '--bind', cfg.host, '--port', String(cfg.port)],
       {
         env: {
-          ...process.env,
+          ...hardenedEnv(),
           ...(cfg.token ? { AGENTOS_AUTH_TOKEN: cfg.token, AGENTOS_AUTH_MODE: 'token' } : {}),
           ...(secretFile ? { AGENTOS_OPERATOR_SECRET_FILE: secretFile } : {}),
         },
