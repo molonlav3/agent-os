@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [2026.10.25] - 2026-10-25
+
 ### Added
 - Desktop app: a collapse / expand all button beside the "+" in the
   sidebar's Projects header. With any folder open it folds every project
