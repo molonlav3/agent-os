@@ -192,7 +192,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   ("Live · 12 s", "Snapshot · 3 min", "Unavailable"), and offer exactly one
   recovery action (Retry connection, Start gateway on the desktop, the
   attention inbox, or Health). It is derived from the connection's own
-  frames, a refused handshake, `doctor.status` and `/ready`, refreshed on
+  frames, the gateway's typed handshake refusal, an announced restart,
+  `doctor.status` and `/ready` (`state`, `failing`), refreshed on
   connect and the gateway's tick, with no polling timer of its own.
 - Web UI: an attention inbox (`g i`, with a nav count) listing approvals of
   every namespace, pending agent questions (`ask_user`) and typed runtime
@@ -205,12 +206,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `protocol_mismatch`, `model_auth_required`, `rate_limited`,
   `channel_terminal`, `safe_mode`, `update_failed`, `doctor_warning`) with
   fix steps in place and a per-session dismiss.
-- Web UI: cron job cards mark a failing job Degraded, with its failure
-  streak and last error, read from the `health` block when the gateway
-  sends one and otherwise from `consecutive_errors` and the last error
-  (today's payload). An overlap policy picker (`forbid`, `replace`,
-  `allow`) appears only when the job carries `concurrency`. The desktop's
-  job detail shows the Degraded chip too.
+- Web UI: cron job cards show a job's failure streak and last error, with a
+  Degraded badge once the engine marks it degraded (3 failures in a row),
+  from the `health` block on `cron.list`; an older gateway's
+  `consecutive_errors` and last error are read with the same threshold. An
+  overlap policy picker (`forbid`, `replace`, `allow`) appears when the job
+  carries `concurrency`. The desktop's job detail shows the Degraded chip
+  too.
 - A contract test (`tests/test_console_required_methods.py`) fails CI when
   the Web UI or the desktop app calls an RPC method the gateway does not
   advertise in `features.methods`.
@@ -287,13 +289,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   so the rest of the console, its keyboard shortcuts and the status bar's
   recovery action stay usable. A new approval brings the prompt back.
 
-### Fixed
-- Web UI and desktop app: a connection that goes silent (no frame for 2.5
-  tick intervals) is now dropped and reopened at once, instead of waiting
-  out the browser's close handshake, and "Retry connection" forces a new
-  socket when the current one still looks open but has gone silent. A
-  socket that drops during the handshake now reconnects by itself.
-
 ### Deprecated
 - `GET /api/v1/artifacts/{id}?sessionKey=` and
   `GET /api/v1/attachments/{sha256}?sessionKey=`: they keep working for this
@@ -301,6 +296,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   with `[artifacts] legacy_session_key_urls = false` (#3693).
 
 ### Fixed
+- Web UI and desktop app: a connection that goes silent (no frame for 2.5
+  tick intervals) is now dropped and reopened at once, instead of waiting
+  out the browser's close handshake, and "Retry connection" forces a new
+  socket when the current one still looks open but has gone silent.
 - Gateway: SIGTERM — what `agentos gateway stop`, the desktop app, launchd
   and systemd send — now runs the same orderly shutdown as Ctrl+C: turns get
   up to 30 s to finish, channels stop, clients receive the `shutdown` event,

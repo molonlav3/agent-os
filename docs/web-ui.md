@@ -122,9 +122,9 @@ and fresh". It shows one of six states and how fresh the view is:
 | State | Meaning |
 | --- | --- |
 | Ready | Connected, frames are arriving, and the doctor reports no error-level finding. |
-| Degraded | Connected, but a doctor finding is at error level, the gateway reports safe mode or draining, or no frame has arrived for 2.5 tick intervals (the view is a snapshot). |
-| Connecting | The WebSocket is opening, or the gateway says it is still starting. |
-| Blocked | The gateway refused the handshake: bad credentials or a different protocol version. The console does not retry these by itself. |
+| Degraded | Connected, but a doctor finding is at error level, `/ready` reports `safe_mode` or `draining`, or no frame has arrived for 2.5 tick intervals (the view is a snapshot). |
+| Connecting | The WebSocket is opening, `/ready` reports `starting`, or the gateway announced an in-place restart (`shutdown` with `restart_expected_ms`) and is on its way back. |
+| Blocked | The gateway refused the handshake, read from its typed error: bad credentials (`UNAUTHORIZED`), too many failed sign-ins (`AUTH_RATE_LIMITED`), or a different protocol version (`PROTOCOL_MISMATCH`; when the console is the older side, reloading the page fixes it). The console does not retry these by itself. |
 | Offline | No connection. What is on screen is the last snapshot. |
 | Unknown | Connected, but the doctor report has not arrived or could not be loaded, so "Ready" cannot be claimed. |
 
@@ -139,8 +139,9 @@ reopened by itself.
 
 The badge refreshes from the connection itself: the hello, every event frame,
 the gateway's `tick` (every 30 s), and a shallow `doctor.status` plus
-`GET /ready` read on connect and every fourth tick (a `health` event or a
-`state_version` revision triggers an extra read, once the gateway sends
+`GET /ready` (its `state`: starting, ready, draining, safe_mode, and the
+`failing` checks) read on connect and every fourth tick (a `health` event or
+a `state_version` revision triggers an extra read, once the gateway sends
 them). It runs no polling timer of its own; a one-second display clock only
 ages the "Live · 12 s" readout. Screen readers hear the state when it
 changes, not the ageing freshness.
@@ -170,9 +171,11 @@ nav item:
   While the console is offline only the connection issue is listed; the
   last doctor report is not repeated as if it were current.
 
-Approvals come from the same store as the Approvals page and the list
-updates when that store changes; the inbox adds no timer of its own (items
-show when they started waiting, "since 11:32"). An empty inbox says "Nothing
+Approvals come from the same store as the Approvals page, which the gateway
+keeps current with `approval.requested` / `approval.resolved` events (one
+backfill per connect), and the list updates when that store changes; the
+inbox adds no timer and no polling of its own (**Re-check** asks for one
+backfill), and items show when they started waiting ("since 11:32"). An empty inbox says "Nothing
 needs you" only while the console is connected.
 
 ## Keyboard Shortcuts
@@ -402,9 +405,9 @@ lists the same approvals next to agent questions and runtime issues.
 
 A job that keeps failing is marked on its card: a **Degraded** badge, the
 consecutive failure count and the last error. They come from the `health`
-block on `cron.list` when the gateway sends one, and otherwise from the
-job's `consecutive_errors` and last error (the scheduler backs a job off
-from its first consecutive error). When the job carries an overlap policy (`concurrency`), an
+block on `cron.list` (the engine calls a job degraded at 3 failures in a
+row); a gateway older than that is read from the job's `consecutive_errors`
+and last error with the same threshold. When the job carries an overlap policy (`concurrency`), an
 **Overlap** picker sets it (`forbid` skips a run while one is going,
 `replace` stops the running one, `allow` runs them side by side) through
 `cron.update`; it does not appear when the job has no `concurrency`. **Run**
