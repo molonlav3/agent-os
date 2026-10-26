@@ -59,7 +59,12 @@ describe('handshake', () => {
     expect(req.method).toBe('connect')
     expect(req.params.minProtocol).toBe(3)
     expect(req.params.maxProtocol).toBe(3)
-    expect(req.params.client).toEqual({ name: 'agentos-web' })
+    expect(req.params.client).toEqual({
+      id: 'agentos-web',
+      version: 'bundled',
+      platform: 'web',
+      mode: 'webui',
+    })
     expect(req.params.auth).toEqual({ token: 'tok-1' })
   })
 
@@ -78,6 +83,86 @@ describe('handshake', () => {
     ws2.serverOpen()
     ws2.serverSend({ type: 'event', event: 'connect.challenge' })
     expect(JSON.parse(ws2.sent.at(-1)!).params.auth).toBeUndefined()
+  })
+
+  it('sends a caller-supplied client block, updatable before the next handshake', () => {
+    const client = new WsRpcClient({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      clientInfo: { id: 'agentos-desktop', platform: 'darwin', mode: 'desktop' },
+    })
+    client.setClientInfo({ version: '2026.10.25' })
+    client.connect('ws://test/ws', null)
+    const ws = FakeWebSocket.instances.at(-1)!
+    ws.serverOpen()
+    ws.serverSend({ type: 'event', event: 'connect.challenge', payload: { nonce: 'n1', ts: 1 } })
+    expect(JSON.parse(ws.sent.at(-1)!).params.client).toEqual({
+      id: 'agentos-desktop',
+      version: '2026.10.25',
+      platform: 'darwin',
+      mode: 'desktop',
+    })
+  })
+
+  it('exposes hello-ok capabilities', () => {
+    const { client, ws } = newClient()
+    ws.serverSend({ type: 'event', event: 'connect.challenge', payload: { nonce: 'n1' } })
+    ws.serverSend({
+      protocol: 3,
+      auth: { nonce: 'n1' },
+      features: { methods: [], events: [], capabilities: ['rpc-http', 'typed-errors'] },
+      policy: {},
+    })
+    expect(client.state).toBe('connected')
+    expect(client.capabilities).toEqual(['rpc-http', 'typed-errors'])
+    expect(client.hasCapability('typed-errors')).toBe(true)
+    expect(client.hasCapability('nope')).toBe(false)
+  })
+
+  it('refuses a hello-ok that echoes another challenge nonce', () => {
+    const { client, ws } = newClient()
+    const errors: unknown[] = []
+    client.on('_handshakeError', (e) => errors.push(e))
+    ws.serverSend({ type: 'event', event: 'connect.challenge', payload: { nonce: 'mine' } })
+    ws.serverSend({ protocol: 3, auth: { nonce: 'theirs' }, policy: {} })
+    expect(client.state).not.toBe('connected')
+    expect(errors).toHaveLength(1)
+  })
+
+  it('stops on a refused handshake and surfaces the typed error', () => {
+    const { client, ws } = newClient()
+    const errors: unknown[] = []
+    client.on('_handshakeError', (e) => errors.push(e))
+    ws.serverSend({ type: 'event', event: 'connect.challenge', payload: { nonce: 'n' } })
+    const req = JSON.parse(ws.sent.at(-1)!)
+    ws.serverSend({
+      type: 'res',
+      id: req.id,
+      ok: false,
+      error: {
+        code: 'INVALID_REQUEST',
+        message: 'Unsupported protocol version range',
+        details: { code: 'PROTOCOL_MISMATCH', reload_required: true },
+      },
+    })
+    expect(client.state).toBe('disconnected')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatchObject({
+      code: 'INVALID_REQUEST',
+      details: { code: 'PROTOCOL_MISMATCH', reload_required: true },
+    })
+    vi.advanceTimersByTime(60_000)
+    expect(FakeWebSocket.instances).toHaveLength(1) // no reconnect loop
+  })
+
+  it('reconnects when the socket drops mid-handshake (not a refusal)', () => {
+    const { client, ws } = newClient()
+    const errors: unknown[] = []
+    client.on('_handshakeError', (e) => errors.push(e))
+    ws.serverSend({ type: 'event', event: 'connect.challenge', payload: { nonce: 'n' } })
+    ws.close()
+    expect(errors).toHaveLength(0)
+    vi.advanceTimersByTime(800)
+    expect(FakeWebSocket.instances).toHaveLength(2)
   })
 
   it('enters connected state and stores policy on HelloOk', () => {

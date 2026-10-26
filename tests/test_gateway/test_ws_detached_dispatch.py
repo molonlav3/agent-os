@@ -17,7 +17,7 @@ from agentos.gateway.access import ConnectionSurface
 from agentos.gateway.auth import AccessContext
 from agentos.gateway.config import GatewayConfig
 from agentos.gateway.rpc.registry import RpcRegistry
-from agentos.gateway.websocket import DETACHED_METHODS, WsConnection, _message_loop
+from agentos.gateway.websocket import UNORDERED_METHODS, WsConnection, _message_loop
 
 
 class _FakeWs:
@@ -53,7 +53,7 @@ async def _answered(ws: _FakeWs, req_id: str) -> None:
 
 
 async def test_slow_suggest_next_does_not_delay_a_fast_request() -> None:
-    assert "chat.suggestNext" in DETACHED_METHODS
+    assert "chat.suggestNext" in UNORDERED_METHODS
     registry = RpcRegistry()
     release = asyncio.Event()
     order: list[str] = []

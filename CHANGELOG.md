@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- Gateway: `hello-ok.features.capabilities` lists additive features a client
+  can gate on (`typed-errors`, `challenge-ts`, `auth-rate-limit`, `rpc-http`).
+- Gateway: a closed set of top-level error codes (`INVALID_REQUEST`,
+  `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NOT_FOUND`,
+  `UNAVAILABLE`, `RATE_LIMITED`, `INTERNAL_ERROR`) with the specific reason in
+  `details.code`; existing codes keep working and map to a category. A
+  protocol-version mismatch now says `PROTOCOL_MISMATCH` with both version
+  ranges and whether a reload fixes it.
+
+### Changed
+- Gateway: requests on one WebSocket no longer run strictly one at a time. Up
+  to four run at once; requests on the same session keep their order, a
+  request naming no session still waits for the ones before it, and
+  session-less reads such as `sessions.list` no longer wait behind another
+  session's slow `chat.history`. A request that cannot start within 30 s
+  answers `UNAVAILABLE` with `REQUEST_START_TIMEOUT` (retryable).
+- Gateway: outbound backpressure is counted in bytes. Past
+  `max_buffered_bytes` (50 MiB) queued for a client that is not reading,
+  periodic refreshes are dropped with their `seq` consumed (the client sees
+  the gap and resynchronizes); anything else closes the socket `1008 slow
+  consumer`.
+- The web console and the desktop app send a `client` block `{id, version,
+  platform, mode}` and an exact protocol range in `connect`; the challenge
+  carries a timestamp and `hello-ok.auth` echoes its nonce.
+
+### Fixed
+- Gateway: the advertised payload limits are enforced. Frames before
+  `hello-ok` are capped at 64 KiB (`1009` close), and uvicorn is configured
+  with the advertised 25 MiB `max_payload` instead of its 16 MiB default.
+- Gateway: `connect` params and every request envelope are validated against
+  the protocol models; malformed ones answer `INVALID_REQUEST` with typed
+  `details` (`INVALID_FRAME`, `INVALID_CONNECT_PARAMS`) instead of failing
+  deeper in. The web console's old `client: {name}` shape is still accepted.
+- The web console reconnects when the socket drops in the middle of the
+  handshake instead of staying disconnected.
+
 ## [2026.10.25] - 2026-10-25
 
 ### Added

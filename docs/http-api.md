@@ -111,6 +111,60 @@ plus server-pushed events. It is one route on the same app — the REST surface
 above sits alongside it. See [`mcp-server.md`](mcp-server.md) for a bridge that
 uses this transport.
 
+### Handshake
+
+1. The server sends `connect.challenge` with `{nonce, ts}` (`ts` in ms since
+   the epoch).
+2. The client answers with a `req` whose `method` is `connect` and whose
+   `params` are `{minProtocol, maxProtocol, clientKind, client, auth?}`. The
+   current protocol is `3`; send `minProtocol = maxProtocol = 3`. `client` is
+   informational, `{id, version, platform, mode}`, every field optional.
+   `auth.token` carries the gateway token.
+3. The server answers with a bare `hello-ok` frame (not a `res`) carrying
+   `features.methods`, `features.events`, `features.capabilities` (additive
+   feature names such as `typed-errors`, `challenge-ts`, `auth-rate-limit`,
+   `rpc-http`; treat an unknown one as absent), `policy` and
+   `auth.nonce` (the challenge nonce, so a client can check it answered its
+   own challenge).
+
+Frames before `hello-ok` are capped at 64 KiB (larger ones close the socket
+with `1009`); after it the cap is `policy.max_payload` (25 MiB). Malformed
+frames answer `INVALID_REQUEST` with `details.code` `INVALID_FRAME` or
+`INVALID_CONNECT_PARAMS` and an `errors` list. A protocol range the server
+cannot meet answers `INVALID_REQUEST` with `details {code:
+"PROTOCOL_MISMATCH", client_min, client_max, server_min, server_max,
+reload_required}`; `reload_required` is true when the client is the older
+side (a stale web console bundle).
+
+### Errors
+
+`error.code` is one of `INVALID_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`,
+`NOT_FOUND`, `METHOD_NOT_FOUND`, `UNAVAILABLE`, `RATE_LIMITED`,
+`INTERNAL_ERROR`, a long-standing code kept for existing clients
+(`QUEUE_FULL`, `GATEWAY_RESTARTING`, ...), or a namespaced domain code
+(`project.conflict`, `trading.operator_required`). The specific reason of a
+new error is in `details.code` (`PROTOCOL_MISMATCH`, `AUTH_RATE_LIMITED`,
+`REQUEST_START_TIMEOUT`, `QUEUE_FULL`, ...). `retryable: true` says trying
+again later can succeed.
+
+### Concurrency and backpressure
+
+Up to four requests per connection run at once. Requests naming the same
+session (`sessionKey`, or `key` on `sessions.*`) run in order, and a request
+naming no session waits for every earlier one, so a client can still rely on
+`chat.send` before `sessions.abort` or `subscribe` before a history read.
+Session-less reads (`sessions.list`, `status`, `config.get`, `models.list`,
+`usage.*`, ...) wait only for earlier session-less writes, so a poll is not
+held back by another session's slow history. A request that cannot start
+within 30 seconds answers `UNAVAILABLE` with
+`details.code = "REQUEST_START_TIMEOUT"` (retryable).
+
+Event frames carry a per-connection `seq`. When more than
+`policy.max_buffered_bytes` (50 MiB) is waiting for a client that is not
+reading, periodic refreshes (`tick`, `presence`, `health`) are dropped and
+their `seq` still consumed, so the client sees a gap and resynchronizes;
+anything else closes the socket with `1008` `slow consumer`.
+
 Projects (session groups with shared knowledge) are WebSocket-only:
 `projects.create` / `projects.list` / `projects.get` / `projects.update` /
 `projects.delete` (params use `projectId`, `agentId`, `name`, `knowledge`;

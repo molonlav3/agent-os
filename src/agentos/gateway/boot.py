@@ -43,6 +43,7 @@ from agentos.gateway.config import (
     is_public_bind,
 )
 from agentos.gateway.llm_runtime import resolve_llm_runtime_config
+from agentos.gateway.protocol import MAX_PAYLOAD_BYTES
 from agentos.gateway.rpc import get_dispatcher
 from agentos.gateway.session_events import build_sessions_changed_payload
 from agentos.gateway.session_lifecycle import (
@@ -2788,6 +2789,10 @@ async def start_gateway_server(
             "port": config.port,
             "log_level": "info" if not config.debug else "debug",
             "access_log": config.debug,
+            # The post-handshake frame ceiling ``hello-ok.policy.max_payload``
+            # advertises; frames before ``hello-ok`` are held to
+            # MAX_PREAUTH_PAYLOAD_BYTES by the handshake itself.
+            "ws_max_size": MAX_PAYLOAD_BYTES,
         }
         if config.tls.keyfile and config.tls.certfile:
             uvicorn_kwargs["ssl_keyfile"] = config.tls.keyfile

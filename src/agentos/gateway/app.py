@@ -30,12 +30,38 @@ from agentos.gateway.middleware import (
     RateLimitMiddleware,
     SecurityHeadersMiddleware,
 )
+from agentos.gateway.protocol import ErrorCode, error_category
 from agentos.gateway.rpc import RpcContext, get_dispatcher
 from agentos.gateway.websocket import handle_ws_connection
 
 _start_time = time.time()
 
 log = structlog.get_logger(__name__)
+
+#: HTTP status for each canonical error category (``protocol.error_category``).
+#: ``UNAUTHORIZED`` stays 403: an RPC refused on this surface is a
+#: permission answer, the 401 for a missing/wrong token comes from
+#: ``AuthMiddleware`` before any handler runs.
+RPC_CATEGORY_STATUS: dict[ErrorCode, int] = {
+    ErrorCode.INVALID_REQUEST: 400,
+    ErrorCode.UNAUTHORIZED: 403,
+    ErrorCode.FORBIDDEN: 403,
+    ErrorCode.NOT_FOUND: 404,
+    ErrorCode.METHOD_NOT_FOUND: 404,
+    ErrorCode.RATE_LIMITED: 429,
+    ErrorCode.UNAVAILABLE: 503,
+    ErrorCode.INTERNAL_ERROR: 500,
+}
+
+
+def rpc_status_code(result: Any, default: int = 500) -> int:
+    """HTTP status for a dispatcher result, from its code's category."""
+    if result.error is None:
+        return default
+    category = error_category(result.error.code)
+    if category is None:
+        return default
+    return RPC_CATEGORY_STATUS.get(category, default)
 
 
 def resolve_trusted_hosts(config: GatewayConfig) -> list[str]:
@@ -110,20 +136,7 @@ def create_gateway_app(
         diagnostics_state = DiagnosticsState.from_config(config)
 
     dispatcher = get_dispatcher()
-
-    def _rpc_status_code(result: Any, default: int = 500) -> int:
-        if result.error is None:
-            return default
-        code = result.error.code
-        if code == "INVALID_REQUEST":
-            return 400
-        if code == "UNAUTHORIZED":
-            return 403
-        if code in {"NOT_FOUND", "METHOD_NOT_FOUND"}:
-            return 404
-        if code == "UNAVAILABLE":
-            return 503
-        return default
+    _rpc_status_code = rpc_status_code
 
     # ── HTTP endpoint handlers ───────────────────────────────────────────────
 

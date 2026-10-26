@@ -10,6 +10,25 @@ export class RpcError extends Error {
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void }
 type Handler = (...args: unknown[]) => void
 
+/** The `client` block of the connect request: who is connecting (informational). */
+export interface ClientInfo {
+  id: string
+  version: string
+  platform: string
+  mode: string
+}
+
+/** The web console ships inside the engine, so its version is the engine's. */
+export const WEB_CLIENT_INFO: ClientInfo = {
+  id: 'agentos-web',
+  version: 'bundled',
+  platform: 'web',
+  mode: 'webui',
+}
+
+/** Protocol version this client speaks (min = max: no older dialects). */
+export const CLIENT_PROTOCOL_VERSION = 3
+
 export class WsRpcClient {
   private ws: WebSocket | null = null
   private reqId = 0
@@ -31,10 +50,19 @@ export class WsRpcClient {
   private lastFrameAt = 0
   private tickWatchTimer: ReturnType<typeof setInterval> | null = null
   private tickTimeoutMs = 60000
+  private challengeNonce: string | null = null
+  private capabilitiesValue: string[] = []
+  private clientInfo: ClientInfo
   private readonly WebSocketImpl: typeof WebSocket
 
-  constructor(opts?: { WebSocketImpl?: typeof WebSocket }) {
+  constructor(opts?: { WebSocketImpl?: typeof WebSocket; clientInfo?: Partial<ClientInfo> }) {
     this.WebSocketImpl = opts?.WebSocketImpl ?? WebSocket
+    this.clientInfo = { ...WEB_CLIENT_INFO, ...(opts?.clientInfo ?? {}) }
+  }
+
+  /** Update the `client` block sent on the next handshake (e.g. a late app version). */
+  setClientInfo(info: Partial<ClientInfo>): void {
+    this.clientInfo = { ...this.clientInfo, ...info }
   }
 
   /**
@@ -88,6 +116,15 @@ export class WsRpcClient {
     return this.policyValue ?? {}
   }
 
+  /** `hello-ok.features.capabilities`: additive features the gateway supports. */
+  get capabilities(): string[] {
+    return this.capabilitiesValue
+  }
+
+  hasCapability(name: string): boolean {
+    return this.capabilitiesValue.includes(name)
+  }
+
   waitForConnection(): Promise<void> {
     if (this.stateValue === 'connected') return Promise.resolve()
     return new Promise((resolve) => {
@@ -128,15 +165,24 @@ export class WsRpcClient {
 
       // Handshake: server sends connect.challenge, we reply with connect request
       if (data.type === 'event' && data.event === 'connect.challenge') {
+        const challenge = (data.payload as { nonce?: unknown } | undefined) ?? {}
+        this.challengeNonce = typeof challenge.nonce === 'string' ? challenge.nonce : null
         const auth: Record<string, string> = { ...(this.extraAuth ?? {}) }
         if (this.token) auth.token = this.token
         const authParams = Object.keys(auth).length ? { auth } : {}
         const id = String(++this.reqId)
         this.pending.set(id, {
           resolve: () => {}, // HelloOk is not a res frame, handled below
-          reject: () => {
-            this.ws?.close()
+          reject: (error) => {
+            // The socket closing mid-handshake is not a refusal: onclose
+            // reconnects with backoff as for any drop.
+            if (!(error instanceof RpcError)) return
+            // A refused handshake (wrong token, rate limit, protocol
+            // mismatch) does not heal by retrying: stop, and let the UI read
+            // the typed error (code + details) from `_handshakeError`.
+            this.emit('_handshakeError', error)
             this.setState('disconnected')
+            this.ws?.close()
           },
         })
         this.ws?.send(
@@ -145,10 +191,10 @@ export class WsRpcClient {
             id,
             method: 'connect',
             params: {
-              minProtocol: 3,
-              maxProtocol: 3,
+              minProtocol: CLIENT_PROTOCOL_VERSION,
+              maxProtocol: CLIENT_PROTOCOL_VERSION,
               clientKind: 'control',
-              client: { name: 'agentos-web' },
+              client: { ...this.clientInfo },
               ...authParams,
             },
           }),
@@ -158,6 +204,18 @@ export class WsRpcClient {
 
       // Handshake: HelloOk frame (has "protocol" field, no "type":"res")
       if (data.protocol !== undefined && this.stateValue === 'connecting') {
+        // The gateway echoes the challenge nonce; a different one means this
+        // hello answers some other connection's handshake.
+        const echoed = (data.auth as { nonce?: unknown } | undefined)?.nonce
+        if (typeof echoed === 'string' && this.challengeNonce && echoed !== this.challengeNonce) {
+          this.emit('_handshakeError', new RpcError('Handshake nonce mismatch'))
+          this.ws?.close()
+          return
+        }
+        const features = (data.features as { capabilities?: unknown } | undefined) ?? {}
+        this.capabilitiesValue = Array.isArray(features.capabilities)
+          ? features.capabilities.filter((c): c is string => typeof c === 'string')
+          : []
         this.policyValue = (data.policy as Record<string, unknown>) ?? null
         for (const [id, p] of this.pending) {
           this.pending.delete(id)
