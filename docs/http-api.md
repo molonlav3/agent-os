@@ -49,9 +49,10 @@ itself is ignored as spoofed.
 
 ### Failed-auth rate limiting
 
-A *wrong* token counts against a per-client budget shared by HTTP and the
-WebSocket: ten failures within 60 seconds lock that client out for five
-minutes. A locked-out client gets `429` with `Retry-After` (seconds) and
+A *wrong* token counts against a budget per client address, shared by HTTP
+and the WebSocket: ten failures within 60 seconds lock that address out for
+five minutes, whatever `Origin` header its attempts carry. A locked-out
+client gets `429` with `Retry-After` (seconds) and
 
 ```json
 {"error": "Too many failed authentication attempts", "code": "RATE_LIMITED",
@@ -59,9 +60,14 @@ minutes. A locked-out client gets `429` with `Retry-After` (seconds) and
 ```
 
 even when it presents the right token. A request with no token is a plain
-`401` and never counts. A loopback client without an `Origin` header is never
-locked out (each failure is answered after a delay growing from 250 ms to
-5 s); a browser request is keyed by its `Origin` and never exempt. Settings:
+`401` and never counts. A loopback address is never locked out (each failure
+is answered after a delay growing from 250 ms to 5 s), but browser requests
+(those carrying `Origin`) are also counted in a second budget per address,
+shared by every `Origin` value and never exempt, so a page in the operator's
+browser cannot guess the token from loopback, and rotating `Origin` gains
+nothing. Behind a proxy on the same host every client looks like loopback:
+list the proxy in `auth.trusted_proxy` (its `X-Forwarded-For` then names the
+client) or set `exempt_loopback = false`. Settings:
 
 ```toml
 [auth.rate_limit]
@@ -162,11 +168,14 @@ Only an allowlist is reachable: reads (`health`, `status`, `config.get`,
 `sessions.list`/`get`/`preview`/`resolve`, `chat.history`, `models.list`,
 `usage.*`, `agents.list`, `projects.list`/`get`, `skills.list`, `cron.list`,
 `channels.status`, `doctor.status`, `acp.*` status, ...) and mutations that
-create or send but never destroy (`chat.send`, `sessions.send`,
-`sessions.create`, `sessions.rename`, `projects.create`/`update`, `*.abort`,
-`plan.mode.set`). Configuration writes, secrets and environment variables,
-trading and wallets, restarts, deletes and approval decisions stay on the
-WebSocket. Any other method answers `403` with `error.code = "FORBIDDEN"` and
+create, rename or send without deleting anything (`chat.send`,
+`sessions.send`, `sessions.create`, `sessions.rename`,
+`projects.create`/`update`, `*.abort`, `plan.mode.set`). `chat.send` and
+`sessions.send` start an agent turn with the same options as over the
+WebSocket, including an elevated execution mode the request asks for, so the
+token must be treated as full operator access either way. Configuration
+writes, secrets and environment variables, trading and wallets, restarts,
+deletes and approval decisions stay on the WebSocket. Any other method answers `403` with `error.code = "FORBIDDEN"` and
 `details.code = "METHOD_NOT_ALLOWED_OVER_HTTP"`. The full list is
 `HTTP_RPC_METHODS` in
 [`src/agentos/gateway/http_rpc.py`](../src/agentos/gateway/http_rpc.py).
@@ -200,8 +209,10 @@ uses this transport.
    `auth.nonce` (the challenge nonce, so a client can check it answered its
    own challenge).
 
-Frames before `hello-ok` are capped at 64 KiB (larger ones close the socket
-with `1009`); after it the cap is `policy.max_payload` (25 MiB). Malformed
+Messages before `hello-ok` are capped at 64 KiB: a larger one (plain,
+fragmented or compressed) closes the socket with `1009` before it is read.
+After it the cap is `policy.max_payload` (25 MiB). One address may hold at
+most 128 sockets in the handshake; the next upgrade is refused with HTTP 403. Malformed
 frames answer `INVALID_REQUEST` with `details.code` `INVALID_FRAME` or
 `INVALID_CONNECT_PARAMS` and an `errors` list. A protocol range the server
 cannot meet answers `INVALID_REQUEST` with `details {code:

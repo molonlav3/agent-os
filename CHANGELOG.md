@@ -10,7 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Gateway: `POST /api/v1/rpc` calls one RPC method over plain HTTP behind the
   normal bearer auth: `{id?, method, params?}` in, `{id, ok, payload | error}`
   out, with the HTTP status taken from the error's category. Only an
-  allowlist of reads and non-destructive methods is reachable; config writes,
+  allowlist is reachable: reads, and methods that create, rename or send
+  (`chat.send` runs a turn exactly as over the WebSocket); config writes,
   secrets, env, trading, restarts and deletes answer `403 FORBIDDEN`.
 - Gateway: `hello-ok.features.capabilities` lists additive features a client
   can gate on (`typed-errors`, `challenge-ts`, `auth-rate-limit`, `rpc-http`).
@@ -22,14 +23,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   ranges and whether a reload fixes it.
 - `agentos doctor` reports risky gateway exposure: `gateway.bind_no_auth`,
   `gateway.allowed_origins_wildcard`, `gateway.cors_wildcard_with_credentials`,
-  `gateway.trusted_proxy_unset`, `gateway.auth_rate_limit_off` and
-  `gateway.token_short`, each with the command that fixes it.
+  `gateway.trusted_proxy_unset`, `gateway.auth_rate_limit_off`,
+  `gateway.rate_limit_loopback_exempt_behind_proxy` and `gateway.token_short`,
+  each with a command that writes the fix to the config file. It reads them
+  from the running gateway, presenting the token from `--token`,
+  `AGENTOS_GATEWAY_TOKEN` or `auth.token`, and from the config file when no
+  gateway answers (one that refuses to start, or admits nobody).
 - Docs: `docs/remote-access.md` — SSH tunnel, Tailscale Serve, reverse proxy
-  with trusted-proxy mode, token rotation, and what never to do.
+  with trusted-proxy mode, token rotation, and what never to do. Every recipe
+  writes the config file and enforces auth before anything is exposed.
 - The Python gateway clients (CLI and MCP bridge) reconnect after a dropped
   socket (1 s backoff doubling to 30 s), renew session subscriptions from the
   last `stream_seq`, close and reconnect on an event-sequence gap, and stop on
-  a wrong token or a protocol mismatch.
+  a wrong token or a protocol mismatch. The CLI gives up after 60 s without a
+  gateway, so `agentos chat` prints "reconnecting…" during an outage and the
+  old "Gateway connection lost" error when the gateway does not come back.
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up
@@ -37,7 +45,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   request naming no session still waits for the ones before it, and
   session-less reads such as `sessions.list` no longer wait behind another
   session's slow `chat.history`. A request that cannot start within 30 s
-  answers `UNAVAILABLE` with `REQUEST_START_TIMEOUT` (retryable).
+  answers `UNAVAILABLE` with `REQUEST_START_TIMEOUT` (retryable) and still
+  holds back the requests queued behind it until its own predecessor ends.
 - Gateway: outbound backpressure is counted in bytes. Past
   `max_buffered_bytes` (50 MiB) queued for a client that is not reading,
   periodic refreshes are dropped with their `seq` consumed (the client sees
@@ -45,7 +54,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   consumer`.
 - Gateway: `auth.mode = "trusted-proxy"` is accepted on a non-loopback bind
   (admission checks the real transport peer), `auth.trusted_proxy` takes CIDR
-  blocks, and `X-Forwarded-For` is walked right to left skipping trusted hops
+  blocks (an IPv4 block also matches the `::ffff:` form a dual-stack listener
+  reports), and `X-Forwarded-For` is walked right to left skipping trusted hops
   instead of trusting its left-most entry; a forwarded address naming the
   gateway host itself is ignored as spoofed.
 - The web console, the desktop app and the Python clients send a `client`
@@ -59,30 +69,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Gateway: SIGTERM — what `agentos gateway stop`, the desktop app, launchd
   and systemd send — now runs the same orderly shutdown as Ctrl+C: turns get
   up to 30 s to finish, channels stop, clients receive the `shutdown` event,
-  sockets and MCP clients close, and the process exits 0. A second signal
-  forces it. Before, the process died before any of that ran. A stop signal
-  during an in-place restart no longer re-executes a new gateway.
+  sockets and MCP clients close (concurrently, 2 s at most, so a client that
+  stopped reading cannot stall it), and the process exits 0. A second signal
+  cancels the remaining turns. Before, the process died before any of that
+  ran. A stop signal during an in-place restart no longer re-executes a new
+  gateway.
 - Gateway: the `shutdown` event is delivered before the socket closes; it was
   queued and then dropped with the connection.
-- Gateway: the advertised payload limits are enforced. Frames before
-  `hello-ok` are capped at 64 KiB (`1009` close), and uvicorn is configured
-  with the advertised 25 MiB `max_payload` instead of its 16 MiB default.
+- Gateway: the advertised payload limits are enforced. Messages before
+  `hello-ok` are capped at 64 KiB by the transport, which refuses a larger
+  one (also fragmented or compressed) with `1009` before reading it, so
+  unauthenticated sockets cannot park large frames in memory; after the
+  handshake the cap is the advertised 25 MiB `max_payload` instead of
+  uvicorn's 16 MiB default.
 - Gateway: `connect` params and every request envelope are validated against
   the protocol models; malformed ones answer `INVALID_REQUEST` with typed
-  `details` (`INVALID_FRAME`, `INVALID_CONNECT_PARAMS`) instead of failing
-  deeper in. The web console's old `client: {name}` shape is still accepted.
+  `details` (`INVALID_FRAME`, `INVALID_CONNECT_PARAMS`, including an inverted
+  protocol range) instead of failing deeper in. The web console's old
+  `client: {name}` shape is still accepted.
 - The web console reconnects when the socket drops in the middle of the
   handshake instead of staying disconnected.
 
 ### Security
-- Gateway: wrong tokens are rate limited per client across HTTP and the
-  WebSocket (`[auth.rate_limit]`, on by default): 10 failures in 60 s lock
-  the client out for 5 minutes (HTTP `429` + `Retry-After`, WebSocket
-  `UNAUTHORIZED` with `details.code = "AUTH_RATE_LIMITED"`). A missing token
-  never counts; a loopback peer is slowed down (250 ms to 5 s) instead of
-  locked out; a browser attempt is keyed by its `Origin` and never exempt.
+- Gateway: wrong tokens are rate limited per client address across HTTP and
+  the WebSocket (`[auth.rate_limit]`, on by default): 10 failures in 60 s lock
+  the address out for 5 minutes whatever `Origin` its attempts carry (HTTP
+  `429` + `Retry-After`, WebSocket `UNAUTHORIZED` with
+  `details.code = "AUTH_RATE_LIMITED"`). A missing token never counts. A
+  loopback address is slowed down (250 ms to 5 s) instead of locked out, but
+  its browser attempts share a second, lockable budget that rotating `Origin`
+  cannot escape. Behind a same-host proxy set `auth.trusted_proxy` so the
+  lockout applies per forwarded client.
 - Gateway: at most 128 sockets per client address may wait in the handshake;
-  more are refused before `accept()`.
+  more are refused before the upgrade completes (HTTP 403).
 
 ## [2026.10.25] - 2026-10-25
 

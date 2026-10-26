@@ -9,11 +9,14 @@ through the same dispatcher as a WebSocket request on the Control surface,
 so a handler cannot tell the two transports apart.
 
 Only :data:`HTTP_RPC_METHODS` are reachable. The list is deliberately short:
-reads, plus mutations that create or send but never destroy, reconfigure or
-spend from a wallet. Configuration writes, secrets and environment
-variables, trading and wallets, restarts, deletes and approval decisions
-stay on the WebSocket, where a client has held one authenticated connection
-since the handshake. Anything else is ``403 FORBIDDEN``.
+reads, plus mutations that create, rename or send without deleting,
+reconfiguring or spending from a wallet. ``chat.send`` / ``sessions.send``
+start an agent turn exactly as over the WebSocket (and as ``POST
+/api/chat`` already did), elevated execution modes included. Configuration
+writes, secrets and environment variables, trading and wallets, restarts,
+deletes and approval decisions stay on the WebSocket, where a client has
+held one authenticated connection since the handshake. Anything else is
+``403 FORBIDDEN``.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from agentos.gateway.protocol import (
 )
 
 #: The methods ``POST /api/v1/rpc`` dispatches. Additions must be reads or
-#: non-destructive mutations; ``tests/test_gateway/test_http_rpc.py`` guards
+#: mutations that delete and reconfigure nothing; ``tests/test_gateway/test_http_rpc.py`` guards
 #: the excluded families.
 HTTP_RPC_METHODS: frozenset[str] = frozenset(
     {
