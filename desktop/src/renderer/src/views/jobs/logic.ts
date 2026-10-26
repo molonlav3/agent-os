@@ -7,6 +7,7 @@
 
 import {
   explainCron,
+  jobRuntimeHealth,
   nextRuns,
   parseCron,
   type CronForm,
@@ -26,6 +27,9 @@ export type JobHealth = 'running' | 'failing' | 'active' | 'paused'
 export function jobHealth(job: RawJob): JobHealth {
   if (!job.enabled) return 'paused'
   if (job.status === 'running') return 'running'
+  // The gateway's own verdict (cron.list `health`), when it sends one.
+  const reported = jobRuntimeHealth(job)
+  if (reported?.degraded || (reported?.consecutiveFailures ?? 0) > 0) return 'failing'
   const consecutive = Number(job.consecutive_errors ?? 0)
   const lastStatus = job.last_status
   if (consecutive > 0 || lastStatus === 'error' || lastStatus === 'fail') return 'failing'

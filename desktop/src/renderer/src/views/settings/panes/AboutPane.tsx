@@ -2,6 +2,8 @@ import { useQuery } from '@tanstack/react-query'
 import { ExternalLink, LoaderCircle } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useRpc } from '@/app/providers'
+import { tPlural } from '@/i18n'
+import { useUpdatePreflight, type PreflightState } from '@/lib/update-preflight'
 import { useConnection } from '@/stores/connection'
 import type { AppInfo } from '@shared/app'
 import {
@@ -13,7 +15,9 @@ import {
 import { Button } from '~/components/ui/button'
 import { t } from '~/i18n'
 import { desktopApi } from '~/lib/desktop-api'
+import { useAttentionPanel } from '~/stores/attention'
 import { useSettings } from '~/stores/settings'
+import { useUi } from '~/stores/ui'
 import { useUpdates } from '~/stores/updates'
 import { formatUptime } from '../logic'
 import { Card, Head, Notice, Pill, Row, Value, type Tone } from '../parts'
@@ -48,6 +52,16 @@ export function AboutPane() {
   const loaded = useUpdates((s) => s.loaded)
   const checkAll = useUpdates((s) => s.checkAll)
   const updateAll = useUpdates((s) => s.updateAll)
+  const applyEngine = useUpdates((s) => s.applyEngine)
+  // Every engine update restarts the gateway, so it goes through the
+  // preflight first: what would be interrupted, blocked while an approval
+  // waits, applied only once confirmed. Which update is waiting on it:
+  const [pendingUpdate, setPendingUpdate] = useState<'engine' | 'all' | null>(null)
+  const preflight = useUpdatePreflight()
+  const askToUpdate = (which: 'engine' | 'all') => {
+    setPendingUpdate(which)
+    preflight.run()
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -97,7 +111,11 @@ export function AboutPane() {
         </div>
         <div className="stg-hero__actions">
           {engineOutdated && appOutdated ? (
-            <Button variant="primary" disabled={busy} onClick={() => void updateAll()}>
+            <Button
+              variant="primary"
+              disabled={busy || pendingUpdate !== null}
+              onClick={() => askToUpdate('all')}
+            >
               {t('settings.about.updateAll')}
             </Button>
           ) : null}
@@ -125,10 +143,18 @@ export function AboutPane() {
       <EngineCard
         engine={engine}
         gatewayVersion={gatewayVersion}
-        activeSessions={connected ? (status.data?.active_sessions ?? 0) : 0}
         uptimeMs={connected ? status.data?.uptime_ms : undefined}
         connected={connected}
         onRestarted={() => void status.refetch()}
+        confirming={pendingUpdate !== null}
+        preflight={preflight}
+        onRequestUpdate={() => askToUpdate('engine')}
+        onCancelUpdate={() => setPendingUpdate(null)}
+        onConfirmUpdate={() => {
+          const which = pendingUpdate
+          setPendingUpdate(null)
+          void (which === 'all' ? updateAll() : applyEngine())
+        }}
       />
 
       <AppCard />
@@ -174,22 +200,28 @@ const ENGINE_TONE: Record<string, Tone | undefined> = {
 function EngineCard({
   engine,
   gatewayVersion,
-  activeSessions,
   uptimeMs,
   connected,
   onRestarted,
+  confirming,
+  preflight,
+  onRequestUpdate,
+  onCancelUpdate,
+  onConfirmUpdate,
 }: {
   engine: EngineUpdateState
   gatewayVersion: string | null
-  activeSessions: number
   uptimeMs: number | undefined
   connected: boolean
   onRestarted: () => void
+  confirming: boolean
+  preflight: PreflightState
+  onRequestUpdate: () => void
+  onCancelUpdate: () => void
+  onConfirmUpdate: () => void
 }) {
   const rpc = useRpc()
   const mode = useSettings((s) => s.settings.gateway.mode)
-  const applyEngine = useUpdates((s) => s.applyEngine)
-  const [confirming, setConfirming] = useState(false)
   const [dataCheck, setDataCheck] = useState<DataCheck | null>(null)
   const verifiedFor = useRef<string | null>(null)
 
@@ -213,14 +245,9 @@ function EngineCard({
   }, [done, engine.result, connected, rpc, onRestarted])
 
   const start = () => {
-    setConfirming(false)
     setDataCheck(null)
     verifiedFor.current = null
-    void applyEngine()
-  }
-  const requestUpdate = () => {
-    if (activeSessions > 0) setConfirming(true)
-    else start()
+    onConfirmUpdate()
   }
 
   const pill =
@@ -257,7 +284,7 @@ function EngineCard({
         </Value>
         {engine.availability === 'outdated' && !running && !confirming ? (
           mode === 'external' ? null : (
-            <Button variant="primary" onClick={requestUpdate}>
+            <Button variant="primary" onClick={onRequestUpdate}>
               {t('settings.about.engine.update')}
             </Button>
           )
@@ -269,22 +296,7 @@ function EngineCard({
       ) : null}
 
       {confirming ? (
-        <Notice
-          action={
-            <>
-              <Button onClick={() => setConfirming(false)}>
-                {t('settings.about.engine.cancel')}
-              </Button>
-              <Button variant="danger" onClick={start}>
-                {t('settings.about.engine.updateAnyway')}
-              </Button>
-            </>
-          }
-        >
-          {activeSessions === 1
-            ? t('settings.about.engine.sessionsWarn.one')
-            : `${activeSessions} ${t('settings.about.engine.sessionsWarn.many')}`}
-        </Notice>
+        <PreflightNotice preflight={preflight} onCancel={onCancelUpdate} onConfirm={start} />
       ) : null}
 
       {engine.interrupted && engine.phase !== 'error' ? (
@@ -348,6 +360,78 @@ function EngineCard({
         <ProgressLog lines={engine.log} />
       ) : null}
     </Card>
+  )
+}
+
+/**
+ * The engine update's preflight, in the About card's own notice style: what
+ * the gateway restart would interrupt (shared copy from the console), the
+ * reason it is blocked while an approval waits, and the confirm.
+ */
+function PreflightNotice({
+  preflight,
+  onCancel,
+  onConfirm,
+}: {
+  preflight: PreflightState
+  onCancel: () => void
+  onConfirm: () => void
+}) {
+  const openAttention = useAttentionPanel((s) => s.setOpen)
+  const closeSettings = useUi((s) => s.closeSettings)
+  const { preflight: result, loading, error, gate } = preflight
+  const sessions = result?.runningSessions.length ?? 0
+  const jobs = result?.dueJobs ?? []
+  const approvals = result?.pendingApprovals ?? 0
+  const warn = !!result?.warn || !!error
+  const tone = gate.code === 'approvals_pending' ? 'danger' : warn ? 'warn' : 'info'
+  return (
+    <Notice
+      tone={tone}
+      action={
+        <>
+          {gate.code === 'approvals_pending' ? (
+            <Button
+              onClick={() => {
+                closeSettings()
+                openAttention(true)
+              }}
+            >
+              {t('preflight.openAttention')}
+            </Button>
+          ) : null}
+          <Button onClick={onCancel}>{t('preflight.cancel')}</Button>
+          <Button
+            variant={warn ? 'danger' : 'primary'}
+            disabled={gate.disabled}
+            title={gate.reason ?? undefined}
+            data-testid="engine-preflight-confirm"
+            onClick={onConfirm}
+          >
+            {warn ? t('preflight.updateAnyway') : t('preflight.update')}
+          </Button>
+        </>
+      }
+    >
+      <span className="stg-preflight" data-testid="engine-preflight">
+        <b>{t('preflight.title')}</b>
+        {loading && !result ? <span>{t('settings.about.checking')}</span> : null}
+        {error ? <span>{error}</span> : null}
+        {result ? (
+          <>
+            <span>{tPlural('shell.preflightSessions', sessions)}</span>
+            <span>
+              {tPlural('shell.preflightJobs', jobs.length)}
+              {jobs.length ? ` (${jobs.map((j) => j.name).join(', ')})` : ''}
+            </span>
+            <span>{tPlural('shell.preflightApprovals', approvals)}</span>
+          </>
+        ) : null}
+        {gate.disabled && gate.reason && !loading ? (
+          <span className="stg-preflight__reason">{gate.reason}</span>
+        ) : null}
+      </span>
+    </Notice>
   )
 }
 

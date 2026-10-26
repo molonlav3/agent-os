@@ -1,4 +1,5 @@
 import { acp } from './en/acp'
+import { attention } from './en/attention'
 import { jobs } from './en/jobs'
 import { notifications } from './en/notifications'
 import { projects } from './en/projects'
@@ -24,6 +25,7 @@ const en = {
   ...trading,
   ...quickAsk,
   ...acp,
+  ...attention,
 } as const
 
 export type MessageKey = keyof typeof en

@@ -548,12 +548,6 @@ export const settings = {
   'settings.about.engine.manual': 'Run this in a terminal:',
   'settings.about.engine.interrupted': 'A previous update did not finish.',
   'settings.about.engine.log': 'Progress',
-  'settings.about.engine.sessionsWarn.one':
-    'One session is active. Restarting the gateway will interrupt it.',
-  'settings.about.engine.sessionsWarn.many':
-    'sessions are active. Restarting the gateway will interrupt them.',
-  'settings.about.engine.updateAnyway': 'Update anyway',
-  'settings.about.engine.cancel': 'Cancel',
   'settings.about.engine.tooOld': 'This app needs engine',
   'settings.about.engine.tooOld.rest': 'or newer; the gateway runs',
   'settings.about.engine.external':

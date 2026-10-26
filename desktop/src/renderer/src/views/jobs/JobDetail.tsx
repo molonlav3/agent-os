@@ -18,6 +18,7 @@ import { copyWithFallback } from '@/lib/clipboard'
 import {
   jobCreatedFrom,
   jobElevated,
+  jobRuntimeHealth,
   jobSessionKey,
   type RawJob,
   type RawRun,
@@ -111,7 +112,11 @@ export function JobDetail({
   const script = String(job.script || '').trim()
   const createdFrom = jobCreatedFrom(job)
   const sessionKey = jobSessionKey(job)
-  const lastError = typeof job.lastResult === 'string' ? job.lastResult.trim() : ''
+  // The gateway's run health (cron.list `health`), when it reports one: the
+  // degraded flag, the failure streak and the last error. Absent, nothing new.
+  const reported = jobRuntimeHealth(job)
+  const lastError =
+    reported?.lastError || (typeof job.lastResult === 'string' ? job.lastResult.trim() : '')
 
   async function copyId() {
     try {
@@ -154,6 +159,14 @@ export function JobDetail({
             <span className="mac-chip" data-tone={HEALTH_TONE[health]}>
               {t(`jobs.health.${health}`)}
             </span>
+            {reported?.degraded ? (
+              <span className="mac-chip" data-tone="danger" data-testid="job-degraded">
+                {t('jobs.health.degraded')}
+                {reported.consecutiveFailures
+                  ? ` · ${t('jobs.health.failures').replace('{count}', String(reported.consecutiveFailures))}`
+                  : ''}
+              </span>
+            ) : null}
             <span className="mac-chip">{t(`jobs.kind.${kind}`)}</span>
             {elevated ? (
               <span className="mac-chip" data-tone="danger" title={t('jobs.detail.elevatedHint')}>
