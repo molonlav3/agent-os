@@ -6,6 +6,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { useRpc } from '@/app/providers'
 import { apiOrigin } from '@/lib/api-origin'
+import { callIdempotent } from '@/lib/ws-rpc'
 import { useApprovals } from '@/services/approval-monitor'
 import { useTheme } from '@/stores/theme'
 import { chatMarkdown } from './markdown'
@@ -58,6 +59,7 @@ import {
   dayLabel,
   esc,
   historyFallbackMessageIdentity,
+  inFlightDecision,
   inputNormalizationProvenanceFromAttachments,
   outgoingAttachment,
   renderMessageAttachmentHtml,
@@ -1205,6 +1207,9 @@ export function useTranscript(opts: {
   // in the abort→done window would be pulled into the composer twice. Reset per
   // turn on a fresh send and after the guarded drain runs (chat.js:5127).
   const stopRequestedByUserRef = useRef(false)
+  // Bumped by every send, so a subscribe answer can tell that the user started
+  // a turn while it was in flight (replayed frames restart a stream too).
+  const sendCountRef = useRef(0)
 
   // chat.js:6062-6205 `_onSend`. ChatPage owns enqueue-while-streaming, slash
   // commands and attachment normalization; this action renders the user turn,
@@ -1221,6 +1226,7 @@ export function useTranscript(opts: {
       if (!hasPayload || !sessionKey || controller.isStreaming()) return
 
       abortedRef.current = false
+      sendCountRef.current += 1
       // A new turn clears the stop-recover guard (legacy resets `_stopRequestedByUser`
       // per turn — chat.js:1722/8799) so the next abort→done cycle re-arms cleanly.
       stopRequestedByUserRef.current = false
@@ -1287,8 +1293,10 @@ export function useTranscript(opts: {
         textLen: providerText.length,
         attachments: atts.length,
       })
-      rpc
-        .call('chat.send', params)
+      // A per-message idempotency key: a send whose answer was lost with the
+      // socket is retried after the reconnect, and the gateway answers the
+      // retry with the turn it already started instead of a second one.
+      callIdempotent(rpc, 'chat.send', params)
         .then((res) => {
           const r = res as { sessionKey?: string } | null
           seamsRef.current.diag?.('send.rpc.resolved', {
@@ -1673,12 +1681,57 @@ export function useTranscript(opts: {
       resyncHistory()
     }
 
+    // The gateway's `in_flight_run` is authoritative where the gateway sends
+    // it: `null` ends whatever live view the session came back with (a parked
+    // bubble, replayed frames), an object is the running turn and its text so
+    // far. Returns false for an older gateway, which falls back to the
+    // run-status reconcile above.
+    const adoptInFlightRun = (
+      state: Record<string, unknown> | null,
+      sentDuringSubscribe: boolean,
+    ): boolean => {
+      const decision = inFlightDecision(state, controller.syncLastStreamSeqFromSession(sessionKey))
+      if (decision.kind === 'legacy') return false
+      // A send started while the subscribe was in flight belongs to a turn
+      // this answer predates.
+      if (sentDuringSubscribe && controller.isStreaming()) return true
+      if (decision.kind === 'clear') {
+        controller.discardParkedStreamState(sessionKey)
+        if (!controller.hasViewLocalStreamState()) return true
+        diag('session.subscribe.inflight_cleared', {})
+        controller.clearViewLocalStreamState('inflight_snapshot_cleared')
+        if (state) {
+          applySessionRunState(state)
+          seams().applySessionRunState?.(state)
+        }
+        resyncHistory()
+        return true
+      }
+      if (decision.kind === 'keep') return true
+      diag('session.subscribe.inflight_adopted', {
+        rebuild: decision.rebuild,
+        textLen: decision.text.length,
+      })
+      if (decision.rebuild && controller.hasViewLocalStreamState()) {
+        controller.clearViewLocalStreamState('inflight_snapshot_rebuilt')
+      }
+      if (!controller.isStreaming()) {
+        controller.startStreaming()
+        if (!decision.text) controller.showThinkingIndicator()
+      }
+      if (decision.text) controller.reconcileFinalStreamText(decision.text)
+      controller.resetStreamIdleTimer()
+      return true
+    }
+
     // ── Subscribe (chat.js:2857 `_subscribeSession`) ──────────────────────
     const subscribe = async () => {
       let gatewayState: Record<string, unknown> | null = null
+      let sentDuringSubscribe = false
       try {
         await rpc.waitForConnection()
         if (cancelled || sessionKey !== sessionKeyRef.current) return
+        const sendsAtCall = sendCountRef.current
         const sinceStreamSeq = controller.syncLastStreamSeqFromSession(sessionKey)
         const res = (await rpc.call('sessions.messages.subscribe', {
           key: sessionKey,
@@ -1692,6 +1745,7 @@ export function useTranscript(opts: {
           current_stream_seq?: unknown
         } | null
         if (cancelled || sessionKey !== sessionKeyRef.current) return
+        sentDuringSubscribe = sendCountRef.current !== sendsAtCall
         if (res && res.subscribed === false) throw new Error(t('chat.noSubscriptionManager'))
         const subscribedState = (res as Record<string, unknown>) ?? {}
         gatewayState = subscribedState
@@ -1733,7 +1787,9 @@ export function useTranscript(opts: {
         // async config work, so include them in the same entry barrier.
         await Promise.allSettled(Array.from(pendingReplayTasks))
         if (!cancelled && sessionKey === sessionKeyRef.current) {
-          reconcileStreamWithGateway(gatewayState)
+          if (!adoptInFlightRun(gatewayState, sentDuringSubscribe)) {
+            reconcileStreamWithGateway(gatewayState)
+          }
           subscriptionSettledSessionRef.current = sessionKey
           setSubscriptionSettleRevision((revision) => revision + 1)
         }
@@ -1965,6 +2021,12 @@ export function useTranscript(opts: {
       onEvent('sessions.changed', (payload: StreamEventPayload) => {
         if (isStaleEpoch(payload)) return
         if (!isCurrentSessionPayload(payload, sessionKeyRef.current)) return
+        // Replayed to a late subscriber too now: one already applied live is
+        // not applied twice.
+        if (!controller.acceptStreamSeq(payload)) {
+          diag('sessions.changed.drop.stream_seq', {})
+          return
+        }
         // Terminal session change → end streaming + resync history
         // (chat.js:1713 `_syncTerminalSessionChange`). We conservatively resync
         // history + apply run-state; terminal pending recovery is handled by the
@@ -1986,6 +2048,7 @@ export function useTranscript(opts: {
     unsubs.push(
       onEvent('task.queued', (payload: StreamEventPayload) => {
         if (!isCurrentSessionPayload(payload, sessionKeyRef.current)) return
+        if (!controller.acceptStreamSeq(payload)) return
         if (
           runStateRef.current.status === 'running' ||
           runStateRef.current.status === 'approval_pending'
@@ -2004,6 +2067,7 @@ export function useTranscript(opts: {
     unsubs.push(
       onEvent('task.running', (payload: StreamEventPayload) => {
         if (!isCurrentSessionPayload(payload, sessionKeyRef.current)) return
+        if (!controller.acceptStreamSeq(payload)) return
         const next = {
           run_status: 'running',
           active_task: { ...(payload || {}), status: 'running' },
@@ -2114,6 +2178,13 @@ export function useTranscript(opts: {
             diag('event.generic.drop.stream_seq', { event: rawEvent })
             return
           }
+        }
+        // A task terminal is replayed to a late subscriber as well; the one
+        // this view already handled live must not finalize twice. (Queued /
+        // running frames were accepted by their own handlers above.)
+        if (rawEvent.startsWith('task.') && !controller.acceptStreamSeq(rawPayload)) {
+          diag('event.generic.drop.stream_seq', { event: rawEvent })
+          return
         }
 
         const taskTerminal = rawEvent.startsWith('task.') ? rawEvent.slice('task.'.length) : ''

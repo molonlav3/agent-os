@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { WsRpcClient } from './ws-rpc'
+import { RpcError, WsRpcClient, callIdempotent } from './ws-rpc'
 
 /** Minimal scripted fake for the browser WebSocket API. */
 class FakeWebSocket {
@@ -339,5 +339,66 @@ describe('supervisor contract', () => {
     ws.close()
     vi.advanceTimersByTime(800)
     expect(FakeWebSocket.instances.length).toBe(count + 1)
+  })
+})
+
+describe('callIdempotent', () => {
+  it('retries a transport failure with the same idempotency key once reconnected', async () => {
+    const sent: Record<string, unknown>[] = []
+    let failures = 1
+    const rpc = {
+      call: vi.fn(async (_method: string, params?: Record<string, unknown>) => {
+        sent.push(params ?? {})
+        if (failures > 0) {
+          failures -= 1
+          throw new Error('Connection closed')
+        }
+        return { task_id: 't1' }
+      }),
+      waitForConnection: vi.fn().mockResolvedValue(undefined),
+    }
+
+    const result = await callIdempotent(rpc as never, 'chat.send', { message: 'hi' })
+
+    expect(result).toEqual({ task_id: 't1' })
+    expect(sent).toHaveLength(2)
+    expect(typeof sent[0]!.idempotency_key).toBe('string')
+    expect(sent[1]!.idempotency_key).toBe(sent[0]!.idempotency_key)
+    expect(sent[1]!.message).toBe('hi')
+  })
+
+  it('never retries an answer from the gateway', async () => {
+    const rpcError = new RpcError('queue full')
+    rpcError.code = 'QUEUE_FULL'
+    const rpc = {
+      call: vi.fn().mockRejectedValue(rpcError),
+      waitForConnection: vi.fn().mockResolvedValue(undefined),
+    }
+
+    await expect(callIdempotent(rpc as never, 'chat.send', {})).rejects.toBe(rpcError)
+    expect(rpc.call).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a caller-provided key and gives up when the socket does not come back', async () => {
+    vi.useFakeTimers()
+    try {
+      const rpc = {
+        call: vi.fn().mockRejectedValue(new Error('Not connected')),
+        waitForConnection: vi.fn(() => new Promise<void>(() => {})),
+      }
+      const pending = callIdempotent(
+        rpc as never,
+        'chat.send',
+        { idempotency_key: 'mine' },
+        { reconnectTimeoutMs: 1000 },
+      )
+      const settled = expect(pending).rejects.toThrow('Not connected')
+      await vi.advanceTimersByTimeAsync(1500)
+      await settled
+      expect(rpc.call).toHaveBeenCalledTimes(1)
+      expect(rpc.call.mock.calls[0]![1]).toEqual({ idempotency_key: 'mine' })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

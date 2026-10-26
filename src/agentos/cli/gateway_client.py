@@ -569,7 +569,25 @@ class GatewayClient:
         )
 
     async def abort_session(self, key: str) -> dict[str, Any]:
-        return cast(dict[str, Any], await self._call("sessions.abort", {"key": key}))
+        """Stop the session's run (and its child runs); waits for the end.
+
+        A cascade that did not finish within the gateway's bound is reported,
+        not raised: the session's own run is stopped either way, and the
+        caller (Ctrl-C, ``/abort``) has nothing better to do than say so.
+        """
+        try:
+            return cast(dict[str, Any], await self._call("sessions.abort", {"key": key}))
+        except GatewayRPCError as exc:
+            details = exc.data or {}
+            if details.get("code") != "ABORT_INCOMPLETE":
+                raise
+            return {
+                "key": key,
+                "aborted": details.get("aborted") or [],
+                "children_aborted": details.get("children_aborted") or [],
+                "still_running": details.get("still_running") or [],
+                "incomplete": True,
+            }
 
     async def rename_session(self, key: str, name: str | None) -> dict[str, Any]:
         """Set a session's display name; an empty/``None`` name clears it."""
@@ -750,6 +768,9 @@ class GatewayClient:
             "key": session_key,
             "message": message,
             "attachments": attachments or [],
+            # One per message: a gateway that already accepted it answers a
+            # resend with the same turn instead of starting another.
+            "idempotency_key": uuid.uuid4().hex,
             "_source": {
                 "caller_kind": "cli",
                 "channel_kind": "cli",
@@ -782,13 +803,17 @@ class GatewayClient:
             if (
                 accepted_task_id is not None
                 and not active_task_groups
-                and event_name.startswith("task.")
+                and (
+                    event_name.startswith("task.")
+                    or event_name in ("session.event.done", "session.event.error")
+                )
                 and isinstance(payload.get("task_id"), str)
                 and payload["task_id"] != accepted_task_id
             ):
                 # ``task.cancelled`` left over from the aborted previous turn,
-                # or a cron run's ``task.failed`` on this session: with no
-                # task group in flight, only our own task may end the turn.
+                # or a cron run's ``task.failed`` / terminal frame on this
+                # session: with no task group in flight, only our own task may
+                # end the turn.
                 continue
             if event_name == "session.event.error":
                 payload = _normalize_session_error_payload(payload)

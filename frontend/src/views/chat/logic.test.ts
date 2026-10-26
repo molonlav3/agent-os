@@ -49,6 +49,7 @@ import {
   stripProtocolTextLeak,
   stripTimePrefix,
   subscribeResultNeedsTerminalHistorySync,
+  inFlightDecision,
   webchatSessionKey,
   ACTIVE_SESSION_STORAGE_KEY,
   MAX_PENDING,
@@ -730,6 +731,30 @@ describe('subscription recovery helpers', () => {
       }),
     ).toBe(true)
     expect(subscribeResultNeedsTerminalHistorySync({ run_status: 'running' })).toBe(false)
+  })
+
+  it('reads the in-flight snapshot of a subscribe answer', () => {
+    // An older gateway sends no field: the view keeps inferring.
+    expect(inFlightDecision({ run_status: 'running' }, 0)).toEqual({ kind: 'legacy' })
+    expect(inFlightDecision(null, 0)).toEqual({ kind: 'legacy' })
+    // An explicit null is authoritative: nothing runs.
+    expect(inFlightDecision({ in_flight_run: null }, 9)).toEqual({ kind: 'clear' })
+    const run = { run_id: 't1', task_id: 't1', text: 'so far', through_stream_seq: 5 }
+    expect(inFlightDecision({ in_flight_run: run }, 5)).toEqual({
+      kind: 'adopt',
+      run,
+      text: 'so far',
+      rebuild: false,
+    })
+    // The view already holds frames newer than the snapshot.
+    expect(inFlightDecision({ in_flight_run: run }, 7)).toEqual({ kind: 'keep' })
+    // A replay that missed frames: rebuild from the snapshot even if "ahead".
+    expect(inFlightDecision({ in_flight_run: run, replay_complete: false }, 7)).toEqual({
+      kind: 'adopt',
+      run,
+      text: 'so far',
+      rebuild: true,
+    })
   })
 })
 

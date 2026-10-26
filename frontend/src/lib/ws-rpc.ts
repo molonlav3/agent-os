@@ -394,3 +394,58 @@ export class WsRpcClient {
     this.emit('_state', s)
   }
 }
+
+/** A fresh per-request idempotency key (the gateway dedupes on it). */
+export function newIdempotencyKey(): string {
+  const cryptoApi = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto
+  if (cryptoApi && typeof cryptoApi.randomUUID === 'function') return cryptoApi.randomUUID()
+  return `k-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+}
+
+/**
+ * True for a call that failed in transport (socket down or dropped before the
+ * answer), as opposed to an answer from the gateway (`RpcError`). Only the
+ * former is worth retrying: the request may or may not have reached it.
+ */
+export function isTransportError(error: unknown): boolean {
+  return error instanceof Error && !(error instanceof RpcError)
+}
+
+type RetryableRpc = Pick<WsRpcClient, 'call' | 'waitForConnection'>
+
+/**
+ * `rpc.call` for a side-effecting method, safe to retry: the params carry an
+ * `idempotency_key` (one is minted when absent) and a transport failure waits
+ * for the socket to come back and sends the SAME request again, so a gateway
+ * that already acted on the first one answers with that result instead of
+ * acting twice. Gateway errors are never retried.
+ */
+export async function callIdempotent<T = unknown>(
+  rpc: RetryableRpc,
+  method: string,
+  params: Record<string, unknown>,
+  opts: { retries?: number; reconnectTimeoutMs?: number } = {},
+): Promise<T> {
+  const retries = opts.retries ?? 2
+  const reconnectTimeoutMs = opts.reconnectTimeoutMs ?? 20000
+  const request = { ...params }
+  if (typeof request.idempotency_key !== 'string' || !request.idempotency_key) {
+    request.idempotency_key = newIdempotencyKey()
+  }
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await rpc.call<T>(method, request)
+    } catch (error) {
+      if (attempt >= retries || !isTransportError(error)) throw error
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const reconnected = await Promise.race([
+        rpc.waitForConnection().then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), reconnectTimeoutMs)
+        }),
+      ])
+      if (timer !== undefined) clearTimeout(timer)
+      if (!reconnected) throw error
+    }
+  }
+}

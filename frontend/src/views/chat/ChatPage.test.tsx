@@ -645,6 +645,221 @@ describe('ChatPage', () => {
     )
   })
 
+  // The subscribe answer's `in_flight_run` (gateway capability
+  // "inflight-snapshot") is the run's own account of itself.
+  function subscribeWith(answer: Record<string, unknown>, history: unknown[] = []) {
+    let historyReads = 0
+    mockRpc.call.mockImplementation((...args: unknown[]) => {
+      if (args[0] === 'commands.list_for_surface') {
+        return Promise.resolve({ surface: 'web_chat', commands: SLASH_CATALOG })
+      }
+      if (args[0] === 'chat.history') {
+        historyReads += 1
+        return Promise.resolve({ messages: history, history_scope: 'complete' })
+      }
+      if (args[0] === 'sessions.messages.subscribe') return Promise.resolve(answer)
+      return Promise.resolve({})
+    })
+    return { historyReads: () => historyReads }
+  }
+
+  it('seeds the live bubble from the in-flight snapshot when nothing was replayed', async () => {
+    mockRpc = makeRpc()
+    subscribeWith(
+      {
+        subscribed: true,
+        replay_complete: true,
+        replayed_count: 0,
+        current_stream_seq: 12,
+        run_status: 'running',
+        active_task: { task_id: 't3', status: 'running' },
+        in_flight_run: {
+          run_id: 't3',
+          task_id: 't3',
+          status: 'running',
+          started_at: 1000,
+          through_stream_seq: 12,
+          text: 'Here is what I found so far',
+        },
+      },
+      [{ role: 'user', text: 'question', timestamp: 100 }],
+    )
+    renderPage()
+
+    await waitFor(() =>
+      expect(document.querySelector('.msg.assistant.streaming')).toHaveTextContent(
+        'Here is what I found so far',
+      ),
+    )
+    expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument()
+  })
+
+  it('completes replayed text from the snapshot without repeating it', async () => {
+    mockRpc = makeRpc()
+    let resolveSubscribe!: (value: Record<string, unknown>) => void
+    const subscribeResult = new Promise<Record<string, unknown>>((resolve) => {
+      resolveSubscribe = resolve
+    })
+    mockRpc.call.mockImplementation((...args: unknown[]) => {
+      if (args[0] === 'commands.list_for_surface') {
+        return Promise.resolve({ surface: 'web_chat', commands: SLASH_CATALOG })
+      }
+      if (args[0] === 'chat.history') {
+        return Promise.resolve({
+          messages: [{ role: 'user', text: 'question', timestamp: 100 }],
+          history_scope: 'complete',
+        })
+      }
+      if (args[0] === 'sessions.messages.subscribe') return subscribeResult
+      return Promise.resolve({})
+    })
+    renderPage()
+    await waitFor(() => expect(document.querySelector('.msg.user')).toHaveTextContent('question'))
+
+    const key = 'agent:main:webchat:default'
+    // The replay buffer drops text deltas first under pressure: only the
+    // start of the answer came back.
+    act(() => {
+      mockRpc.emit(
+        'session.event.text_delta',
+        { key, stream_seq: 4, text: 'First part, ' },
+        { replayed: true },
+      )
+    })
+    await act(async () => {
+      resolveSubscribe({
+        subscribed: true,
+        replay_complete: true,
+        replayed_count: 1,
+        current_stream_seq: 9,
+        run_status: 'running',
+        active_task: { task_id: 't4', status: 'running' },
+        in_flight_run: {
+          run_id: 't4',
+          task_id: 't4',
+          through_stream_seq: 9,
+          text: 'First part, second part.',
+        },
+      })
+      await subscribeResult
+    })
+
+    const bubble = document.querySelector('.msg.assistant.streaming')
+    await waitFor(() => expect(bubble).toHaveTextContent('First part, second part.'))
+    expect(bubble?.textContent?.match(/First part/g)).toHaveLength(1)
+  })
+
+  it('ends a live view when the snapshot says nothing runs', async () => {
+    mockRpc = makeRpc()
+    let resolveSubscribe!: (value: Record<string, unknown>) => void
+    const subscribeResult = new Promise<Record<string, unknown>>((resolve) => {
+      resolveSubscribe = resolve
+    })
+    mockRpc.call.mockImplementation((...args: unknown[]) => {
+      if (args[0] === 'commands.list_for_surface') {
+        return Promise.resolve({ surface: 'web_chat', commands: SLASH_CATALOG })
+      }
+      if (args[0] === 'chat.history') {
+        return Promise.resolve({
+          messages: [{ role: 'user', text: 'question', timestamp: 100 }],
+          history_scope: 'complete',
+        })
+      }
+      if (args[0] === 'sessions.messages.subscribe') return subscribeResult
+      return Promise.resolve({})
+    })
+    renderPage()
+    await waitFor(() => expect(document.querySelector('.msg.user')).toHaveTextContent('question'))
+
+    const key = 'agent:main:webchat:default'
+    act(() => {
+      mockRpc.emit(
+        'session.event.text_delta',
+        { key, stream_seq: 1, text: 'a stale half answer' },
+        { replayed: true },
+      )
+    })
+    expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument()
+
+    // The run-status label alone would keep the stream ("running" from a task
+    // row that lags); the snapshot's null is the authority.
+    await act(async () => {
+      resolveSubscribe({
+        subscribed: true,
+        replay_complete: true,
+        replayed_count: 1,
+        current_stream_seq: 1,
+        run_status: 'running',
+        active_task: { task_id: 't1', status: 'running' },
+        in_flight_run: null,
+      })
+      await subscribeResult
+    })
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: /stop/i })).toBeNull())
+    expect(document.querySelector('.msg.assistant.streaming')).toBeNull()
+  })
+
+  it('applies a replayed lifecycle frame it already saw live only once', async () => {
+    mockRpc = makeRpc()
+    const reads = subscribeWith({
+      subscribed: true,
+      replay_complete: true,
+      replayed_count: 0,
+      current_stream_seq: 0,
+      run_status: 'idle',
+      in_flight_run: null,
+    })
+    renderPage()
+    await waitFor(() => expect(reads.historyReads()).toBeGreaterThan(0))
+
+    const key = 'agent:main:webchat:default'
+    const terminal = {
+      key,
+      stream_seq: 21,
+      reason: 'task_terminal',
+      run_status: 'cancelled',
+      last_task: { task_id: 't9', status: 'cancelled' },
+    }
+    act(() => mockRpc.emit('sessions.changed', terminal, {}))
+    await waitFor(() => expect(reads.historyReads()).toBeGreaterThan(1))
+    const afterLive = reads.historyReads()
+
+    // The same frame again, replayed to the resubscribing view.
+    act(() => mockRpc.emit('sessions.changed', terminal, { replayed: true }))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(reads.historyReads()).toBe(afterLive)
+  })
+
+  it('retries a send lost with the socket under the same idempotency key', async () => {
+    mockRpc = makeRpc()
+    let sendAttempts = 0
+    mockRpc.call.mockImplementation((...args: unknown[]) => {
+      if (args[0] === 'commands.list_for_surface') {
+        return Promise.resolve({ surface: 'web_chat', commands: SLASH_CATALOG })
+      }
+      if (args[0] === 'chat.send') {
+        sendAttempts += 1
+        if (sendAttempts === 1) return Promise.reject(new Error('Connection closed'))
+        return Promise.resolve({ ok: true, sessionKey: 'agent:main:webchat:default' })
+      }
+      return Promise.resolve({})
+    })
+    renderPage()
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'hello again' } })
+    fireEvent.click(screen.getByRole('button', { name: /send/i }))
+
+    await waitFor(() => expect(sendAttempts).toBe(2))
+    const sends = mockRpc.call.mock.calls
+      .filter(([m]) => m === 'chat.send')
+      .map(([, params]) => params as Record<string, unknown>)
+    expect(typeof sends[0]!.idempotency_key).toBe('string')
+    expect(sends[1]!.idempotency_key).toBe(sends[0]!.idempotency_key)
+    expect(sends[1]!.message).toBe('hello again')
+    // The lost answer was recovered, not reported as a failed send.
+    expect(document.querySelector('.msg.error')).toBeNull()
+  })
+
   it('downloads a non-anchor artifact target through the authenticated delegate', async () => {
     mockRpc = makeRpc()
     renderPage()

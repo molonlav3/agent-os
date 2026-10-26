@@ -207,3 +207,47 @@ async def test_task_terminal_without_an_accepted_task_id_still_ends_the_turn() -
     events = await _collect(client)
 
     assert [e["event"] for e in events] == ["session.event.error"]
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_frame_of_another_task_does_not_end_the_turn() -> None:
+    """Every run now ends with a ``done`` / ``error`` naming its task; a cron
+    run's failure on the same session must not end this turn."""
+    client, calls = _client(
+        on_send=[
+            _event("session.event.error", seq=12, task_id="task-cron", code="agent_error"),
+            _event("session.event.text_delta", seq=13, text="answer"),
+            _event("session.event.done", seq=14, task_id="task-new", reason="stop"),
+        ],
+        subscribe_response={"key": SESSION, "current_stream_seq": 11},
+        send_response={"status": "accepted", "key": SESSION, "task_id": "task-new"},
+    )
+
+    events = await _collect(client)
+
+    assert [e["event"] for e in events] == ["session.event.text_delta", "session.event.done"]
+    send_params = next(params for method, params in calls if method == "sessions.send")
+    assert isinstance(send_params["idempotency_key"], str) and send_params["idempotency_key"]
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_abort_cascade_is_reported_not_raised() -> None:
+    from agentos.cli.gateway_client import GatewayRPCError
+
+    client = GatewayClient()
+
+    async def fake_call(method: str, params: dict | None = None) -> Any:
+        raise GatewayRPCError(
+            method,
+            code="UNAVAILABLE",
+            message="still running",
+            data={"code": "ABORT_INCOMPLETE", "aborted": ["t1"], "still_running": ["child"]},
+        )
+
+    client._call = fake_call  # type: ignore[method-assign]
+
+    result = await client.abort_session(SESSION)
+
+    assert result["incomplete"] is True
+    assert result["aborted"] == ["t1"]
+    assert result["still_running"] == ["child"]
