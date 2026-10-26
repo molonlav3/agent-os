@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, cast
 from urllib.parse import quote
 
@@ -13,7 +14,7 @@ from agentos.chat.source import chat_source_metadata
 from agentos.gateway.access import CONTROL_AND_CHANNEL, CONTROL_ONLY
 from agentos.gateway.config import GatewayConfig
 from agentos.gateway.context_overflow import apply_context_overflow_policy
-from agentos.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
+from agentos.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
 from agentos.gateway.session_events import build_sessions_changed_payload
 from agentos.session.compaction import (
     build_compaction_config_from_provider,
@@ -28,6 +29,21 @@ log = structlog.get_logger(__name__)
 _WEBCHAT_SESSION_KEY = build_webchat_key()
 _CHAT_HISTORY_DEFAULT_LIMIT = 50
 _CHAT_HISTORY_MAX_LIMIT = 200
+#: One ``chat.history`` answer stays under this many bytes of messages, so a
+#: single huge tool result cannot blow the WebSocket frame; older rows that do
+#: not fit are left for the next ``before`` page.
+CHAT_HISTORY_RESPONSE_BUDGET_BYTES = 6 * 1024 * 1024
+#: A message larger than this is sent as a placeholder (see ``chat.entry``).
+CHAT_HISTORY_MESSAGE_BUDGET_BYTES = 128 * 1024
+#: ``delta_cursor`` answers: at most this many rows / bytes after the cursor.
+CHAT_HISTORY_DELTA_MAX_ROWS = 200
+CHAT_HISTORY_DELTA_MAX_BYTES = 1024 * 1024
+#: Leading text a placeholder keeps so the row still reads as something.
+_PLACEHOLDER_PREVIEW_CHARS = 2_000
+#: ``chat.entry`` refuses a row that would not fit a frame on its own.
+_CHAT_ENTRY_MAX_BYTES = 20 * 1024 * 1024
+#: Segment keys that identify a tool call; a placeholder keeps only these.
+_SEGMENT_IDENTITY_KEYS = ("type", "name", "tool_name", "tool_use_id", "id", "is_error", "status")
 
 
 def _canonical_webchat_session_key(value: object = None) -> str:
@@ -152,6 +168,84 @@ def _chat_history_page(
     if len(entries) <= limit:
         return entries, False
     return entries[-limit:], True
+
+
+def _message_size(message: dict[str, Any]) -> int:
+    return len(json.dumps(message, ensure_ascii=False, separators=(",", ":"), default=str).encode())
+
+
+def _placeholder_message(message: dict[str, Any], *, size: int) -> dict[str, Any]:
+    """An oversized row: identity, tool identity and size, not the body.
+
+    ``entry_id`` fetches the full row through ``chat.entry``. A short preview
+    of the text keeps the row readable in a client that knows nothing of
+    placeholders.
+    """
+    placeholder = {
+        key: value
+        for key, value in message.items()
+        if key not in {"text", "tool_calls", "attachments", "artifacts", "usage"}
+    }
+    raw_text = message.get("text")
+    text = raw_text if isinstance(raw_text, str) else ""
+    placeholder["text"] = text[:_PLACEHOLDER_PREVIEW_CHARS]
+    placeholder["placeholder"] = True
+    placeholder["truncated"] = True
+    placeholder["byte_size"] = size
+    placeholder["entry_id"] = message.get("transcript_id") or message.get("message_id")
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        placeholder["tool_calls"] = [
+            {key: segment[key] for key in _SEGMENT_IDENTITY_KEYS if key in segment}
+            for segment in tool_calls
+            if isinstance(segment, dict)
+        ]
+    return placeholder
+
+
+def _budgeted_messages(
+    entries: list[object],
+    *,
+    response_budget: int,
+    message_budget: int,
+    newest_first: bool,
+    max_rows: int | None = None,
+) -> tuple[list[object], list[dict[str, Any]], bool]:
+    """Project ``entries`` to chat messages within the byte budgets.
+
+    Walks newest-first for a history page (the rows a reader sees first are
+    kept; older ones wait for the next ``before`` page) and oldest-first for a
+    delta (rows after the cursor stay contiguous). Returns the entries kept,
+    their messages in chronological order, and whether rows were left out.
+    """
+    order = list(reversed(entries)) if newest_first else list(entries)
+    kept: list[tuple[object, dict[str, Any] | None]] = []
+    total = 0
+    cut = False
+    for entry in order:
+        if max_rows is not None and len(kept) >= max_rows:
+            cut = True
+            break
+        projected = transcript_entries_to_chat_messages([entry], limit=None)
+        message = projected[0] if projected else None
+        size = 0
+        if message is not None:
+            size = _message_size(message)
+            if size > message_budget:
+                message = _placeholder_message(message, size=size)
+                size = _message_size(message)
+        if kept and total + size > response_budget:
+            cut = True
+            break
+        total += size
+        kept.append((entry, message))
+    if newest_first:
+        kept.reverse()
+    return (
+        [entry for entry, _ in kept],
+        [message for _, message in kept if message is not None],
+        cut,
+    )
 
 
 def _session_summary_to_chat_payload(summary: object) -> dict[str, Any]:
@@ -531,11 +625,21 @@ async def _handle_chat_thinking(params: dict | None, ctx: RpcContext) -> dict:
 
 @_d.method("chat.history", CONTROL_AND_CHANNEL)
 async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
+    """A page of a session's transcript, display-ready and byte-bounded.
+
+    ``delta_cursor`` (a ``newest_cursor`` from an earlier answer) asks for
+    only the rows after it: ``kind: "delta"``, or ``kind: "reset"`` with the
+    latest page when the cursor no longer names a row. Messages over
+    ``CHAT_HISTORY_MESSAGE_BUDGET_BYTES`` come back as placeholders
+    (``placeholder: true``, ``byte_size``, ``entry_id`` for ``chat.entry``).
+    Unless paging backwards, ``in_flight_run`` reports the running turn.
+    """
     raw_params = params or {}
     session_key = _canonical_webchat_session_key(raw_params.get("sessionKey"))
     limit = _normalize_chat_history_limit(raw_params.get("limit"))
     before = raw_params.get("before")
     after = raw_params.get("after")
+    delta_cursor = raw_params.get("delta_cursor", raw_params.get("deltaCursor"))
     include_canonical = _chat_history_bool(
         raw_params.get("includeCanonical"),
         default=True,
@@ -557,14 +661,66 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
         # A whitelist, not a blanket swallow — a typo'd agent key should still
         # surface as an error rather than silently render an empty chat.
         if _is_webchat_session_key(session_key) or _is_cron_session_key(session_key):
-            return _empty_chat_history_payload(limit)
+            empty = _empty_chat_history_payload(limit)
+            if delta_cursor is not None:
+                empty["kind"] = "reset"
+            empty["in_flight_run"] = None
+            return empty
         raise
+
+    in_flight_run: dict[str, Any] | None = None
+    if not before:
+        from agentos.gateway.rpc_sessions import session_in_flight_run
+
+        in_flight_run = await session_in_flight_run(ctx, session_key)
+
+    kind: str | None = None
+    if delta_cursor is not None:
+        cursor_index = _chat_history_cursor_index(transcript, delta_cursor)
+        if cursor_index is not None:
+            delta_entries, delta_messages, delta_more = _budgeted_messages(
+                transcript[cursor_index + 1 :],
+                response_budget=CHAT_HISTORY_DELTA_MAX_BYTES,
+                message_budget=CHAT_HISTORY_MESSAGE_BUDGET_BYTES,
+                newest_first=False,
+                max_rows=CHAT_HISTORY_DELTA_MAX_ROWS,
+            )
+            if not _control_ui_show_thinking(ctx):
+                for message in delta_messages:
+                    message.pop("has_thinking", None)
+            return {
+                "kind": "delta",
+                "messages": _annotate_transcript_attachment_downloads(
+                    delta_messages, session_key=session_key
+                ),
+                # More rows after these: ask again from ``newest_cursor``.
+                "has_more": delta_more,
+                "newest_cursor": (
+                    _chat_history_cursor(delta_entries[-1]) if delta_entries else str(delta_cursor)
+                ),
+                "loaded_count": len(delta_entries),
+                "canonical_available": canonical_available,
+                "in_flight_run": in_flight_run,
+            }
+        # The cursor names no row (compaction, reset, another session): the
+        # client must replace what it has with the latest page.
+        kind = "reset"
+        before = after = None
+
     page_entries, has_more = _chat_history_page(
         transcript,
         limit=limit,
         before=before,
         after=after,
     )
+    page_entries, messages, budget_cut = _budgeted_messages(
+        page_entries,
+        response_budget=CHAT_HISTORY_RESPONSE_BUDGET_BYTES,
+        message_budget=CHAT_HISTORY_MESSAGE_BUDGET_BYTES,
+        newest_first=not after,
+    )
+    if budget_cut:
+        has_more = True
     summaries = await _chat_history_summaries(
         mgr,
         session_key,
@@ -577,11 +733,10 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
     else:
         history_scope = "complete"
 
-    messages = transcript_entries_to_chat_messages(page_entries, limit=None)
     if not _control_ui_show_thinking(ctx):
         for message in messages:
             message.pop("has_thinking", None)
-    return {
+    payload: dict[str, Any] = {
         "messages": _annotate_transcript_attachment_downloads(
             messages,
             session_key=session_key,
@@ -595,6 +750,53 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
         "canonical_available": canonical_available,
         "compaction_summaries": summaries,
     }
+    if kind is not None:
+        payload["kind"] = kind
+    if not before:
+        payload["in_flight_run"] = in_flight_run
+    return payload
+
+
+@_d.method("chat.entry", CONTROL_ONLY)
+async def _handle_chat_entry(params: dict | None, ctx: RpcContext) -> dict:
+    """The full message behind a ``chat.history`` placeholder.
+
+    ``entryId`` is the placeholder's ``entry_id`` (a transcript id, or a
+    message id for rows that have none).
+    """
+    raw_params = params or {}
+    session_key = _canonical_webchat_session_key(raw_params.get("sessionKey"))
+    entry_id = raw_params.get("entryId", raw_params.get("entry_id"))
+    if entry_id in (None, ""):
+        raise ValueError("params.entryId is required")
+    mgr = _require_chat_session_manager(ctx)
+    transcript, _ = await _chat_history_transcript(mgr, session_key, include_canonical=True)
+    wanted = str(entry_id)
+    for entry in transcript:
+        ids = {str(getattr(entry, "id", "")), str(getattr(entry, "message_id", ""))}
+        if wanted not in ids:
+            continue
+        projected = transcript_entries_to_chat_messages([entry], limit=None)
+        if not projected:
+            break
+        message = projected[0]
+        if not _control_ui_show_thinking(ctx):
+            message.pop("has_thinking", None)
+        size = _message_size(message)
+        if size > _CHAT_ENTRY_MAX_BYTES:
+            raise RpcHandlerError(
+                "ENTRY_TOO_LARGE",
+                "This message is too large to send in one frame.",
+                details={"entry_id": entry_id, "byte_size": size},
+            )
+        _annotate_transcript_attachment_downloads([message], session_key=session_key)
+        return {
+            "sessionKey": session_key,
+            "entry_id": entry_id,
+            "byte_size": size,
+            "message": message,
+        }
+    raise KeyError(f"Transcript entry not found: {entry_id}")
 
 
 @_d.method("chat.inject")
