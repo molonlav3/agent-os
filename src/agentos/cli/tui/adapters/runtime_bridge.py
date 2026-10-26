@@ -211,6 +211,9 @@ def _gateway_runtime_notifier(
             return
         if notice.kind == "error":
             output_console.print(error_panel_factory(notice.message or ""))
+            return
+        if notice.kind == "connection":
+            output_console.print(f"[yellow]{markup_escape(notice.message or '')}[/yellow]")
 
     def _notify(notice: _gateway_runtime.GatewayRuntimeNotice) -> None:
         # In full-screen the startup notices land before the app owns the

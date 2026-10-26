@@ -326,3 +326,42 @@ async def test_cli_client_bad_token_still_exits_with_the_handshake_frame(
         gateway.handshake_error = {"code": "UNAUTHORIZED", "message": "Authentication failed"}
         with pytest.raises(SystemExit, match="Handshake failed.*UNAUTHORIZED"):
             await _cli_client().connect(gateway.url, token="wrong")
+
+
+async def test_cli_client_gives_up_after_its_reconnect_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A gateway that is gone for good must not leave `agentos chat` waiting."""
+    monkeypatch.setenv("AGENTOS_OPERATOR_SECRET_FILE", str(tmp_path / "absent"))
+    statuses: list[str] = []
+    client = _cli_client()
+    client.reconnect_budget_s = 0.4
+    client.on_connection_status = lambda state, _text: statuses.append(state)
+    async with _FakeGateway() as gateway:
+        await client.connect(gateway.url)
+    # The fake gateway is shut down: every reconnect attempt is refused.
+    try:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(ConnectionError, match="restart chat or reconnect"):
+            await client.call("status")
+        assert asyncio.get_running_loop().time() - started < 3.0
+        assert statuses == ["reconnecting", "lost"]
+    finally:
+        await client.close()
+
+
+async def test_cli_client_reports_a_recovered_outage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    monkeypatch.setenv("AGENTOS_OPERATOR_SECRET_FILE", str(tmp_path / "absent"))
+    statuses: list[str] = []
+    async with _FakeGateway() as gateway:
+        client = _cli_client()
+        client.on_connection_status = lambda state, _text: statuses.append(state)
+        await client.connect(gateway.url)
+        try:
+            await gateway.connections[0].close(1012)
+            await _until(lambda: client.reconnects == 1)
+            assert statuses == ["reconnecting", "reconnected"]
+        finally:
+            await client.close()

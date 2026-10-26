@@ -7,7 +7,7 @@ import ipaddress
 import json
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -158,6 +158,8 @@ def _frame_belongs_to_turn(
 _CONNECTION_LOST = (
     "Gateway connection lost; restart chat or reconnect before sending another command."
 )
+#: How long the CLI client keeps reconnecting after a drop before giving up.
+CLI_RECONNECT_BUDGET_S = 60.0
 
 
 class GatewayClient:
@@ -190,6 +192,12 @@ class GatewayClient:
         self.auto_reconnect = auto_reconnect
         self.reconnect_initial_delay_s = RECONNECT_INITIAL_DELAY_S
         self.reconnect_max_delay_s = RECONNECT_MAX_DELAY_S
+        #: How long to keep reconnecting before failing for good, so a caller
+        #: waiting on the gateway (``agentos chat``) is never stuck for ever.
+        self.reconnect_budget_s: float | None = CLI_RECONNECT_BUDGET_S
+        #: Told about outages as they happen ("reconnecting", "reconnected",
+        #: "lost"), e.g. to print a line in ``agentos chat``.
+        self.on_connection_status: Callable[[str, str], None] | None = None
         #: Successful reconnects since :meth:`connect`.
         self.reconnects = 0
 
@@ -843,14 +851,44 @@ class GatewayClient:
         self._ws = None
         self._ready_event().clear()
         if self._reconnect_task is None or self._reconnect_task.done():
+            self._report_status("reconnecting", "Gateway connection lost; reconnecting…")
             self._reconnect_task = asyncio.create_task(self._reconnect_loop())
         return err
 
+    def _report_status(self, state: str, text: str) -> None:
+        callback = self.on_connection_status
+        if callback is None:
+            return
+        try:
+            callback(state, text)
+        except Exception:  # noqa: BLE001 - a status line must never break the client
+            pass
+
+    def _give_up(self, exc: BaseException) -> None:
+        self._mark_connection_failed(exc)
+        self._ready_event().set()
+        self._report_status("lost", _CONNECTION_LOST)
+
     async def _reconnect_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        budget = self.reconnect_budget_s
+        deadline = None if budget is None else loop.time() + budget
+        last_error: BaseException = ConnectionError("gateway unreachable")
         delays = reconnect_delays(
             initial=self.reconnect_initial_delay_s, maximum=self.reconnect_max_delay_s
         )
         for delay in delays:
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    self._give_up(
+                        ConnectionError(
+                            f"{_CONNECTION_LOST} Original error: no gateway for "
+                            f"{budget:g}s ({last_error})"
+                        )
+                    )
+                    return
+                delay = min(delay, remaining)
             await asyncio.sleep(delay)
             if self._closing:
                 return
@@ -859,14 +897,16 @@ class GatewayClient:
             except asyncio.CancelledError:
                 raise
             except GatewayHandshakeError as exc:
+                last_error = exc
                 if exc.recoverable:
                     continue
-                self._mark_connection_failed(exc)
-                self._ready_event().set()
+                self._give_up(exc)
                 return
-            except Exception:  # noqa: BLE001 - network errors: try again later
+            except Exception as exc:  # noqa: BLE001 - network errors: try again later
+                last_error = exc.__cause__ or exc
                 continue
             self.reconnects += 1
+            self._report_status("reconnected", "Reconnected to the gateway.")
             for method, params in self._subscriptions.resubscribe_calls():
                 try:
                     await self._call(method, params)

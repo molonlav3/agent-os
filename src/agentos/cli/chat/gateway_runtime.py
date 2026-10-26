@@ -27,6 +27,7 @@ GatewayRuntimeNoticeKind = Literal[
     "goodbye",
     "unknown_command",
     "error",
+    "connection",
 ]
 
 
@@ -206,6 +207,10 @@ async def run_gateway_chat(
 
     client = GatewayClient()
     await client.connect(default_gateway_url(), token=default_gateway_token())
+    # Outages show up as a line in the transcript instead of a silent wait.
+    client.on_connection_status = lambda _state, text: deps.notify(
+        GatewayRuntimeNotice(kind="connection", message=text)
+    )
 
     elevated_state: dict[str, str | None] = {"mode": None}
     suggestion = _NextPromptSuggestion(client)
