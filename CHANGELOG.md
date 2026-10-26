@@ -49,7 +49,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   estimate for an in-place restart, `null` for a terminal stop) and the
   console reconnects when the gateway said it would be back.
   `agentos gateway status --json` adds `drain_budget_ms`, `active_turns` and
-  the gateway's `runtime.state` (new `gateway.status` RPC).
+  the gateway's `runtime.state` (new `gateway.status` RPC). `hello-ok`
+  advertises it as the `supervisor-contract` capability.
 - `agentos gateway install` / `uninstall` / `status --deep` (#3690): run the
   gateway as a macOS LaunchAgent (`dev.useagentos.gateway`: `KeepAlive`,
   `ThrottleInterval 10`, `ExitTimeOut` = drain budget + 10 s) or a Linux

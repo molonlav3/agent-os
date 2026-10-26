@@ -26,11 +26,13 @@ import time
 from collections.abc import Callable
 from typing import Any, Literal
 
+from agentos.gateway.protocol import ErrorDetailCode
+
 #: ``sysexits.h`` EX_CONFIG: a configuration error. A service manager treats
 #: it as "do not restart blindly" (systemd ``RestartPreventExitStatus=78``).
 EX_CONFIG = 78
 #: ``ErrorShape.details.code`` of a handshake refused because boot is not done.
-STARTUP_SIDECARS = "STARTUP_SIDECARS"
+STARTUP_SIDECARS = ErrorDetailCode.STARTUP_SIDECARS.value
 #: RFC 6455 "Try Again Later": the WebSocket close code that goes with it.
 WS_CLOSE_TRY_AGAIN_LATER = 1013
 WS_CLOSE_REASON_STARTING = "gateway starting"

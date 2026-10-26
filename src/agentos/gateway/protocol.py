@@ -54,6 +54,9 @@ CAPABILITIES: frozenset[str] = frozenset(
         "auth-rate-limit",
         "challenge-ts",
         "rpc-http",
+        # /ready + /startupz states, STARTUP_SIDECARS during boot, and
+        # `shutdown {reason, restart_expected_ms}` (gateway/readiness.py).
+        "supervisor-contract",
         "typed-errors",
     }
 )

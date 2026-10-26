@@ -235,6 +235,9 @@ class _RecordingConn:
     async def send_event(self, event: str, payload: Any = None) -> None:
         self.events.append((event, payload))
 
+    async def flush(self, timeout: float = 1.0) -> None:
+        return None
+
     async def close(self, *args: Any, **kwargs: Any) -> None:
         self.closed = True
 
@@ -289,17 +292,9 @@ class _WireRecorder:
         self.close_codes.append(code)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "close() broadcasts `shutdown` into each connection's writer queue and "
-        "closes the socket 1012 before the writer has flushed it, so the frame "
-        "is dropped. The flush-before-close ordering lands with the gateway "
-        "hardening branch; drop this marker once this branch is rebased on it."
-    ),
-)
 @pytest.mark.asyncio
 async def test_shutdown_frame_reaches_a_client_through_its_writer_queue() -> None:
+    """The frame is flushed through the writer before the socket closes 1012."""
     from agentos.gateway.access import ConnectionSurface
     from agentos.gateway.auth import AccessContext
     from agentos.gateway.websocket import WsConnection

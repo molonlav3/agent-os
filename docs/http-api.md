@@ -205,10 +205,13 @@ uses this transport.
    current protocol is `3`; send `minProtocol = maxProtocol = 3`. `client` is
    informational, `{id, version, platform, mode}`, every field optional.
    `auth.token` carries the gateway token.
+   While the gateway is still booting, `connect` is answered with a retryable
+   `UNAVAILABLE` (`details.code: "STARTUP_SIDECARS"`, `retry_after_ms`) and the
+   socket closes `1013`; retry after `retry_after_ms`.
 3. The server answers with a bare `hello-ok` frame (not a `res`) carrying
    `features.methods`, `features.events`, `features.capabilities` (additive
    feature names such as `typed-errors`, `challenge-ts`, `auth-rate-limit`,
-   `rpc-http`; treat an unknown one as absent), `policy` and
+   `rpc-http`, `supervisor-contract`; treat an unknown one as absent), `policy` and
    `auth.nonce` (the challenge nonce, so a client can check it answered its
    own challenge).
 
