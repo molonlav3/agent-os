@@ -6,7 +6,12 @@ import path from 'node:path'
 import { PassThrough } from 'node:stream'
 import { describe, expect, it, vi } from 'vitest'
 import type { GatewaySettings } from '@shared/settings'
-import { GatewaySupervisor, STOP_DRAIN_MS, STOP_FORCE_MS } from './supervisor'
+import {
+  GatewaySupervisor,
+  STOP_DRAIN_MS,
+  STOP_FORCE_MS,
+  summarizeDoctorReport,
+} from './supervisor'
 
 const external: GatewaySettings = {
   mode: 'external',
@@ -264,5 +269,246 @@ describe('GatewaySupervisor.stop escalation', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+/**
+ * A spawn stand-in whose children the test drives: each spawned child runs
+ * `script(child, index)` right after the supervisor has attached listeners.
+ */
+function scriptedSpawn(
+  script: (child: EventEmitter & { stderr: PassThrough }, index: number) => void,
+) {
+  let count = 0
+  const spawn = vi.fn(() => {
+    const index = count++
+    const child = new EventEmitter() as EventEmitter & {
+      pid: number
+      stdout: PassThrough
+      stderr: PassThrough
+      kill: () => boolean
+    }
+    child.pid = 5000 + index
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.kill = () => true
+    setTimeout(() => script(child, index), 5)
+    return child
+  })
+  return {
+    spawn: spawn as unknown as typeof import('node:child_process').spawn,
+    spawned: () => count,
+  }
+}
+
+const managedCli: GatewaySettings = {
+  mode: 'managed',
+  host: '127.0.0.1',
+  port: 18998,
+  token: null,
+  cliPath: '/opt/agentos',
+}
+
+function managedDeps(extra: Partial<ConstructorParameters<typeof GatewaySupervisor>[1]>) {
+  return {
+    locate: (override: string | null) => override,
+    secretDir: mkdtempSync(path.join(os.tmpdir(), 'agentos-sup-')),
+    ...extra,
+  }
+}
+
+describe('GatewaySupervisor (exit 78: configuration error)', () => {
+  it('runs doctor once, retries once, and reports running when the retry boots', async () => {
+    const { spawn, spawned } = scriptedSpawn((child, index) => {
+      if (index === 0) child.emit('exit', 78, null)
+    })
+    const runDoctor = vi.fn(async () => 'Local configuration cannot be loaded')
+    const sup = new GatewaySupervisor(
+      () => managedCli,
+      managedDeps({
+        probe: async () => false,
+        probeReady: async () => (spawned() >= 2 ? 'ready' : 'waiting'),
+        runDoctor,
+        spawn,
+      }),
+    )
+    const seen: { state: string; detail: string | null | undefined }[] = []
+    sup.subscribe((s) => seen.push({ state: s.state, detail: s.detail }))
+
+    const status = await sup.start()
+
+    expect(status).toMatchObject({ state: 'running', pid: 5001, error: null, detail: null })
+    expect(spawned()).toBe(2)
+    expect(runDoctor).toHaveBeenCalledTimes(1)
+    expect(runDoctor).toHaveBeenCalledWith('/opt/agentos')
+    expect(seen).toEqual([
+      { state: 'starting', detail: null },
+      { state: 'starting', detail: 'Configuration error (exit 78): running agentos doctor' },
+      { state: 'starting', detail: 'Retrying start' },
+      { state: 'running', detail: null },
+    ])
+  })
+
+  it('surfaces the exit code and the doctor summary when the retry fails too', async () => {
+    const { spawn, spawned } = scriptedSpawn((child) => {
+      child.stderr.write('AgentOS config error: the gateway configuration is invalid\n')
+      setTimeout(() => child.emit('exit', 78, null), 5)
+    })
+    const runDoctor = vi.fn(
+      async () => 'Local configuration cannot be loaded (fix: agentos onboard status --json)',
+    )
+    const sup = new GatewaySupervisor(
+      () => managedCli,
+      managedDeps({
+        probe: async () => false,
+        probeReady: async () => 'waiting',
+        runDoctor,
+        spawn,
+      }),
+    )
+
+    const status = await sup.start()
+
+    expect(spawned()).toBe(2)
+    expect(runDoctor).toHaveBeenCalledTimes(1)
+    expect(status.state).toBe('error')
+    expect(status.exitCode).toBe(78)
+    expect(status.error).toContain('configuration error (exit 78)')
+    expect(status.error).toContain(
+      'agentos doctor: Local configuration cannot be loaded (fix: agentos onboard status --json)',
+    )
+    expect(status.error).toContain('AgentOS config error')
+  })
+
+  it('keeps the old behaviour for any other exit code: no doctor, no retry', async () => {
+    const { spawn, spawned } = scriptedSpawn((child) => {
+      child.stderr.write('Traceback: boom\n')
+      setTimeout(() => child.emit('exit', 1, null), 5)
+    })
+    const runDoctor = vi.fn(async () => 'never')
+    const sup = new GatewaySupervisor(
+      () => managedCli,
+      managedDeps({
+        probe: async () => false,
+        probeReady: async () => 'waiting',
+        runDoctor,
+        spawn,
+      }),
+    )
+
+    const status = await sup.start()
+
+    expect(spawned()).toBe(1)
+    expect(runDoctor).not.toHaveBeenCalled()
+    expect(status).toMatchObject({ state: 'error', exitCode: 1 })
+    expect(status.error).toContain('gateway exited (code=1, signal=null)')
+    expect(status.error).toContain('Traceback: boom')
+  })
+
+  it('reports stopped, not error, when stop() lands during the doctor run', async () => {
+    const { spawn, spawned } = scriptedSpawn((child) => child.emit('exit', 78, null))
+    let sup: GatewaySupervisor | null = null
+    const runDoctor = vi.fn(async () => {
+      await sup!.stop()
+      return null
+    })
+    sup = new GatewaySupervisor(
+      () => managedCli,
+      managedDeps({
+        probe: async () => false,
+        probeReady: async () => 'waiting',
+        runDoctor,
+        spawn,
+      }),
+    )
+
+    const status = await sup.start()
+
+    expect(spawned()).toBe(1)
+    expect(status.state).toBe('stopped')
+  })
+})
+
+describe('GatewaySupervisor (readiness of a spawned child)', () => {
+  /** fetch stand-in: nothing listens before the spawn, then `/ready` follows `ready`. */
+  function stubGateway(ready: number[], spawned: () => number) {
+    const calls: string[] = []
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = String(input)
+      calls.push(url)
+      if (spawned() === 0) throw new Error('ECONNREFUSED')
+      if (url.endsWith('/ready')) {
+        const code = ready.length > 1 ? ready.shift()! : ready[0]!
+        return new Response('{}', { status: code })
+      }
+      return new Response('{"ok":true}', { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return calls
+  }
+
+  it('waits for /ready to answer 200; a 503 keeps it starting', async () => {
+    const { spawn, spawned } = scriptedSpawn(() => {})
+    const calls = stubGateway([503, 503, 200], spawned)
+    const sup = new GatewaySupervisor(() => managedCli, managedDeps({ spawn }))
+    const seen: string[] = []
+    sup.subscribe((s) => seen.push(s.state))
+    try {
+      const status = await sup.start()
+      expect(status).toMatchObject({ state: 'running', pid: 5000 })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+    const readyCalls = calls.filter((url) => url.endsWith('/ready'))
+    expect(readyCalls).toHaveLength(3)
+    // Only the pre-spawn adoption check used /health.
+    expect(calls.filter((url) => url.endsWith('/health'))).toHaveLength(1)
+    expect(seen).toEqual(['starting', 'running'])
+  })
+
+  it('falls back to /health on an engine whose /ready is a 404', async () => {
+    const { spawn, spawned } = scriptedSpawn(() => {})
+    const calls = stubGateway([404], spawned)
+    const sup = new GatewaySupervisor(() => managedCli, managedDeps({ spawn }))
+    try {
+      const status = await sup.start()
+      expect(status.state).toBe('running')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+    expect(calls.filter((url) => url.endsWith('/ready')).length).toBeGreaterThanOrEqual(1)
+    expect(calls.filter((url) => url.endsWith('/health')).length).toBeGreaterThanOrEqual(2)
+  })
+})
+
+describe('summarizeDoctorReport', () => {
+  it('names the first error that is not "the gateway is down", with its command', () => {
+    const report = {
+      ready: false,
+      findings: [
+        { id: 'gateway.unavailable', severity: 'error', title: 'Gateway is unavailable' },
+        {
+          id: 'config.local.unreadable',
+          severity: 'error',
+          title: 'Local configuration cannot be loaded',
+          fixSteps: [{ label: 'Inspect' }, { label: 'Fix', command: 'agentos onboard' }],
+        },
+        { id: 'provider.key', severity: 'warn', title: 'Provider key missing' },
+      ],
+    }
+    expect(summarizeDoctorReport(report)).toBe(
+      'Local configuration cannot be loaded (fix: agentos onboard)',
+    )
+  })
+
+  it('returns null when there is nothing beyond the gateway being down', () => {
+    expect(
+      summarizeDoctorReport({
+        findings: [
+          { id: 'gateway.unavailable', severity: 'error', title: 'Gateway is unavailable' },
+        ],
+      }),
+    ).toBeNull()
+    expect(summarizeDoctorReport(null)).toBeNull()
   })
 })

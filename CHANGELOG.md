@@ -77,6 +77,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `cron.list` rows carry `concurrency` and `health`
   (`consecutive_failures`, `last_error`, `degraded` at 3 failures in a row).
   A run in progress no longer clears the job's last error. (#3699)
+- Desktop app: when the gateway it starts exits with code 78 (configuration
+  error) it runs `agentos doctor --json` once, retries the start once, and
+  otherwise shows the exit code with doctor's top finding and fix. A spawned
+  gateway counts as running once `/ready` answers `200` (`/health` on older
+  engines), and the gateway status carries `detail` and `exitCode`. (#3682)
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up

@@ -51,7 +51,7 @@ export function SidebarFooter() {
         size="icon"
         disabled={busy}
         aria-label={label}
-        title={`${t(`gateway.state.${status.state}`)}${status.url ? ` · ${status.url}` : ''}${status.error ? ` · ${status.error}` : ''}`}
+        title={`${t(`gateway.state.${status.state}`)}${status.url ? ` · ${status.url}` : ''}${status.detail ? ` · ${status.detail}` : ''}${status.error ? ` · ${status.error}` : ''}`}
         onClick={() => void (running ? stop() : start())}
       >
         <span className="relative flex">
