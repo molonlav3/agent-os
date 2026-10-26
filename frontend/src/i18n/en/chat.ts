@@ -805,6 +805,12 @@ export const chat = defineNamespace('chat', {
   msgCopyFailed: 'Copy failed: {message}',
   msgWaitForResponse: 'Wait for the current response to finish',
   msgNoPrevious: 'No previous message to regenerate',
+  msgTruncated: 'Message truncated',
+  msgTruncatedSize: 'Message truncated ({size})',
+  msgShowFull: 'Show full',
+  msgShowFullLoading: 'Loading…',
+  msgShowFullMissing: 'The message is no longer in this session.',
+  msgShowFullFailed: 'Could not load the full message: {message}',
 
   // Transcript: thinking indicator verbs (chat.js:381-382).
   verbWatching: 'Watching',

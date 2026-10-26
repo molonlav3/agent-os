@@ -34,6 +34,7 @@ import {
 import type { CompactionSummary } from './transcript/compaction'
 import {
   CHAT_HISTORY_PAGE_SIZE,
+  applyHistoryDelta,
   createHistoryRenderer,
   historyResponseMetadata,
   mergeHistoryMessagePages,
@@ -462,6 +463,13 @@ export function useTranscript(opts: {
   // lazily by the imperative controller and reset on every session boundary.
   const historyHasRenderedRef = useRef(false)
   const historyHydratingRef = useRef(false)
+  // A reconnect asks only for the rows after the newest one rendered
+  // (`chat.history` `delta_cursor`); any other refresh reads the full page.
+  const historyDeltaRequestedRef = useRef(false)
+  const newestHistoryCursorRef = useRef<{ session: string; cursor: string | null }>({
+    session: '',
+    cursor: null,
+  })
   const historySettledSessionRef = useRef('')
   const subscriptionSettledSessionRef = useRef('')
   const [subscriptionSettleRevision, setSubscriptionSettleRevision] = useState(0)
@@ -1161,6 +1169,13 @@ export function useTranscript(opts: {
         })) as { reasoning?: string | null } | null
         return res?.reasoning ?? null
       },
+      fetchEntry: async (entryId: string) => {
+        const res = (await rpc.call('chat.entry', {
+          sessionKey: sessionKeyRef.current,
+          entryId,
+        })) as { message?: ChatMessage | null } | null
+        return res?.message ?? null
+      },
       getCurrentSessionLiveUserAnchor: () => controller.getCurrentSessionLiveUserAnchor(),
       getPendingFinalizedAssistantBubble: () => controller.getPendingFinalizedAssistantBubble(),
       isPendingFinalizedAssistantBubble: (row) => controller.isPendingFinalizedAssistantBubble(row),
@@ -1436,18 +1451,44 @@ export function useTranscript(opts: {
     queryKey: ['chat', 'history', opts.sessionKey],
     queryFn: async () => {
       historyHydratingRef.current = true
+      // Cleared only once a read completes: a resync that supersedes this read
+      // mid-flight (the subscribe's terminal sync right after a reconnect)
+      // still reads the delta rather than the full page.
+      const wantDelta = historyDeltaRequestedRef.current
       await rpc.waitForConnection()
       // Do not reconstruct router receipts against placeholder tier labels. The
       // timeout is faithful: config failure must never hang history forever.
       await awaitRouterConfigReady(routerConfigGate.promise)
+      const known = newestHistoryCursorRef.current
+      if (wantDelta && known.session === opts.sessionKey && known.cursor) {
+        try {
+          const delta = await rpc.call<HistoryResponse>('chat.history', {
+            sessionKey: opts.sessionKey,
+            delta_cursor: known.cursor,
+            includeCanonical: false,
+            includeSummaries: false,
+          })
+          const merged = applyHistoryDelta(pagingRef.current, delta)
+          if (merged) {
+            historyDeltaRequestedRef.current = false
+            return merged
+          }
+          // `kind: "reset"` (or more rows than one delta carries): read the
+          // full page below, as before.
+        } catch {
+          // An older gateway, or a transient failure: the full read decides.
+        }
+      }
       // Legacy `_loadHistory` params (chat.js:5457-5462): `sessionKey`, `limit`,
       // `includeCanonical:false`, `includeSummaries:true`.
-      return rpc.call<HistoryResponse>('chat.history', {
+      const page = await rpc.call<HistoryResponse>('chat.history', {
         sessionKey: opts.sessionKey,
         limit: CHAT_HISTORY_PAGE_SIZE,
         includeCanonical: false,
         includeSummaries: true,
       })
+      historyDeltaRequestedRef.current = false
+      return page
     },
     // Legacy re-issues the initial load on view entry / reconnect / after a turn
     // (via _scheduleHistorySync); react-query owns the initial + refresh, and
@@ -1474,6 +1515,7 @@ export function useTranscript(opts: {
       renderedResponseAtRef.current = historyQuery.dataUpdatedAt
       const messages = (data.messages || []) as ChatMessage[]
       const meta = historyResponseMetadata(data)
+      newestHistoryCursorRef.current = { session: opts.sessionKey, cursor: meta.newestCursor }
       pagingRef.current = {
         loadedMessages: messages.slice(),
         oldestCursor: meta.oldestCursor,
@@ -2370,6 +2412,9 @@ export function useTranscript(opts: {
           controller.applyRpcPolicy(rpc.policy)
           controller.hideThinkingIndicator()
           void subscribe()
+          // What the view already shows stays; only the rows written while
+          // the socket was down are read (full page if the cursor is gone).
+          historyDeltaRequestedRef.current = true
           resyncHistory()
         }
         if (state === 'disconnected' && controller.isStreaming()) {

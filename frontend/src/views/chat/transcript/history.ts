@@ -99,6 +99,29 @@ export interface HistoryResponse {
   newest_cursor?: string | null
   history_scope?: string
   compaction_summaries?: unknown[]
+  /** `delta` / `reset` on an answer to `delta_cursor`. */
+  kind?: string
+}
+
+/**
+ * Fold a `chat.history` `delta_cursor` answer (only the rows after the
+ * client's `newest_cursor`) into what is loaded, as a full response the
+ * renderer can take. Returns null when the delta cannot stand in for a full
+ * read: the cursor was unusable (`kind: "reset"`) or more rows are waiting.
+ */
+export function applyHistoryDelta(
+  paging: HistoryPagingState,
+  delta: HistoryResponse | null | undefined,
+): HistoryResponse | null {
+  if (!delta || delta.kind !== 'delta' || delta.has_more) return null
+  return {
+    messages: mergeHistoryMessagePages(paging.loadedMessages, delta.messages || []),
+    has_more: paging.hasMore,
+    oldest_cursor: paging.oldestCursor,
+    newest_cursor: delta.newest_cursor ?? null,
+    history_scope: paging.scope,
+    compaction_summaries: paging.compactionSummaries,
+  }
 }
 
 /** chat.js:5329-5338 — normalize a `chat.history` response's paging metadata. */
@@ -224,6 +247,11 @@ export interface HistoryRenderDeps {
   getLiveThinkingBlock?: () => HTMLElement | null
   /** `chat.thinking` fetch-on-expand for history rows flagged `has_thinking`. */
   fetchThinking?: (messageId: string) => Promise<string | null>
+  /**
+   * `chat.entry` fetch for a row the gateway sent as a placeholder (too large
+   * for a history page): resolves to the full message, or null.
+   */
+  fetchEntry?: (entryId: string) => Promise<ChatMessage | null>
   getCurrentSessionLiveUserAnchor: () => HTMLElement | null
   getPendingFinalizedAssistantBubble: () => HTMLElement | null
   isPendingFinalizedAssistantBubble: (el: HTMLElement | null) => boolean
@@ -233,6 +261,22 @@ export interface HistoryRenderDeps {
 }
 
 /** Paging state the scope row + render path read (subset of legacy fields). */
+/** "150 KiB" / "2.4 MiB" for a placeholder's `byte_size`. */
+export function formatEntrySize(bytes: unknown): string {
+  const n = Number(bytes)
+  if (!Number.isFinite(n) || n <= 0) return ''
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MiB`
+  return `${Math.max(1, Math.round(n / 1024))} KiB`
+}
+
+/** The gateway's oversized-row marker (`chat.history` budgets). */
+export function historyPlaceholderEntryId(msg: ChatMessage): string {
+  const raw = msg as { placeholder?: unknown; entry_id?: unknown }
+  if (raw.placeholder !== true) return ''
+  const id = raw.entry_id
+  return typeof id === 'string' || typeof id === 'number' ? String(id) : ''
+}
+
 export interface HistoryPagingState {
   loadedMessages: ChatMessage[]
   oldestCursor: string | null
@@ -254,6 +298,54 @@ export interface HistoryPagingState {
 export function createHistoryRenderer(deps: HistoryRenderDeps) {
   const diag = deps.diag ?? (() => {})
   const headerState = deps.headerState ?? { current: { day: '', role: '' } }
+  // Placeholders the reader expanded: a later history refresh (which brings
+  // the placeholder again) keeps showing the full message.
+  const expandedEntries = new Map<string, ChatMessage>()
+
+  /**
+   * The "Message truncated (N KiB) — Show full" line under a placeholder's
+   * preview. Show full fetches the row through `chat.entry` and re-renders it.
+   */
+  function appendTruncatedNotice(
+    row: HTMLElement,
+    msg: ChatMessage,
+    entryId: string,
+    rerender: (full: ChatMessage) => void,
+  ): void {
+    const body = row.querySelector<HTMLElement>('.msg-body')
+    if (!body || body.querySelector('.msg-truncated')) return
+    const notice = document.createElement('div')
+    notice.className = 'msg-truncated'
+    const label = document.createElement('span')
+    label.className = 'msg-truncated__label'
+    const size = formatEntrySize((msg as { byte_size?: unknown }).byte_size)
+    label.textContent = size ? t('chat.msgTruncatedSize', { size }) : t('chat.msgTruncated')
+    notice.appendChild(label)
+    if (deps.fetchEntry) {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'msg-truncated__show'
+      button.textContent = t('chat.msgShowFull')
+      button.addEventListener('click', () => {
+        button.disabled = true
+        button.textContent = t('chat.msgShowFullLoading')
+        deps.fetchEntry!(entryId)
+          .then((full) => {
+            if (!full) throw new Error(t('chat.msgShowFullMissing'))
+            expandedEntries.set(entryId, full)
+            rerender(full)
+          })
+          .catch((err: unknown) => {
+            button.disabled = false
+            button.textContent = t('chat.msgShowFull')
+            const message = err instanceof Error ? err.message : String(err)
+            label.textContent = t('chat.msgShowFullFailed', { message })
+          })
+      })
+      notice.appendChild(button)
+    }
+    body.appendChild(notice)
+  }
 
   function historyFallbackText(role: string, text: string): string {
     // chat.js:5842-5846 — role-specific display-text strip pipeline.
@@ -534,7 +626,9 @@ export function createHistoryRenderer(deps: HistoryRenderDeps) {
     let userIndex = 0
     let lastUserRequestKind: 'image' | 'text' = 'text'
 
-    messages.forEach((msg) => {
+    messages.forEach((sent) => {
+      const placeholderId = historyPlaceholderEntryId(sent)
+      const msg = (placeholderId && expandedEntries.get(placeholderId)) || sent
       if (msg.role === 'user') {
         userIndex += 1
         lastUserRequestKind = routerFxRequestKindFromAttachments(
@@ -645,6 +739,19 @@ export function createHistoryRenderer(deps: HistoryRenderDeps) {
           body.insertAdjacentHTML('beforeend', deps.renderArtifacts(artifacts))
           deps.mountCharts?.(body)
         }
+      }
+
+      if (msg === sent && placeholderId) {
+        const row = div
+        appendTruncatedNotice(row, msg, placeholderId, (full) => {
+          const fullText = full.role === 'user' ? deps.stripTimePrefix(full.text || '') : full.text
+          deps.replaceMessage(row, full.role, fullText || '', timestamp, messageOptions)
+          const fullTools = historyMessageRecords(full, 'tool_calls')
+          if (full.role === 'assistant' && fullTools.length > 0) {
+            deps.reconstructToolCalls(row, fullTools)
+          }
+          deps.attachHoverActions(row, full.role)
+        })
       }
 
       // Tool reconstruction and the user-attachment body rewrite above remove

@@ -888,6 +888,63 @@ describe('ChatPage', () => {
     )
   })
 
+  it('reads only the rows written while the socket was down on reconnect', async () => {
+    mockRpc = makeRpc()
+    const historyCalls: Record<string, unknown>[] = []
+    let deltaAnswer: Record<string, unknown> = {
+      kind: 'delta',
+      messages: [
+        { role: 'assistant', text: 'written while away', message_id: 'm3', timestamp: 300 },
+      ],
+      newest_cursor: '300|3',
+      has_more: false,
+    }
+    mockRpc.call.mockImplementation((...args: unknown[]) => {
+      if (args[0] === 'commands.list_for_surface') {
+        return Promise.resolve({ surface: 'web_chat', commands: SLASH_CATALOG })
+      }
+      if (args[0] === 'chat.history') {
+        const params = (args[1] ?? {}) as Record<string, unknown>
+        historyCalls.push(params)
+        if (params.delta_cursor) return Promise.resolve(deltaAnswer)
+        return Promise.resolve({
+          messages: [
+            { role: 'user', text: 'question', message_id: 'm1', timestamp: 100 },
+            { role: 'assistant', text: 'first answer', message_id: 'm2', timestamp: 200 },
+          ],
+          newest_cursor: '200|2',
+          history_scope: 'complete',
+        })
+      }
+      return Promise.resolve({})
+    })
+    renderPage()
+    await waitFor(() =>
+      expect(document.querySelector('.chat-thread')).toHaveTextContent('first answer'),
+    )
+    const fullReads = () => historyCalls.filter((p) => !p.delta_cursor).length
+    expect(fullReads()).toBe(1)
+
+    await act(async () => {
+      mockRpc.emit('_state', 'connected')
+      await Promise.resolve()
+    })
+    await waitFor(() =>
+      expect(document.querySelector('.chat-thread')).toHaveTextContent('written while away'),
+    )
+    expect(document.querySelector('.chat-thread')).toHaveTextContent('first answer')
+    expect(historyCalls.some((p) => p.delta_cursor === '200|2')).toBe(true)
+    expect(fullReads()).toBe(1)
+
+    // A cursor the gateway no longer knows: the full read takes over.
+    deltaAnswer = { kind: 'reset', messages: [] }
+    await act(async () => {
+      mockRpc.emit('_state', 'connected')
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(fullReads()).toBe(2))
+  })
+
   it('retries a send lost with the socket under the same idempotency key', async () => {
     mockRpc = makeRpc()
     let sendAttempts = 0
