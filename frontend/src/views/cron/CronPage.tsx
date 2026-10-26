@@ -469,7 +469,9 @@ function JobCard({
             )}
           </dd>
         </div>
-        {health ? (
+        {/* A health row only when there is something to say: a reported
+            verdict, a failure streak, or a job that has run. */}
+        {health && (health.degraded || health.consecutiveFailures > 0 || job.last_run) ? (
           <div className="cron-card__health" data-testid="cron-health">
             <dt className="t-label">{t('cron.cardHealth')}</dt>
             <dd className="t-data">

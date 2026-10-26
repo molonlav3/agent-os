@@ -19,7 +19,8 @@ export const jobs = {
   'jobs.health.active': 'Scheduled',
   'jobs.health.paused': 'Paused',
   'jobs.health.degraded': 'Degraded',
-  'jobs.health.failures': '{count} failures in a row',
+  'jobs.health.failures.one': '1 failure in a row',
+  'jobs.health.failures.many': '{count} failures in a row',
 
   'jobs.list.loading': 'Loading jobs',
   'jobs.list.empty': 'No jobs match this filter',

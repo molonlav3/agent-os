@@ -104,16 +104,13 @@ describe('deriveRuntimeIssues', () => {
       ),
     )
     expect(issues.map((i) => i.kind)).toEqual(['gateway_unreachable'])
-    expect(issues[0]!.actions.map((a) => a.kind)).toEqual([
-      'retry_connection',
-      'open_fix_steps',
-      'dismiss',
-    ])
+    // Offline the doctor (and Health) cannot be read: retry, not fix steps.
+    expect(issues[0]!.actions.map((a) => a.kind)).toEqual(['retry_connection', 'dismiss'])
     expect(
       deriveRuntimeIssues(
         input({ rpcState: 'disconnected', host: { canRestartGateway: true } }),
-      )[0]!.actions[0]!.kind,
-    ).toBe('restart_gateway')
+      )[0]!.actions.map((a) => a.kind),
+    ).toEqual(['restart_gateway', 'retry_connection', 'dismiss'])
   })
 
   it('waits for a first attempt to fail before calling a fresh page unreachable', () => {

@@ -204,28 +204,51 @@ export function isOkStatus(status: string | undefined | null): boolean {
 
 // ── Job health + overlap policy (cron.list `health` / `concurrency`) ─────────
 
-/** What `cron.list` reports about a job's recent runs, when the gateway sends it. */
+/** A job's recent-run health, as the card shows it. */
 export interface JobRuntimeHealth {
   consecutiveFailures: number
   lastError: string
+  /** The job keeps failing: the scheduler is backing it off, or gave up on it. */
   degraded: boolean
+  /** Where it came from: the `health` block, or the older flat fields. */
+  source: 'health' | 'legacy'
+}
+
+function failureCount(raw: unknown): number {
+  const n = Number(raw ?? 0)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
 }
 
 /**
- * The job's `health` block, normalised (snake or camel case). Null when the
- * gateway does not send one: an older engine says nothing, and nothing is
- * what the card then shows, rather than a guessed "healthy".
+ * The job's run health, normalised. Newer gateways send a `health` block
+ * (`consecutive_failures`, `last_error`, `degraded`; snake or camel case).
+ * Older ones send `consecutive_errors` and `lastResult` (the last error)
+ * flat on the job; their scheduler backs a job off from its first
+ * consecutive error and stops a recurring one at its limit, so any streak,
+ * or a `failed` status, reads as degraded. Null when the job carries
+ * neither, so nothing is shown rather than a guessed "healthy".
  */
 export function jobRuntimeHealth(job: RawJob): JobRuntimeHealth | null {
   const raw = job.health
-  if (!raw || typeof raw !== 'object') return null
-  const h = raw as Record<string, unknown>
-  const failures = Number(h.consecutive_failures ?? h.consecutiveFailures ?? 0)
-  const lastError = h.last_error ?? h.lastError
+  if (raw && typeof raw === 'object') {
+    const h = raw as Record<string, unknown>
+    const lastError = h.last_error ?? h.lastError
+    return {
+      consecutiveFailures: failureCount(h.consecutive_failures ?? h.consecutiveFailures),
+      lastError: typeof lastError === 'string' ? lastError.trim() : '',
+      degraded: h.degraded === true,
+      source: 'health',
+    }
+  }
+  const streak = job.consecutive_errors ?? job.consecutiveErrors
+  const lastResult = typeof job.lastResult === 'string' ? job.lastResult.trim() : ''
+  if (streak === undefined && !lastResult) return null
+  const consecutiveFailures = failureCount(streak)
   return {
-    consecutiveFailures: Number.isFinite(failures) && failures > 0 ? Math.floor(failures) : 0,
-    lastError: typeof lastError === 'string' ? lastError.trim() : '',
-    degraded: h.degraded === true,
+    consecutiveFailures,
+    lastError: lastResult,
+    degraded: consecutiveFailures > 0 || job.status === 'failed',
+    source: 'legacy',
   }
 }
 

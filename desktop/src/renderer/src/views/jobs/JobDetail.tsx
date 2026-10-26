@@ -49,6 +49,13 @@ function payloadKind(job: RawJob): PayloadKind {
   return kind === 'reminder' || kind === 'system_event' || kind === 'script' ? kind : 'agent_turn'
 }
 
+/** "1 failure in a row", "3 failures in a row". */
+function failuresInARow(count: number): string {
+  return count === 1
+    ? t('jobs.health.failures.one')
+    : t('jobs.health.failures.many').replace('{count}', String(count))
+}
+
 const HEALTH_TONE: Record<JobHealth, 'ok' | 'warn' | 'danger' | 'dim'> = {
   running: 'ok',
   active: 'ok',
@@ -163,7 +170,7 @@ export function JobDetail({
               <span className="mac-chip" data-tone="danger" data-testid="job-degraded">
                 {t('jobs.health.degraded')}
                 {reported.consecutiveFailures
-                  ? ` · ${t('jobs.health.failures').replace('{count}', String(reported.consecutiveFailures))}`
+                  ? ` · ${failuresInARow(reported.consecutiveFailures)}`
                   : ''}
               </span>
             ) : null}

@@ -120,10 +120,12 @@ function actionsFor(kind: IssueKind, host: IssueHost, restartRequired: boolean):
   const restart = host.canRestartGateway ? [action('restart_gateway')] : []
   const dismiss = action('dismiss')
   switch (kind) {
+    // Offline the doctor (and the Health view that shows its fix steps)
+    // cannot be read, so the connection issues offer a retry instead.
     case 'gateway_unreachable':
       return host.canRestartGateway
-        ? [action('restart_gateway'), action('open_fix_steps'), dismiss]
-        : [action('retry_connection'), action('open_fix_steps'), dismiss]
+        ? [action('restart_gateway'), action('retry_connection'), dismiss]
+        : [action('retry_connection'), dismiss]
     case 'auth_failed':
       return [
         action('open_settings', { settings: 'connection' }),
@@ -131,7 +133,7 @@ function actionsFor(kind: IssueKind, host: IssueHost, restartRequired: boolean):
         dismiss,
       ]
     case 'protocol_mismatch':
-      return [action('open_settings', { settings: 'updates' }), action('open_fix_steps'), dismiss]
+      return [action('open_settings', { settings: 'updates' }), action('retry_connection'), dismiss]
     case 'model_auth_required':
       return [action('open_settings', { settings: 'providers' }), action('open_fix_steps'), dismiss]
     case 'channel_terminal':
