@@ -517,3 +517,62 @@ async def test_task_runtime_persists_agent_task_timestamps_as_epoch_ms() -> None
     assert before_ms <= record.started_at <= after_ms
     assert before_ms <= record.finished_at <= after_ms
     assert record.finished_at >= record.started_at
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_turn_leaves_the_session_to_its_replacement() -> None:
+    """Under the interrupt queue mode a second message cancels the first.
+
+    The cancelled turn used to mark the row ``killed`` (and broadcast
+    ``cancelled``) while its replacement ran; the replacement's success could
+    no longer move the row, so nothing ever said the session finished.
+    """
+    session = _make_session(status=SessionStatus.DONE)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+    first_started = asyncio.Event()
+
+    async def _handler(run: Any) -> None:
+        if run.message == "first":
+            first_started.set()
+            await asyncio.sleep(30)
+
+    runtime = _make_runtime(_handler, session_manager=manager, events=events)
+    first = await runtime.enqueue(_make_envelope(), "first")
+    await asyncio.wait_for(first_started.wait(), 2)
+    second = await runtime.enqueue(_make_envelope(), "second", mode="interrupt")
+    await runtime.wait(first.task_id, timeout=2.0)
+    await runtime.wait(second.task_id, timeout=2.0)
+
+    changed = [payload for _, name, payload in events if name == "sessions.changed"]
+    assert [p["run_status"] for p in changed] == ["running", "idle"]
+    assert changed[-1]["last_task"]["task_id"] == second.task_id
+    assert session.status == SessionStatus.DONE
+
+
+@pytest.mark.asyncio
+async def test_a_run_ending_on_an_already_finished_row_is_still_announced() -> None:
+    session = _make_session(status=SessionStatus.KILLED)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(session_manager=manager, event_emitter=_emit)
+    await listener(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id="task-1",
+            task_status=AgentTaskStatus.CANCELLED,
+            run_kind="default",
+            terminal_reason="cancelled",
+        )
+    )
+
+    assert manager.update_calls == []
+    assert [(name, payload["run_status"]) for _, name, payload in events] == [
+        ("sessions.changed", "cancelled")
+    ]
+    assert "status" not in events[0][2]

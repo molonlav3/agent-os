@@ -884,23 +884,33 @@ def _make_task_session_lifecycle_listener(
             # ended -- so publish it, scoped to the child session.
             await _emit_child_run_state(event, event_emitter=event_emitter)
             return
+        if event.phase == "terminal" and event.has_followup:
+            # More work is queued on the session (an interrupt's replacement
+            # turn): marking the row terminal now left it "killed" while the
+            # replacement ran, and the replacement's own end could no longer
+            # move it, so no sessions.changed ever said it finished. The
+            # replacement's lifecycle reports the session instead.
+            return
         changed = await apply_task_lifecycle_to_session(
             event,
             session_manager=session_manager,
         )
-        if not changed:
+        if not changed and event.phase == "running":
             return
         reason = "task_running" if event.phase == "running" else "task_terminal"
         session_status = session_status_for_task_status(event.task_status)
         task_state = _task_state_for_session_change(event)
         state_field = "active_task" if event.phase == "running" else "last_task"
+        # A run's end is always announced, also when the row was already
+        # terminal (a kill finished it first): the run state is news even if
+        # the row status is not.
         await event_emitter(
             event.session_key,
             "sessions.changed",
             build_sessions_changed_payload(
                 event.session_key,
                 reason,
-                status=getattr(session_status, "value", session_status),
+                status=getattr(session_status, "value", session_status) if changed else None,
                 run_status=_task_run_status_for_session_change(event),
                 **{state_field: task_state},
             ),
