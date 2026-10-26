@@ -152,7 +152,8 @@ def approval_resolved_payload(
     resolved_by: str | None,
     resolved_at: float | None,
 ) -> dict[str, Any]:
-    """``approval.resolved``: ``decision`` is ``approved``, ``denied`` or ``expired``."""
+    """``approval.resolved``: ``decision`` is ``approved``, ``denied``, ``expired`` or
+    ``cancelled`` (its run was stopped)."""
 
     payload: dict[str, Any] = {"id": approval_id, "namespace": namespace, "decision": decision}
     if resolved_by:

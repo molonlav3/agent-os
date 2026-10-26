@@ -399,3 +399,42 @@ async def test_a_finished_session_keeps_its_stream_for_its_next_turn(tmp_path: P
     finally:
         await store.close()
 
+
+async def test_abort_withdraws_the_prompt_the_run_was_waiting_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no poll left, a prompt for a dead run used to stay on screen."""
+    from agentos.application import approval_queue as queue_mod
+    from agentos.application.approval_events import add_approval_listener
+
+    queue = queue_mod.ApprovalQueue(db_path=str(tmp_path / "q.sqlite"))
+    monkeypatch.setattr(queue_mod, "_queue", queue)
+    resolved: list[dict[str, Any]] = []
+    remove = add_approval_listener(
+        lambda name, payload: resolved.append(payload) if name == "approval.resolved" else None
+    )
+    waiting = asyncio.Event()
+
+    class _AsksFirst:
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            yield TextDeltaEvent(text="Need to run a command.")
+            approval_id = queue.request("exec", {"toolName": "bash", "sessionKey": session_key})
+            waiting.set()
+            await queue.wait(approval_id, timeout=30)
+            yield DoneEvent(text="never")
+
+    try:
+        async with turn_rig(tmp_path, _AsksFirst()) as rig:
+            await rig.enqueue()
+            await asyncio.wait_for(waiting.wait(), 3)
+            res = await get_dispatcher().dispatch(
+                "1", "sessions.abort", {"key": rig.key}, rig.ctx(rig.live.conn_id)
+            )
+            pending = queue.list_pending()
+    finally:
+        remove()
+        queue.close()
+
+    assert res.ok, res.error
+    assert pending == []
+    assert [(p["decision"], p["resolved_by"]) for p in resolved] == [("cancelled", "abort")]

@@ -363,7 +363,8 @@ class ApprovalQueue:
                 namespace=namespace,
                 params=entry.params,
                 created_at=now,
-                expires_at=expires_at,
+                # A row without its own lifespan still ends: at the default.
+                expires_at=expires_at if expires_at is not None else now + self._timeout,
                 mode=self._global_settings.mode,
             ),
         )
@@ -454,13 +455,15 @@ class ApprovalQueue:
         elevated_mode: str | None = None,
         payload: dict | None = None,
         resolved_by: str | None = None,
+        decision: str | None = None,
     ) -> None:
         """Resolve a pending approval.
 
         ``payload`` (optional) is answer data stored beside the row (ACP
         elicitation answers); read it back with :meth:`take_payload`.
         ``resolved_by`` names who decided, for the ``approval.resolved`` event
-        (default ``operator``).
+        (default ``operator``); ``decision`` overrides its ``approved`` /
+        ``denied`` (a denial nobody chose, such as ``cancelled``).
         """
         self._conn.execute("BEGIN IMMEDIATE")
         row = self._get_row(approval_id)
@@ -518,7 +521,7 @@ class ApprovalQueue:
         self._notify_resolved(
             approval_id,
             namespace=entry.namespace,
-            decision="approved" if approved else "denied",
+            decision=decision or ("approved" if approved else "denied"),
             resolved_by=resolved_by or "operator",
         )
 
@@ -686,6 +689,47 @@ class ApprovalQueue:
         if not key:
             return None
         return self._session_elevated_modes.get(key)
+
+    def cancel_pending_for_session(
+        self, session_key: str, *, resolved_by: str = "abort"
+    ) -> list[str]:
+        """Deny every pending approval of ``session_key`` (any namespace).
+
+        For a run that was stopped while it waited on a prompt: nothing will
+        ever consume the answer, so the prompt must not stay on screen. Emits
+        ``approval.resolved`` with ``decision: "cancelled"``. Returns the ids.
+        """
+        key = session_key.strip()
+        if not key:
+            return []
+        cancelled: list[str] = []
+        for row in self._conn.execute(
+            "SELECT approval_id, namespace, params, created_at, resolved, approved, consumed, "
+            "payload, expires_at "
+            "FROM approval_queue WHERE resolved = 0",
+        ).fetchall():
+            entry = self._row_to_entry(row)
+            owner = entry.params.get("sessionKey") or entry.params.get("session_key")
+            if str(owner or "").strip() != key:
+                continue
+            try:
+                self.resolve(
+                    entry.approval_id, False, resolved_by=resolved_by, decision="cancelled"
+                )
+            except (KeyError, ValueError):
+                continue
+            cancelled.append(entry.approval_id)
+        return cancelled
+
+    def sweep(self) -> None:
+        """Expire rows whose lifespan ended and prune old resolved ones.
+
+        Each expiry emits ``approval.resolved`` (``decision: "expired"``). The
+        gateway runs this on a timer: a prompt nobody waits on any more (its
+        run was stopped, the process restarted) would otherwise only expire
+        when something next read the queue.
+        """
+        self._sweep()
 
     def resolve_pending_for_session(
         self,

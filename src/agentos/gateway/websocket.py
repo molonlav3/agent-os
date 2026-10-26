@@ -781,7 +781,7 @@ class ConnectionRegistry:
             try:
                 await conn.send_event(event, payload)
             except Exception:
-                pass
+                log.debug("ws.broadcast_control_failed", conn_id=conn.conn_id, event=event)
 
 
 class SubscriptionManager:

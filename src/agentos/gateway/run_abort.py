@@ -8,7 +8,8 @@ children the run had spawned kept going. This module does the whole job:
 1. capture the exact runs (task ids) of the session and of its descendants;
 2. hold their terminal publication (:mod:`agentos.gateway.terminal_events`) so
    nothing the stream emits while the cancel lands is published on its own;
-3. cancel the session's runs, then the children's (and their harness turns);
+3. cancel the session's runs, then the children's (and their harness turns),
+   and withdraw the approval prompts they were waiting on;
 4. wait, bounded, until each run's terminal status is persisted -- the runtime
    then publishes ``session.event.done {state: "aborted", partial_text}``,
    ``task.cancelled`` and ``sessions.changed``;
@@ -50,6 +51,29 @@ class AbortOutcome:
     #: Session keys (the aborted one or a child) still running when the wait
     #: bound ran out.
     still_running: list[str] = field(default_factory=list)
+    #: Pending approval ids withdrawn because their run was stopped.
+    approvals_cancelled: list[str] = field(default_factory=list)
+
+
+def _cancel_pending_approvals(session_keys: list[str]) -> list[str]:
+    """Withdraw the prompts the stopped runs were waiting on.
+
+    Nothing will consume their answer, and with no poll left to notice, the
+    prompt would stay on every console until its lifespan ran out.
+    """
+    try:
+        from agentos.application.approval_queue import get_approval_queue
+
+        queue = get_approval_queue()
+    except Exception:
+        return []
+    cancelled: list[str] = []
+    for key in session_keys:
+        try:
+            cancelled.extend(queue.cancel_pending_for_session(key, resolved_by="abort"))
+        except Exception:
+            log.warning("sessions.abort.approval_cancel_failed", session_key=key, exc_info=True)
+    return cancelled
 
 
 def _acp_manager() -> Any:
@@ -191,6 +215,9 @@ async def abort_session_runs(
                 await acp.cancel(child, reason=PARENT_ABORT_SOURCE)
             except Exception:
                 log.warning("sessions.abort.acp_cancel_failed", child=child, exc_info=True)
+    # After the cancels: a waiter woken by the denial must not get to act on it
+    # before its cancellation lands.
+    outcome.approvals_cancelled = _cancel_pending_approvals([session_key, *children])
 
     timeout = ABORT_WAIT_TIMEOUT_S if wait_timeout_s is None else max(0.0, wait_timeout_s)
     deadline = time.monotonic() + timeout

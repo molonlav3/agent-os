@@ -330,7 +330,7 @@ class ServiceContainer:
             try:
                 approval_broadcaster.uninstall()
             except Exception:
-                pass
+                log.warning("approval_broadcast.uninstall_failed", exc_info=True)
             self._approval_broadcaster = None
 
         # ── 1. Stop scheduled producers (no further writes after this) ──

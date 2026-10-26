@@ -81,7 +81,6 @@ def test_unknown_fields_are_omitted(queue: ApprovalQueue, events: list) -> None:
     _, payload = events[0]
     assert "session_key" not in payload
     assert "command" not in payload
-    assert "expires_at" not in payload
     assert payload["tool"] == "weather"
     assert payload["summary"] == "Plugin weather requests permissions"
 
@@ -270,3 +269,54 @@ def test_hello_advertises_the_events_and_capabilities() -> None:
     assert {"approval-events", "terminal-replay", "inflight-snapshot", "idempotency-keys"} <= set(
         features.capabilities
     )
+
+
+def test_a_row_without_its_own_lifespan_still_reports_when_it_expires(
+    queue: ApprovalQueue, events: list
+) -> None:
+    queue.request("exec", dict(EXEC_PARAMS))
+
+    _, payload = events[0]
+    # The fixture queue's default lifespan is 60 s.
+    assert payload["expires_at"] == pytest.approx(payload["created_at"] + 60.0)
+
+
+def test_stopping_a_run_withdraws_its_pending_prompts(queue: ApprovalQueue, events: list) -> None:
+    mine = queue.request("exec", dict(EXEC_PARAMS))
+    harness = queue.request("acp", {"sessionKey": "agent:main:webchat:abc", "displayTitle": "x"})
+    other = queue.request("exec", {**EXEC_PARAMS, "sessionKey": "agent:main:webchat:other"})
+    events.clear()
+
+    cancelled = queue.cancel_pending_for_session("agent:main:webchat:abc")
+
+    assert sorted(cancelled) == sorted([mine, harness])
+    assert [(p["id"], p["decision"], p["resolved_by"]) for _, p in events] == [
+        (approval_id, "cancelled", "abort") for approval_id in cancelled
+    ]
+    assert queue.get(mine).resolved and not queue.get(mine).approved
+    assert queue.get(other).resolved is False
+
+
+async def test_the_timer_sweep_announces_an_expiry_nobody_waits_for(
+    tmp_path: Path, events: list
+) -> None:
+    q = ApprovalQueue(db_path=str(tmp_path / "sweep.sqlite"), default_timeout=0.05)
+    try:
+        approval_id = q.request("exec", dict(EXEC_PARAMS))
+        sent = _Sent()
+        broadcaster = ApprovalBroadcaster(asyncio.get_running_loop(), sent).install()
+        broadcaster.start_sweeper(q.sweep, interval_s=0.02)
+        try:
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if any(name == APPROVAL_RESOLVED for name, _ in sent.frames):
+                    break
+            await broadcaster.drain()
+        finally:
+            broadcaster.uninstall()
+    finally:
+        q.close()
+
+    resolved = [p for name, p in sent.frames if name == APPROVAL_RESOLVED]
+    assert resolved and resolved[0]["id"] == approval_id
+    assert resolved[0]["decision"] == "expired"
