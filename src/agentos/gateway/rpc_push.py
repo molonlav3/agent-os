@@ -13,9 +13,14 @@ _d = get_dispatcher()
 def _service(ctx: RpcContext) -> Any:
     from agentos.gateway.web_push import get_web_push_service
 
-    service = get_web_push_service(getattr(ctx, "config", None))
+    config = getattr(ctx, "config", None)
+    service = get_web_push_service(config)
     if service is None:
-        raise RpcUnavailableError("web push needs a gateway state directory")
+        if not getattr(config, "state_dir", None):
+            raise RpcUnavailableError("web push needs a gateway state directory")
+        raise RpcUnavailableError(
+            "web push is unavailable: the cryptography package it needs is not installed"
+        )
     return service
 
 
@@ -41,7 +46,10 @@ async def _handle_vapid_public_key(params: dict | None, ctx: RpcContext) -> dict
 
 @_d.method("push.web.subscribe", CONTROL_ONLY)
 async def _handle_subscribe(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    from agentos.gateway.web_push import validate_subscription
+    from agentos.gateway.web_push import (
+        assert_endpoint_resolves_publicly,
+        validate_subscription,
+    )
 
     if not isinstance(params, dict):
         raise ValueError("params must be an object with endpoint and keys")
@@ -50,6 +58,7 @@ async def _handle_subscribe(params: dict | None, ctx: RpcContext) -> dict[str, A
     if not service.enabled:
         raise ValueError("web push is disabled ([push] web_enabled = false)")
     subscription = validate_subscription(params.get("endpoint"), params.get("keys"))
+    await assert_endpoint_resolves_publicly(subscription.endpoint)
     service.store.upsert(subscription)
     return {"ok": True}
 

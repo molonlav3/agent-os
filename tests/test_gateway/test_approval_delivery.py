@@ -47,13 +47,34 @@ from agentos.gateway.web_push import (
 ENDPOINT = "https://push.example.net/send/abc123"
 
 
+#: Offline DNS for the subscribe-time endpoint check: these names "resolve"
+#: to loopback, everything else to a public documentation-free address.
+_LOOPBACK_NAMES = {"localtest.me", "rebind.example.net"}
+
+
+@pytest.fixture(autouse=True)
+def _offline_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ipaddress
+
+    def fake_resolve(host: str, port: int) -> list[Any]:
+        if host in _LOOPBACK_NAMES:
+            return [ipaddress.ip_address("127.0.0.1")]
+        return [ipaddress.ip_address("8.8.4.4")]
+
+    monkeypatch.setattr("agentos.tools.ssrf_client._getaddrinfo_addresses", fake_resolve)
+
+
 @pytest.fixture(autouse=True)
 def _reset_delivery() -> Any:
+    from agentos.gateway.session_index import set_session_index
+
     approval_delivery.reset()
     set_web_push_service(None)
+    set_session_index(None)
     yield
     approval_delivery.reset()
     set_web_push_service(None)
+    set_session_index(None)
 
 
 class _Browser:
@@ -429,6 +450,28 @@ class TestSubscriptionRpc:
         assert res.error.code == "INVALID_REQUEST"
 
     @pytest.mark.asyncio
+    async def test_a_name_resolving_to_loopback_is_refused(self, tmp_path: Path) -> None:
+        """A literal check alone accepted ``localtest.me`` (127.0.0.1)."""
+        config = GatewayConfig(state_dir=str(tmp_path))
+        endpoint = "https://localtest.me:18857/push"
+        res = await get_dispatcher().dispatch(
+            "1", "push.web.subscribe", _Browser().subscription_json(endpoint), _ctx(config)
+        )
+        assert res.error.code == "INVALID_REQUEST"
+        assert "public address" in res.error.message
+
+    @pytest.mark.asyncio
+    async def test_send_time_guard_refuses_a_name_rebound_to_loopback(self) -> None:
+        """Resolved again when the message is sent: the gateway never dials
+        a private address, whatever the name resolved to at subscribe time."""
+        from agentos.gateway.web_push import httpx_transport
+
+        status = await httpx_transport(
+            PushRequest(endpoint="https://rebind.example.net/push/1", body=b"x", headers={})
+        )
+        assert status is None
+
+    @pytest.mark.asyncio
     async def test_keys_are_validated(self, tmp_path: Path) -> None:
         config = GatewayConfig(state_dir=str(tmp_path))
         bad = {
@@ -665,3 +708,179 @@ class TestCustody:
     def test_no_session_is_refused(self) -> None:
         entry = SimpleNamespace(params={}, audience_session_keys=())
         assert not channel_custody(entry, channel_name="tg", sender_id="1", chat_id="1").allowed
+
+
+# ---------------------------------------------------------------------------
+# Child prompts reach the parent's chat
+# ---------------------------------------------------------------------------
+
+
+class _FakeChannel:
+    def __init__(self, kind: str = "telegram") -> None:
+        self.capability_profile = SimpleNamespace(channel_type=kind)
+        self.sent: list[Any] = []
+
+    async def send(self, message: Any) -> None:
+        self.sent.append(message)
+
+
+class _Channels:
+    def __init__(self, **channels: Any) -> None:
+        self._channels = channels
+
+    def get(self, name: str) -> Any:
+        return self._channels.get(name)
+
+
+class TestParentChatRelay:
+    def _setup(self, tmp_path: Path, rows: list[dict[str, Any]]) -> SessionIndex:
+        from agentos.gateway.session_index import set_session_index
+
+        index = SessionIndex(_sessions_db(tmp_path, rows))
+        set_session_index(index)
+        approval_delivery.set_lineage_resolver(index.parents)
+        return index
+
+    @pytest.mark.asyncio
+    async def test_child_prompt_is_sent_to_the_parent_chat_with_buttons(
+        self, tmp_path: Path
+    ) -> None:
+        from agentos.gateway.approval_channel_relay import ChannelApprovalRelay
+
+        self._setup(
+            tmp_path,
+            [
+                {"key": "agent:main:acp:r1", "parent": "agent:main:main"},
+                {"key": "agent:main:main", "channel": "telegram", "to": "42"},
+            ],
+        )
+        channel = _FakeChannel()
+        relay = ChannelApprovalRelay(lambda: _Channels(telegram=channel))
+        approval_delivery.register_listener(relay)
+        queue = _queue(tmp_path)
+        approval_id = queue.request(
+            "acp",
+            {"sessionKey": "agent:main:acp:r1", "toolName": "Codex", "command": "git push"},
+        )
+        await relay.drain()
+        [message] = channel.sent
+        assert message.reply_to == "42"
+        buttons = message.metadata["reply_markup"]["inline_keyboard"][0]
+        assert [b["callback_data"] for b in buttons] == [
+            f"approve:{approval_id}",
+            f"deny:{approval_id}",
+        ]
+        assert "git push" in message.content
+
+    @pytest.mark.asyncio
+    async def test_the_parent_chat_can_answer_it_through_custody(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        from agentos.channel_pairing import ChannelAdmission
+        from agentos.channels.telegram import TelegramChannel, TelegramChannelConfig
+
+        self._setup(
+            tmp_path,
+            [
+                {"key": "agent:main:acp:r1", "parent": "agent:main:main"},
+                {"key": "agent:main:main", "channel": "telegram", "to": "42"},
+            ],
+        )
+        queue = _queue(tmp_path)
+        approval_id = queue.request("acp", {"sessionKey": "agent:main:acp:r1"})
+        channel = TelegramChannel(TelegramChannelConfig(token="t"))
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def fake_api(method: str, payload: dict[str, Any] | None = None) -> Any:
+            calls.append((method, payload or {}))
+            return True
+
+        channel._api = fake_api  # type: ignore[method-assign]
+        callback = {
+            "id": "cb",
+            "from": {"id": 42},
+            "message": {"message_id": 1, "chat": {"id": 42, "type": "private"}, "text": "?"},
+            "data": f"approve:{approval_id}",
+        }
+        with (
+            patch("agentos.gateway.approval_queue.get_approval_queue", return_value=queue),
+            patch.object(
+                channel.pairing_store,
+                "admission",
+                return_value=ChannelAdmission("telegram", "42", "g", 1),
+            ),
+        ):
+            await channel._handle_telegram_callback(callback)
+        assert queue.get(approval_id).approved is True
+
+    @pytest.mark.asyncio
+    async def test_own_prompts_and_unbound_parents_are_not_relayed(self, tmp_path: Path) -> None:
+        from agentos.gateway.approval_channel_relay import ChannelApprovalRelay
+
+        self._setup(
+            tmp_path,
+            [
+                {"key": "agent:main:acp:r1", "parent": "agent:main:webchat:x"},
+                {"key": "agent:main:webchat:x"},
+                {"key": "agent:main:main", "channel": "telegram", "to": "42"},
+            ],
+        )
+        channel = _FakeChannel()
+        relay = ChannelApprovalRelay(lambda: _Channels(telegram=channel))
+        approval_delivery.register_listener(relay)
+        queue = _queue(tmp_path)
+        queue.request("acp", {"sessionKey": "agent:main:acp:r1"})  # parent is a web session
+        queue.request("exec", {"sessionKey": "agent:main:main"})  # its own turn sends it
+        await relay.drain()
+        assert channel.sent == []
+
+    def test_group_parent_key_is_a_target_without_a_route(self) -> None:
+        from agentos.gateway.approval_channel_relay import relay_target
+
+        entry = SimpleNamespace(
+            audience_session_keys=("agent:main:subagent:s1", "agent:main:slack:channel:C9")
+        )
+        target = relay_target(entry, None)
+        assert target is not None
+        assert (target.channel, target.chat_id) == ("slack", "C9")
+
+
+class TestWireDetails:
+    @pytest.mark.parametrize(
+        ("endpoint", "aud"),
+        [
+            ("https://push.example.net/send/1", "https://push.example.net"),
+            ("https://push.example.net:443/send/1", "https://push.example.net"),
+            ("https://user@push.example.net:8443/send/1", "https://push.example.net:8443"),
+            ("https://[2001:db8::1]:9443/x", "https://[2001:db8::1]:9443"),
+        ],
+    )
+    def test_jwt_audience_is_the_origin_only(self, endpoint: str, aud: str) -> None:
+        header = vapid_authorization(VapidKeys.generate(), endpoint, "mailto:a@b.c", now=1)
+        claims = header.split("t=", 1)[1].split(",", 1)[0].split(".")[1]
+        assert json.loads(b64url_decode(claims))["aud"] == aud
+
+    def test_encrypted_body_fits_the_4096_byte_floor(self) -> None:
+        from agentos.gateway.web_push import MAX_PLAINTEXT_BYTES
+
+        browser = _Browser()
+        assert MAX_PLAINTEXT_BYTES == 3993
+        body = encrypt_payload(b"x" * MAX_PLAINTEXT_BYTES, browser.p256dh, browser.auth)
+        assert len(body) == 4096
+        with pytest.raises(ValueError):
+            encrypt_payload(b"x" * (MAX_PLAINTEXT_BYTES + 1), browser.p256dh, browser.auth)
+
+    @pytest.mark.asyncio
+    async def test_missing_crypto_is_reported_as_such(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agentos.gateway import web_push
+
+        def no_crypto(*_a: Any, **_k: Any) -> Any:
+            raise ImportError("cryptography")
+
+        monkeypatch.setattr(web_push.WebPushService, "from_state_dir", no_crypto)
+        config = GatewayConfig(state_dir=str(tmp_path))
+        res = await get_dispatcher().dispatch("1", "push.web.vapid_public_key", None, _ctx(config))
+        assert res.error.code == "UNAVAILABLE"
+        assert "cryptography" in res.error.message

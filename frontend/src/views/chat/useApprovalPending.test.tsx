@@ -24,6 +24,19 @@ describe('computeHasPendingForSession (chat.js:4686-4689)', () => {
   it('is false for an empty pending list', () => {
     expect(computeHasPendingForSession([], 'sess-1')).toBe(false)
   })
+  it("is true in the parent session of a child's prompt (audience)", () => {
+    const child = {
+      id: 'c',
+      sessionKey: 'agent:main:acp:run-1',
+      audienceSessionKeys: ['agent:main:acp:run-1', 'agent:main:webchat:parent'],
+    } as Approval
+    expect(computeHasPendingForSession([child], 'agent:main:webchat:parent')).toBe(true)
+    expect(computeHasPendingForSession([child], 'agent:main:webchat:other')).toBe(false)
+  })
+  it('reads the snake-case audience alias too', () => {
+    const child = { id: 'c', audience_session_keys: ['child', 'parent'] } as unknown as Approval
+    expect(computeHasPendingForSession([child], 'parent')).toBe(true)
+  })
 })
 
 describe('useApprovalPending — idle-pause gate (chat.js:6216-6233)', () => {

@@ -40,6 +40,12 @@ export interface Approval {
   toolName?: string
   actionKind?: string
   sessionKey?: string
+  /**
+   * The requesting session followed by its subagent / coding-agent ancestors
+   * (gateway `audience_session_keys`): a parent session's viewers see a
+   * child's prompt too.
+   */
+  audienceSessionKeys?: string[]
   agent?: string
   command?: string
   warning?: string

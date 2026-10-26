@@ -150,28 +150,29 @@ form answers.
 
 ### Where a prompt reaches you
 
-A pending approval appears in every open console and desktop window, in the
-chat that started the turn, and — when you opt in — as a push notification:
+Every pending approval is listed on the console's approvals page and in the
+desktop app's approval dialog. Beyond that:
 
 - **Web Push.** In the web console, Settings → *Push notifications for
   approvals* subscribes this browser (it asks for notification permission;
-  it needs HTTPS or `localhost`). Each new approval is pushed with a deep
-  link to the approvals page; when it is resolved, by anyone or by timeout,
-  a replacement notice says it is no longer pending. Messages are encrypted
+  it needs HTTPS or `localhost`). Each new approval is pushed with a link to
+  the approvals page; when it is resolved, by anyone or by timeout, a
+  replacement notice says it is no longer pending. Messages are encrypted
   for the subscribed browser, expire with the approval and carry only its
   title. Turn it off per gateway with `[push] web_enabled = false`.
-- **Parent sessions.** A subagent's or coding harness's prompt is also
-  addressed to the session that spawned it, and to that session's own
-  parent: the approval's `audience_session_keys` lists the requesting
-  session followed by its ancestors, so whoever watches the parent sees the
-  child's prompt.
+- **Parent sessions.** An approval records `audience_session_keys`: the
+  session that asked, then the sessions that spawned it (a coding harness's
+  or subagent's parent, and that session's parent). The chat view of any of
+  those sessions shows the turn as *waiting for approval* while the child's
+  prompt is pending. When the nearest such parent is delivered on Telegram,
+  Discord or Slack, the prompt with *Approve* / *Deny* buttons is also sent to
+  that chat.
 - **Channel custody.** On Telegram, Discord and Slack, *Approve* / *Deny*
   works only in the chat the approval's session is delivered to — a DM
   session answers to its own sender, a group or channel session to members of
   that chat, a child session to its parent's chat, and the shared main DM
-  session to the chat it last delivered to. A paired sender can no longer
-  resolve a prompt that belongs to the web console, the desktop or another
-  chat.
+  session to the chat it last delivered to. A paired sender cannot resolve a
+  prompt that belongs to the web console, the desktop or another chat.
 
 ## Sandbox Posture
 

@@ -145,12 +145,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `push.web.subscribe`, `push.web.unsubscribe`). Each approval is pushed with a
   deep link and a TTL equal to its remaining lifetime, and replaced by a "no
   longer pending" notice when it is resolved. RFC 8291/8292 with a VAPID key
-  generated once into the state directory; `[push] web_enabled = false` turns
-  it off (#3694).
+  generated once into the state directory; endpoints must resolve to public
+  addresses at subscribe time and are dialled through the connect-time SSRF
+  guard; `[push] web_enabled = false` turns it off (#3694).
 - An approval raised by a subagent or coding-harness child now names its
   parent sessions as well (`audience_session_keys` in the queue, the
-  `/api/approvals` listing and `approval.list`), so the parent's viewers can be
-  told about the child's prompt (#3694).
+  `/api/approvals` listing and `approval.list`). The parent's chat view shows
+  its turn as waiting for approval, and when the parent is a Telegram, Discord
+  or Slack conversation the prompt with buttons is sent there too (#3694).
 - `POST /api/v1/tools/invoke` runs one tool without a model turn under the
   same policy chain as an agent's tool call, unattended and sandboxed:
   `dry_run` returns the resolved policy, an approval requirement answers `403`

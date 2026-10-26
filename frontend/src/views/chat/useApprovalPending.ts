@@ -31,11 +31,19 @@ import { useApprovals, type Approval } from '@/services/approval-monitor'
  */
 export function computeHasPendingForSession(pending: Approval[], sessionKey: string): boolean {
   // chat.js:4686-4689 — a pending item matches when its sessionKey (snake or
-  // camel alias) equals the current session key.
-  return pending.some(
-    (item) =>
-      (item.sessionKey || (item as { session_key?: string }).session_key || '') === sessionKey,
-  )
+  // camel alias) equals the current session key — or, for a prompt a
+  // subagent or coding harness raised, when the current session is one of
+  // its ancestors (`audienceSessionKeys`): the parent's turn is waiting on it.
+  return pending.some((item) => {
+    const own = item.sessionKey || (item as { session_key?: string }).session_key || ''
+    if (own === sessionKey) return true
+    if (!sessionKey) return false
+    const audience =
+      item.audienceSessionKeys ||
+      (item as { audience_session_keys?: string[] }).audience_session_keys ||
+      []
+    return Array.isArray(audience) && audience.includes(sessionKey)
+  })
 }
 
 export function useApprovalPending(

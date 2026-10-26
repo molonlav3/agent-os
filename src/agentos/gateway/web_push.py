@@ -53,8 +53,10 @@ VAPID_FILENAME = "web_push_vapid.json"
 SUBSCRIPTIONS_FILENAME = "web_push.sqlite"
 #: RFC 8188 record size advertised in the header; a message is one record.
 RECORD_SIZE = 4096
-#: Room for the padding delimiter and the AEAD tag inside one record.
-MAX_PLAINTEXT_BYTES = RECORD_SIZE - 17 - 1
+#: Push services must accept 4096 bytes of *encrypted* body (RFC 8291 §4):
+#: the 86-byte header (salt, record size, key id length, 65-byte key), the
+#: padding delimiter and the 16-byte AEAD tag come out of that.
+MAX_PLAINTEXT_BYTES = 4096 - 86 - 1 - 16
 #: A push service drops a message after its TTL; a resolved notice outlives
 #: the request so a device that was offline still has the prompt cleared.
 RESOLVED_TTL_SECONDS = 24 * 60 * 60
@@ -128,6 +130,17 @@ def _public_b64(private_key: Any) -> str:
     return b64url_encode(raw)
 
 
+def _jwt_audience(endpoint: str) -> str:
+    """The push service origin: scheme and host, plus the port only when it is not the default."""
+    parts = urlsplit(endpoint)
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    port = parts.port
+    default = {"https": 443, "http": 80}.get(parts.scheme)
+    return f"{parts.scheme}://{host}" + (f":{port}" if port and port != default else "")
+
+
 def vapid_authorization(
     keys: VapidKeys, endpoint: str, subject: str, *, now: float | None = None
 ) -> str:
@@ -136,8 +149,7 @@ def vapid_authorization(
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
-    parts = urlsplit(endpoint)
-    audience = f"{parts.scheme}://{parts.netloc}"
+    audience = _jwt_audience(endpoint)
     issued = int(now if now is not None else time.time())
     header = b64url_encode(json.dumps({"typ": "JWT", "alg": "ES256"}).encode())
     claims = b64url_encode(
@@ -380,17 +392,59 @@ PushTransport = Callable[[PushRequest], Awaitable[int | None]]
 
 
 async def httpx_transport(request: PushRequest) -> int | None:
+    """POST one message; the connection is validated at connect time.
+
+    The client refuses to dial a private, loopback, link-local or reserved
+    address whatever the hostname resolves to *now*, so a subscription whose
+    name was public at subscribe time cannot be rebound onto the gateway's
+    own network.
+    """
     import httpx
 
+    from agentos.tools.ssrf_client import ssrf_guarded_client, validate_fetch_address
+    from agentos.tools.types import SSRFBlockedError
+
     try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+        async with ssrf_guarded_client(
+            validator=validate_fetch_address, timeout=10.0, follow_redirects=False
+        ) as client:
             response = await client.post(
                 request.endpoint, content=request.body, headers=request.headers
             )
+    except SSRFBlockedError:
+        log.warning("web_push.endpoint_blocked", reason="resolves to a non-public address")
+        return None
     except httpx.HTTPError as exc:
         log.info("web_push.delivery_failed", error=type(exc).__name__)
         return None
     return response.status_code
+
+
+async def assert_endpoint_resolves_publicly(endpoint: str) -> None:
+    """Resolve the endpoint's host now and refuse any non-public address.
+
+    The literal check in :func:`validate_subscription` cannot see that a name
+    like ``localtest.me`` points at ``127.0.0.1``.
+    """
+    import anyio
+
+    from agentos.tools.ssrf_client import _getaddrinfo_addresses, validate_fetch_address
+    from agentos.tools.types import SSRFBlockedError
+
+    parts = urlsplit(endpoint)
+    host = parts.hostname or ""
+    port = parts.port or 443
+    try:
+        addresses = await anyio.to_thread.run_sync(_getaddrinfo_addresses, host, port)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError(f"params.endpoint host does not resolve: {host}") from exc
+    if not addresses:
+        raise ValueError(f"params.endpoint host does not resolve: {host}")
+    for address in addresses:
+        try:
+            validate_fetch_address(host, address)
+        except SSRFBlockedError as exc:
+            raise ValueError("params.endpoint must resolve to a public address") from exc
 
 
 def approval_topic(approval_id: str) -> str:
@@ -647,6 +701,7 @@ __all__ = [
     "approval_payload",
     "approval_tag",
     "approval_topic",
+    "assert_endpoint_resolves_publicly",
     "b64url_decode",
     "b64url_encode",
     "decrypt_payload",

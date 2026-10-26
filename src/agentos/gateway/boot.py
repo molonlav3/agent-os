@@ -1298,7 +1298,7 @@ class GatewayServer:
     # ``gateway.restart.GatewayRestarter`` once wired; ``run_gateway`` awaits
     # its task after the server task ends so the exec happens outside the loop.
     _restarter: Any = field(default=None, repr=False)
-    # Approval delivery wired at boot (Web Push listener); undone on close.
+    # Approval delivery wired at boot (Web Push, parent-chat relay); undone on close.
     _web_push: Any = field(default=None, repr=False)
     # ``gateway.config_watcher.ConfigWatcher`` for the active config file.
     _config_watcher: Any = field(default=None, repr=False)
@@ -1593,12 +1593,22 @@ class GatewayServer:
         log.info("gateway.stopped", reason=reason, forced=self._forced)
 
 
-def wire_approval_delivery(config: GatewayConfig) -> Any:
-    """Point the approval queue at session lineage and Web Push; return the push service.
+@dataclass
+class ApprovalDeliveryWiring:
+    push: Any = None
+    relay: Any = None
+
+
+def wire_approval_delivery(
+    config: GatewayConfig, *, channel_manager_ref: Callable[[], Any] | None = None
+) -> ApprovalDeliveryWiring:
+    """Point the approval queue at session lineage, Web Push and the parent-chat relay.
 
     The queue asks for a request's audience (its session plus subagent /
     coding-agent ancestors) through a read-only view of ``sessions.db``; the
-    channel custody check reads delivery routes from the same view.
+    channel custody check and the relay read delivery routes from the same
+    view. The relay sends a child session's prompt to the chat its parent is
+    delivered to.
     """
     from agentos.application import approval_delivery
     from agentos.gateway.approval_queue import get_approval_queue
@@ -1617,14 +1627,24 @@ def wire_approval_delivery(config: GatewayConfig) -> Any:
         service._loop = asyncio.get_running_loop()
         service._lifespan_end = lambda entry: get_approval_queue().lifespan_end(entry)
         approval_delivery.register_listener(service)
-    return service
+    relay = None
+    if channel_manager_ref is not None:
+        from agentos.gateway.approval_channel_relay import ChannelApprovalRelay
+
+        relay = ChannelApprovalRelay(channel_manager_ref, loop=asyncio.get_running_loop())
+        approval_delivery.register_listener(relay)
+    return ApprovalDeliveryWiring(push=service, relay=relay)
 
 
-def _unwire_approval_delivery(service: Any) -> None:
+def _unwire_approval_delivery(wiring: Any) -> None:
     from agentos.application import approval_delivery
     from agentos.gateway.session_index import set_session_index
     from agentos.gateway.web_push import set_web_push_service
 
+    service = getattr(wiring, "push", None)
+    relay = getattr(wiring, "relay", None)
+    if relay is not None:
+        approval_delivery.unregister_listener(relay)
     if service is not None:
         approval_delivery.unregister_listener(service)
         try:
@@ -3399,7 +3419,9 @@ async def start_gateway_server(
     boot_tracker.set_resume_hook(_resume_after_safe_mode)
 
     if run:
-        server_handle._web_push = wire_approval_delivery(config)
+        server_handle._web_push = wire_approval_delivery(
+            config, channel_manager_ref=lambda: _cm_holder[0]
+        )
         if config.config_path:
             from types import SimpleNamespace
 
