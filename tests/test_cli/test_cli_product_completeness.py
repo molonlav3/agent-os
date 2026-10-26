@@ -509,6 +509,28 @@ def test_sessions_abort_resolves_then_aborts(monkeypatch):
     assert ("sessions.abort", {"key": "agent:main:abc"}) in fake.calls
 
 
+def test_sessions_abort_names_stopped_children_and_survivors(monkeypatch):
+    """Aborting a parent whose only live run was a child used to print
+    "No running task", and a cascade that timed out said nothing."""
+    fake = _install_fake_gateway(monkeypatch)
+    fake.rpc_payloads = {
+        "sessions.resolve": {"key": "agent:main:abc", "session_id": "abc"},
+        "sessions.abort": {
+            "aborted": [],
+            "children_aborted": ["agent:main:acp:c1"],
+            "still_running": ["agent:main:acp:c2"],
+            "key": "agent:main:abc",
+        },
+    }
+
+    result = runner.invoke(app, ["sessions", "abort", "abc"])
+
+    assert result.exit_code == 0, result.stdout
+    flat = " ".join(result.stdout.split())
+    assert "Aborted session 'agent:main:abc' and 1 child run" in flat
+    assert "still running: agent:main:acp:c2" in flat
+
+
 def test_memory_status_json_reuses_doctor_rpc(monkeypatch):
     fake = _install_fake_gateway(monkeypatch)
     fake.rpc_payloads = {

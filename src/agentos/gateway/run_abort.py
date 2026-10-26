@@ -177,13 +177,21 @@ async def abort_session_runs(
     source: str,
     reason: str = "user_abort",
     wait_timeout_s: float | None = None,
+    runs: list[str] | None = None,
 ) -> AbortOutcome:
-    """Abort ``session_key``'s runs and its descendants' runs; see the module doc."""
+    """Abort ``session_key``'s runs and its descendants' runs; see the module doc.
+
+    ``runs`` are the session's run ids as the caller captured them when the
+    abort was asked for; only those are stopped (a turn queued after the abort
+    is not), defaulting to whatever is active now.
+    """
     session_key = canonicalize_session_key(session_key)
     publications = task_runtime.terminal_publications
     outcome = AbortOutcome()
 
-    own_runs = list(task_runtime.active_task_ids(session_key))
+    if runs is None:
+        runs = list(task_runtime.active_task_ids(session_key))
+    own_runs = [run_id for run_id in runs if task_runtime.is_task_active(run_id)]
     children = await find_live_descendants(task_runtime, session_manager, session_key)
     child_runs: dict[str, list[str]] = {
         child: list(task_runtime.active_task_ids(child)) for child in children
@@ -195,7 +203,8 @@ async def abort_session_runs(
         for run_id in runs:
             publications.hold(run_id, by="abort")
 
-    await task_runtime.cancel(session_key=session_key, source=source, reason=reason)
+    for run_id in own_runs:
+        await task_runtime.cancel(task_id=run_id, source=source, reason=reason)
     acp = _acp_manager()
     # Deepest first: a child stopped before its own children could otherwise
     # spawn or wake one of them on the way down.

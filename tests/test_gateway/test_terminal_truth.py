@@ -438,3 +438,29 @@ async def test_abort_withdraws_the_prompt_the_run_was_waiting_on(
     assert res.ok, res.error
     assert pending == []
     assert [(p["decision"], p["resolved_by"]) for p in resolved] == [("cancelled", "abort")]
+
+
+async def test_a_send_after_the_abort_is_not_stopped_by_it(tmp_path: Path) -> None:
+    """The abort runs off the connection's request loop (it waits up to 10 s).
+
+    It captures what it stops in its first step; a turn queued while it waits
+    (the user's next message) must survive it.
+    """
+    runner = ScriptedRunner(["first"])
+    async with turn_rig(tmp_path, runner) as rig:
+        first = await rig.enqueue()
+        await asyncio.wait_for(runner.streamed.wait(), 3)
+        abort = asyncio.create_task(
+            get_dispatcher().dispatch(
+                "1", "sessions.abort", {"key": rig.key}, rig.ctx(rig.live.conn_id)
+            )
+        )
+        await asyncio.sleep(0)  # the abort's first step, as the WS loop allows it
+        second = await rig.enqueue()
+        res = await abort
+        runner.release.set()
+        record = await rig.runtime.wait(second, timeout=3)
+
+    assert res.ok, res.error
+    assert res.payload["aborted"] == [first]
+    assert str(getattr(record.status, "value", record.status)) == "succeeded"

@@ -358,8 +358,23 @@ def sessions_abort(
         print_json(payload)
         return
     key = payload.get("key") or session_id
+    console.print(_abort_summary(key, payload))
+
+
+def _abort_summary(key: str, payload: dict) -> str:
+    """One line for ``sessions abort``: what stopped, and what did not."""
     aborted = bool(payload.get("aborted", False))
-    console.print(f"{'Aborted' if aborted else 'No running task for'} session {key!r}")
+    children = payload.get("children_aborted") or []
+    still_running = payload.get("still_running") or []
+    if aborted or children:
+        line = f"Aborted session {key!r}"
+        if children:
+            line += f" and {len(children)} child run{'s' if len(children) != 1 else ''}"
+    else:
+        line = f"No running task for session {key!r}"
+    if still_running:
+        line += f"; still running: {', '.join(str(k) for k in still_running)}"
+    return line
 
 
 @app.command("rename")

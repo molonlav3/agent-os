@@ -1591,6 +1591,11 @@ async def _emit_to_subscribers(
 @_d.method("sessions.abort", CONTROL_AND_CHANNEL)
 async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
+    # Captured before the first await: what this abort stops is what was
+    # running when it was asked, never a turn queued while it waits.
+    runtime = getattr(ctx, "task_runtime", None)
+    active_ids = getattr(runtime, "active_task_ids", None)
+    captured_runs = list(active_ids(key)) if callable(active_ids) else None
 
     if ctx.session_manager is None:
         return {"aborted": False, "key": key}
@@ -1620,6 +1625,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
             key,
             session_manager=ctx.session_manager,
             source=_cancel_source_from_params(params, "sessions_abort"),
+            runs=captured_runs,
         )
         if outcome.still_running:
             raise RpcHandlerError(

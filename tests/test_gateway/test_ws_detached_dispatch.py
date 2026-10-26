@@ -126,6 +126,63 @@ async def test_other_requests_keep_their_order() -> None:
     await asyncio.wait_for(loop, timeout=2.0)
 
 
+async def test_a_waiting_abort_does_not_hold_back_other_sessions() -> None:
+    """``sessions.abort`` waits (up to 10 s) for the stopped runs to end.
+
+    It runs in its session's lane: other sessions' requests and session-less
+    reads on the same socket are answered meanwhile.
+    """
+    registry = RpcRegistry()
+    release = asyncio.Event()
+
+    @registry.method("sessions.abort")
+    async def _abort(params: dict | None, ctx: Any) -> dict:
+        await release.wait()
+        return {"aborted": []}
+
+    @registry.method("chat.history")
+    async def _history(params: dict | None, ctx: Any) -> dict:
+        return {"messages": []}
+
+    @registry.method("sessions.list")
+    async def _list(params: dict | None, ctx: Any) -> dict:
+        return {"sessions": []}
+
+    ws = _FakeWs()
+    conn = WsConnection(
+        conn_id="c-abort",
+        ws=ws,  # type: ignore[arg-type]
+        access=AccessContext(
+            surface=ConnectionSurface.CONTROL, admitted=True, credential_verified=True
+        ),
+    )
+    loop = asyncio.create_task(_message_loop(conn, GatewayConfig(), registry, None))
+    abort = {"key": "agent:main:a"}
+    await ws.inbox.put(
+        json.dumps({"type": "req", "id": "1", "method": "sessions.abort", "params": abort})
+    )
+    await ws.inbox.put(
+        json.dumps(
+            {
+                "type": "req",
+                "id": "2",
+                "method": "chat.history",
+                "params": {"sessionKey": "agent:main:b"},
+            }
+        )
+    )
+    await ws.inbox.put(_req("3", "sessions.list"))
+
+    await asyncio.wait_for(_answered(ws, "2"), timeout=2.0)
+    await asyncio.wait_for(_answered(ws, "3"), timeout=2.0)
+    assert not any(frame.get("id") == "1" for frame in ws.sent)
+    release.set()
+    await asyncio.wait_for(_answered(ws, "1"), timeout=2.0)
+
+    await ws.inbox.put(None)
+    await asyncio.wait_for(loop, timeout=2.0)
+
+
 async def test_pending_detached_requests_are_cancelled_on_disconnect() -> None:
     registry = RpcRegistry()
     started = asyncio.Event()
