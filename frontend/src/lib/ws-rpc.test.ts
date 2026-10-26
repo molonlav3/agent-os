@@ -402,3 +402,78 @@ describe('callIdempotent', () => {
     }
   })
 })
+
+describe('handshake refusal and manual retry', () => {
+  function refuse(ws: FakeWebSocket, code: string, message: string) {
+    ws.serverSend({ type: 'event', event: 'connect.challenge' })
+    const req = JSON.parse(ws.sent.at(-1)!)
+    ws.serverSend({ type: 'res', id: req.id, ok: false, error: { code, message } })
+  }
+
+  it('emits the typed refusal and does not retry by itself', () => {
+    const { client, ws } = newClient()
+    const refused = vi.fn()
+    client.on('_handshakeError', refused)
+    refuse(ws, 'UNAUTHORIZED', 'Authentication failed')
+    expect(refused).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'UNAUTHORIZED', message: 'Authentication failed' }),
+    )
+    expect(client.state).toBe('disconnected')
+    const count = FakeWebSocket.instances.length
+    vi.advanceTimersByTime(60_000)
+    expect(FakeWebSocket.instances.length).toBe(count)
+  })
+
+  it('reconnect() opens a new socket at once after a refusal', () => {
+    const { client, ws } = newClient()
+    refuse(ws, 'UNAUTHORIZED', 'Authentication failed')
+    const count = FakeWebSocket.instances.length
+    client.reconnect()
+    expect(FakeWebSocket.instances.length).toBe(count + 1)
+    expect(client.state).toBe('connecting')
+    const next = FakeWebSocket.instances.at(-1)!
+    next.serverOpen()
+    handshake(next)
+    expect(client.state).toBe('connected')
+  })
+
+  it('reconnect() skips the backoff wait and leaves a live connection alone', () => {
+    const { client, ws } = newClient()
+    handshake(ws)
+    const live = FakeWebSocket.instances.length
+    client.reconnect()
+    expect(FakeWebSocket.instances.length).toBe(live)
+    ws.close()
+    client.reconnect()
+    expect(FakeWebSocket.instances.length).toBe(live + 1)
+  })
+
+  it('a socket that drops mid-handshake still schedules the reconnect', () => {
+    const { client, ws } = newClient()
+    const refused = vi.fn()
+    client.on('_handshakeError', refused)
+    ws.serverSend({ type: 'event', event: 'connect.challenge' })
+    const count = FakeWebSocket.instances.length
+    ws.close()
+    expect(refused).not.toHaveBeenCalled()
+    expect(client.state).toBe('disconnected')
+    vi.advanceTimersByTime(800)
+    expect(FakeWebSocket.instances.length).toBe(count + 1)
+  })
+
+  it('surfaces an event frame state_version as _state_version', () => {
+    const { client, ws } = newClient()
+    handshake(ws)
+    const revision = vi.fn()
+    client.on('_state_version', revision)
+    ws.serverSend({
+      type: 'event',
+      event: 'tick',
+      payload: {},
+      seq: 1,
+      state_version: { presence: 1, health: 4 },
+    })
+    expect(revision).toHaveBeenCalledWith({ presence: 1, health: 4 })
+    expect(client.lastFrameTime).toBeGreaterThan(0)
+  })
+})

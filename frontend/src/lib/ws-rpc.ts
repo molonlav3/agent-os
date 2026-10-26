@@ -7,6 +7,17 @@ export class RpcError extends Error {
   details?: unknown
 }
 
+/**
+ * What the console keeps of a refused handshake (the client emits the
+ * RpcError itself as `_handshakeError`). A refused handshake is not retried
+ * on its own (the same credentials would be refused again), so the console
+ * needs to say so rather than "Connecting…".
+ */
+export interface HandshakeError {
+  code: string
+  message: string
+}
+
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void }
 type Handler = (...args: unknown[]) => void
 
@@ -125,6 +136,44 @@ export class WsRpcClient {
 
   get state(): RpcState {
     return this.stateValue
+  }
+
+  /**
+   * Connect again now, with the URL and credentials of the last `connect()`.
+   * Skips any pending backoff delay; a live connection is left alone. This is
+   * the "Retry connection" action: after a refused handshake the client does
+   * not retry by itself.
+   */
+  reconnect(): void {
+    if (!this.url) return
+    if (this.stateValue === 'connected') return
+    this.autoReconnect = true
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    this.reconnectDelay = 800
+    if (this.ws) {
+      const stale = this.ws
+      this.ws = null
+      stale.onclose = null
+      stale.onmessage = null
+      try {
+        stale.close()
+      } catch {
+        /* noop */
+      }
+    }
+    this.stopPing()
+    this.stopTickWatch()
+    for (const [, p] of this.pending) p.reject(new Error('Connection closed'))
+    this.pending.clear()
+    this.doConnect()
+  }
+
+  /** Epoch ms of the last frame the gateway sent (0 before the first). */
+  get lastFrameTime(): number {
+    return this.lastFrameAt
   }
 
   get policy(): Record<string, unknown> {
@@ -274,6 +323,11 @@ export class WsRpcClient {
         }
       } else if (data.type === 'event') {
         if (data.event === 'shutdown') this.noteShutdown(data.payload)
+        // The gateway may stamp a state_version revision on an event frame;
+        // listeners that cache snapshot-derived state refresh when it moves.
+        if (data.state_version && typeof data.state_version === 'object') {
+          this.emit('_state_version', data.state_version)
+        }
         const meta = (data.meta as Record<string, unknown>) ?? {}
         this.emit(String(data.event), data.payload, meta)
         this.emit('*', String(data.event), data.payload, meta)
