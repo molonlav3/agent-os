@@ -13,7 +13,7 @@ from agentos.gateway.app import create_gateway_app
 from agentos.gateway.config import AuthConfig, GatewayConfig, ToolsConfig, ToolsInvokeConfig
 from agentos.gateway.tools_invoke import HARD_DENY_TOOLS, IdempotencyCache, is_hard_denied
 from agentos.tools.registry import ToolRegistry
-from agentos.tools.types import ToolSpec, current_tool_context
+from agentos.tools.types import ToolSpec, UnsupportedSurfaceError, current_tool_context
 
 TOKEN = "test-token"
 
@@ -42,6 +42,16 @@ def _registry(calls: list[dict[str, Any]]) -> ToolRegistry:
     async def boom(**_: Any) -> str:
         raise RuntimeError("secret detail sk-should-not-leak")
 
+    async def refuses_unattended(**_: Any) -> str:
+        # What exec_command does on an unattended run that needs approval:
+        # it refuses before queuing anything.
+        raise UnsupportedSurfaceError(
+            "Tool 'refuses_unattended' requires human approval, but this run is unattended."
+        )
+
+    async def no_surface(**_: Any) -> str:
+        raise UnsupportedSurfaceError("This tool needs an interactive chat.")
+
     async def never(**_: Any) -> str:
         raise AssertionError("must not run")
 
@@ -65,6 +75,13 @@ def _registry(calls: list[dict[str, Any]]) -> ToolRegistry:
         needs_human,
     )
     registry.register(ToolSpec(name="boom", description="", parameters={}, read_only=True), boom)
+    registry.register(
+        ToolSpec(name="refuses_unattended", description="", parameters={}, read_only=True),
+        refuses_unattended,
+    )
+    registry.register(
+        ToolSpec(name="no_surface", description="", parameters={}, read_only=True), no_surface
+    )
     for name in (
         "exec_command",
         "write_file",
@@ -247,6 +264,21 @@ class TestInvoke:
         body = resp.json()
         assert body["code"] == "FORBIDDEN"
         assert body["details"] == {"code": "APPROVAL_REQUIRED", "approval_id": "abc123"}
+
+    def test_a_tool_refusing_an_unattended_approval_is_403(self) -> None:
+        """The shell refuses before queuing on an unattended run; that is an
+        approval requirement too, without an id."""
+        resp = _invoke(_client(_registry([])), {"tool": "refuses_unattended"})
+        assert resp.status_code == 403, resp.text
+        body = resp.json()
+        assert body["code"] == "FORBIDDEN"
+        assert body["details"] == {"code": "APPROVAL_REQUIRED"}
+        assert "requires human approval" in body["error"]
+
+    def test_another_unsupported_surface_is_a_tool_failure(self) -> None:
+        resp = _invoke(_client(_registry([])), {"tool": "no_surface"})
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is False
 
     def test_tool_failure_is_reported_without_internals(self) -> None:
         resp = _invoke(_client(_registry([])), {"tool": "boom"})

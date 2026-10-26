@@ -145,6 +145,9 @@ FILE_WRITE_ARGUMENTS: frozenset[str] = frozenset(
 )
 
 _APPROVAL_STATUSES = frozenset({"approval_pending", "approval_required", "pending_approval"})
+#: How an unattended refusal comes back: the dispatcher's notice that replaced
+#: a queued approval, or a tool (the shell) refusing before it queues one.
+_UNATTENDED_REFUSALS = frozenset({"UnsupportedSurface", "UnsupportedSurfaceError"})
 
 
 def is_hard_denied(tool: str, allow: list[str] | tuple[str, ...] = ()) -> bool:
@@ -495,7 +498,7 @@ def _approval_gate(
         if str(value.get("status") or "") in _APPROVAL_STATUSES:
             pending = True
             captured_id = captured_id or value.get("approval_id") or value.get("approvalId")
-        elif result.is_error and value.get("error_class") == "UnsupportedSurface":
+        elif result.is_error and value.get("error_class") in _UNATTENDED_REFUSALS:
             pending = pending or "approval" in message.lower()
     if not pending:
         return None
