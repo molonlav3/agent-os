@@ -909,6 +909,13 @@ def _make_task_session_lifecycle_listener(
     return _listener
 
 
+#: Stream events that end a text segment: text held back by the display strip
+#: is released (or dropped) before them, as the console starts a new segment.
+_TEXT_SEGMENT_BOUNDARY_EVENTS = frozenset(
+    {"tool_use_start", "tool_result", "artifact", "done", "error"}
+)
+
+
 async def _emit_child_run_state(event: TaskLifecycleEvent, *, event_emitter: Any) -> None:
     """``sessions.changed`` for a child session's run transition, row untouched."""
     if event.phase == "terminal" and event.has_followup:
@@ -962,11 +969,25 @@ async def _emit_task_runtime_stream_events(
     :mod:`agentos.gateway.terminal_events`) makes it exactly-once: a run an
     abort already holds, or whose terminal was already published, does not
     get a second one.
+
+    Streamed text is display-clean: directives, generated-artifact markers and
+    leaked tool-protocol text are stripped here (``agentos.chat.display_text``),
+    so no client has to, and a frame never carries half a marker. Text a
+    marker might still complete is held until the next chunk or the end of the
+    text segment (a tool call or the turn's end).
     """
     from dataclasses import asdict, is_dataclass
 
+    from agentos.chat.display_text import AssistantTextStreamSanitizer, strip_assistant_text
     from agentos.engine.stream_wrappers import wrap_stream
     from agentos.gateway.terminal_events import terminal_state
+
+    display_text = AssistantTextStreamSanitizer()
+
+    async def _flush_display_text() -> None:
+        held = display_text.flush()
+        if held:
+            await event_emitter(session_key, "session.event.text_delta", {"text": held})
 
     error_message: str | None = None
     error_code: str | None = None
@@ -1003,6 +1024,16 @@ async def _emit_task_runtime_stream_events(
                 continue
             if event_kind == "done":
                 event_dict.pop("reasoning_content", None)
+        if event_kind == "text_delta":
+            raw_text = event_dict.get("text")
+            cleaned = display_text.feed(raw_text if isinstance(raw_text, str) else "")
+            if not cleaned:
+                continue
+            event_dict["text"] = cleaned
+        elif event_kind in _TEXT_SEGMENT_BOUNDARY_EVENTS:
+            await _flush_display_text()
+        if event_kind == "done" and isinstance(event_dict.get("text"), str):
+            event_dict["text"] = strip_assistant_text(event_dict["text"])
         if event_kind == "error":
             raw_message = event_dict.get("message")
             error_message = (
@@ -1058,6 +1089,7 @@ async def _emit_task_runtime_stream_events(
         if event_kind == "error":
             message = event_dict.get("error_message")
             error_message = message if isinstance(message, str) and message else "Agent error"
+    await _flush_display_text()
     if error_message is not None:
         raise TaskRuntimeStreamError(
             error_message,
