@@ -707,6 +707,20 @@ def create_gateway_app(
     from agentos.gateway.download_grants import register_download_routes  # noqa: PLC0415
 
     register_download_routes(app, config=config, session_manager=session_manager)
+    from agentos.gateway.tools_invoke import register_tools_invoke_route  # noqa: PLC0415
+
+    register_tools_invoke_route(
+        app,
+        config=config,
+        make_ctx=_make_ctx,
+        tool_registry=tool_registry,
+        runtime={
+            "session_manager": session_manager,
+            "task_runtime": task_runtime,
+            "cron_scheduler": cron_scheduler,
+            "channel_manager": channel_manager,
+        },
+    )
     register_audio_transcription_routes(app, config=config)
 
     return app

@@ -148,7 +148,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   parent sessions as well (`audience_session_keys` in the queue, the
   `/api/approvals` listing and `approval.list`), so the parent's viewers can be
   told about the child's prompt (#3694).
-- `hello-ok.features.capabilities` advertises `artifact-tickets` and `web-push`.
+- `POST /api/v1/tools/invoke` runs one tool without a model turn under the
+  same policy chain as an agent's tool call, unattended and sandboxed:
+  `dry_run` returns the resolved policy, an approval requirement answers `403`
+  with the `approval_id`, `idempotency_key` replays or answers `409
+  REQUEST_CONFLICT`. Shell and code execution, file writes, session
+  spawning/sending, scheduling, gateway control, outbound messages and trading
+  tools answer `404` whatever the config says, unless `[tools.invoke] allow`
+  names them (#3695).
+- `hello-ok.features.capabilities` advertises `artifact-tickets`, `tools-invoke` and `web-push`.
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up

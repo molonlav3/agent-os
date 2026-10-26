@@ -62,6 +62,7 @@ CAPABILITIES: frozenset[str] = frozenset(
         # `shutdown {reason, restart_expected_ms}` (gateway/readiness.py).
         "supervisor-contract",
         "terminal-replay",
+        "tools-invoke",
         "typed-errors",
         "web-push",
     }

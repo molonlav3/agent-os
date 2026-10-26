@@ -239,6 +239,41 @@ deletes and approval decisions stay on the WebSocket. Any other method answers `
 `HTTP_RPC_METHODS` in
 [`src/agentos/gateway/http_rpc.py`](../src/agentos/gateway/http_rpc.py).
 
+## Direct tool calls
+
+`POST /api/v1/tools/invoke` runs one tool without an LLM turn (bearer auth,
+Control surface):
+
+```sh
+curl -X POST -H "Authorization: Bearer $AGENTOS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tool": "web_search", "args": {"query": "agentos release notes"}}' \
+  http://127.0.0.1:18791/api/v1/tools/invoke
+```
+
+Body: `tool` (required), `args` (object), `action` (merged into `args` for
+tools that take one), `session_key` (runs the tool in that session's context
+and agent), `idempotency_key`, `dry_run`.
+
+| Status | Meaning |
+| --- | --- |
+| `200` `{"ok": true, "result": …}` | The tool ran. A tool that ran and failed answers `200` with `ok: false` and the tool's error class. |
+| `200` `{"dryRun": true, "allowed": …, "policy": {…}}` | `dry_run`: the resolved policy (profile, caller, sandboxed, read-only, may-require-approval); nothing ran. |
+| `403` `POLICY_DENIED` | The configured tool policy (`[tools]` profile/allow/deny, the agent's own entry) refuses it. |
+| `403` `APPROVAL_REQUIRED` | The tool needs a human approval. HTTP calls run unattended, so the tool refuses as on any unattended run; `approval_id` is included when it queued one. |
+| `404` `NOT_FOUND` | Unknown tool **or** a hard-denied one — the two look the same. |
+| `409` `REQUEST_CONFLICT` | The `idempotency_key` was used for a different request in the last ten minutes (a repeat of the same request replays its first answer with `idempotentReplay: true`). |
+
+The hard deny list holds regardless of configuration: shell, terminal and code
+execution (`exec_command`, `bash`, `process`, `execute_code`, …), file writes,
+deletes and moves (`write_file`, `edit_file`, `apply_patch`, `git_commit`,
+memory and skill writes, document creation, `publish_artifact`, `env_set`),
+`sessions_spawn`, `sessions_send`, `subagents`, `acp`, `message`, `cron` and
+any scheduler tool, `gateway`, and any `trade*`/`trading*` tool. Lift a single
+tool with `[tools.invoke] allow = ["write_file"]`. Tools run sandboxed in an
+unattended context; a connection the gateway recognizes as an agent's (an agent
+token or an open exec window) is refused with `403`.
+
 ## Streaming (WebSocket)
 
 For streaming turns and live events, connect to the WebSocket route:
@@ -433,7 +468,7 @@ The full route table is defined in `create_gateway_app`:
 list). File-and-media routes are registered just below it via
 `register_upload_routes`, `register_attachment_routes`,
 `register_artifact_routes`, `register_download_routes` and
-`register_audio_transcription_routes`.
+`register_audio_transcription_routes`; then `register_tools_invoke_route`.
 
 Read next:
 

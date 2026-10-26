@@ -438,5 +438,6 @@ def test_new_default_sections_are_not_persisted() -> None:
     data = GatewayConfig().to_toml_dict()
     for section in ("gateway", "artifacts", "push"):
         assert section not in data
+    assert "invoke" not in data["tools"]
     changed = GatewayConfig(gateway=GatewayServeConfig(bind="lan")).to_toml_dict()
     assert changed["gateway"]["bind"] == "lan"

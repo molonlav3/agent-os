@@ -268,6 +268,19 @@ class SkillsConfig(BaseSettings):
     install_policy: SkillInstallPolicyConfig = Field(default_factory=SkillInstallPolicyConfig)
 
 
+class ToolsInvokeConfig(BaseModel):
+    """``[tools.invoke]`` — the direct HTTP tool endpoint.
+
+    ``allow`` names tools lifted off the endpoint's hard deny list (shell,
+    file writes, session spawning, scheduling, gateway control, trading
+    writes), one tool per entry. Nothing else widens that list.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    allow: list[str] = Field(default_factory=list)
+
+
 class ToolsConfig(BaseModel):
     """Top-level runtime tool policy configuration."""
 
@@ -285,6 +298,8 @@ class ToolsConfig(BaseModel):
     also_allow: list[str] = Field(default_factory=list)
     workspace_write_deny_globs: list[str] = Field(default_factory=list)
     trusted_fake_ip_cidrs: list[str] = Field(default_factory=list)
+    # ``POST /api/v1/tools/invoke`` (``[tools.invoke]``). Read per request.
+    invoke: ToolsInvokeConfig = Field(default_factory=ToolsInvokeConfig)
 
     @field_validator("trusted_fake_ip_cidrs")
     @classmethod
@@ -3249,6 +3264,9 @@ def _drop_default_sections(data: dict[str, Any], config: GatewayConfig) -> None:
     for name, model in _OMIT_WHEN_DEFAULT_SECTIONS:
         if getattr(config, name, None) == model():
             data.pop(name, None)
+    tools = data.get("tools")
+    if isinstance(tools, dict) and config.tools.invoke == ToolsInvokeConfig():
+        tools.pop("invoke", None)
 
 
 def _delete_path(obj: dict[str, Any], path: str) -> None:

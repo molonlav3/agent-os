@@ -723,6 +723,11 @@ cron_default_mode = "bypass"            # off | bypass | full
 # web_enabled = true
 # vapid_subject = "https://useagentos.dev"
 
+# [tools.invoke]
+# Tools POST /api/v1/tools/invoke may run although they are on its hard deny
+# list (shell, file writes, session spawning/sending, cron, gateway, trading).
+# allow = ["create_pdf_report"]
+
 # [channels]
 # [[channels.channels]]
 # name = "my-slack"

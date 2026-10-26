@@ -66,6 +66,30 @@ Approvals are most important for:
 Use the Web UI approvals page when you want durable review outside the chat
 scrollback.
 
+## Calling a Tool Directly
+
+`POST /api/v1/tools/invoke` runs one tool without a model turn, for scripts,
+CI and the desktop: `{"tool": "web_search", "args": {...}}`. It applies the
+same policy an agent's tool call gets — the `[tools]` profile, allow and deny
+lists, the agent's own entry, the runtime capability surface and the dispatch
+policy chain — in an unattended, sandboxed context, so a tool that needs an
+approval refuses (`403 APPROVAL_REQUIRED`, with the `approval_id` when one was
+queued). `dry_run: true` returns the resolved policy without running anything.
+
+A hard deny list applies on top, whatever the configuration says: shell,
+terminal and code execution, file writes, deletes and moves (including memory,
+skill and document writes, `publish_artifact` and `env_set`), `sessions_spawn`,
+`sessions_send`, `subagents`, `acp`, `message`, `cron` and scheduler tools,
+`gateway`, and trading tools. Those answer `404`, exactly like a tool that
+does not exist. Lift one tool at a time with:
+
+```toml
+[tools.invoke]
+allow = ["create_pdf_report"]   # tool names, never patterns
+```
+
+Full status table: [HTTP API → Direct tool calls](http-api.md#direct-tool-calls).
+
 ## Workspace Controls
 
 Read-side restriction:
