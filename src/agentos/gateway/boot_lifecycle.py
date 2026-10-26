@@ -64,10 +64,15 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     ended_at REAL,
     clean INTEGER,
     reason TEXT NOT NULL DEFAULT '',
-    counted INTEGER NOT NULL DEFAULT 1
+    counted INTEGER NOT NULL DEFAULT 1,
+    last_seen_at REAL
 )
 """
 CREATE_INDEX = f"CREATE INDEX IF NOT EXISTS idx_{TABLE}_started_at ON {TABLE}(started_at)"
+#: When an unclean boot ended: its last heartbeat, else its start (it died
+#: before the first maintenance tick). The breaker window counts by this, so
+#: a gateway that ran for an hour and then crashed counts as crashing now.
+_END_TIME = "COALESCE(ended_at, last_seen_at, started_at)"
 
 
 def _iso(ts: float | None) -> str | None:
@@ -88,6 +93,10 @@ class BootRow:
     #: (``channels.start``) and a boot that failed before serving (which safe
     #: mode cannot help: nothing it holds back had started) do not.
     counted: bool = True
+
+    @property
+    def end_time(self) -> float:
+        return self.ended_at if self.ended_at is not None else self.started_at
 
 
 class BootLedger:
@@ -116,6 +125,9 @@ class BootLedger:
             with conn:
                 conn.execute(CREATE_TABLE)
                 conn.execute(CREATE_INDEX)
+                columns = {row[1] for row in conn.execute(f"PRAGMA table_info({TABLE})")}
+                if "last_seen_at" not in columns:
+                    conn.execute(f"ALTER TABLE {TABLE} ADD COLUMN last_seen_at REAL")
                 yield conn
         finally:
             conn.close()
@@ -123,10 +135,11 @@ class BootLedger:
     def begin(self, *, boot_id: str, pid: int, now: float) -> int:
         """Close out boots that never ended, record this one; returns rows closed."""
         with self._connect() as conn:
+            # A boot that never recorded its end died around its last heartbeat.
             closed = conn.execute(
-                f"UPDATE {TABLE} SET clean = 0, ended_at = COALESCE(ended_at, ?), reason = ? "
+                f"UPDATE {TABLE} SET clean = 0, ended_at = {_END_TIME}, reason = ? "
                 "WHERE clean IS NULL AND id != ?",
-                (now, REASON_NO_SHUTDOWN, boot_id),
+                (REASON_NO_SHUTDOWN, boot_id),
             ).rowcount
             conn.execute(
                 f"INSERT INTO {TABLE} (id, pid, started_at) VALUES (?, ?, ?)",
@@ -149,12 +162,21 @@ class BootLedger:
                 (1 if clean else 0, now, reason, 1 if counted else 0, boot_id),
             )
 
+    def touch(self, *, boot_id: str, now: float) -> None:
+        """Heartbeat: this boot was alive at ``now``."""
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE {TABLE} SET last_seen_at = ? WHERE id = ? AND clean IS NULL",
+                (now, boot_id),
+            )
+
     def unclean_since(self, since: float, *, exclude: str | None = None) -> list[BootRow]:
+        """Counted unclean boots that *ended* at or after ``since``."""
         with self._connect() as conn:
             rows = conn.execute(
-                f"SELECT id, pid, started_at, ended_at, clean, reason, counted FROM {TABLE} "
-                "WHERE clean = 0 AND counted = 1 AND started_at >= ? AND id != ? "
-                "ORDER BY started_at DESC",
+                f"SELECT id, pid, started_at, {_END_TIME}, clean, reason, counted FROM {TABLE} "
+                f"WHERE clean = 0 AND counted = 1 AND {_END_TIME} >= ? AND id != ? "
+                f"ORDER BY {_END_TIME} DESC",
                 (since, exclude or ""),
             ).fetchall()
         return [
@@ -203,7 +225,11 @@ class SafeModeDecision:
                     "since": _iso(self.since),
                     "clears_at": _iso(self.clears_at),
                     "recent": [
-                        {"started_at": _iso(row.started_at), "reason": row.reason}
+                        {
+                            "started_at": _iso(row.started_at),
+                            "ended_at": _iso(row.end_time),
+                            "reason": row.reason,
+                        }
                         for row in self.recent
                     ],
                 }
@@ -220,14 +246,16 @@ def evaluate_unclean_boots(
     threshold: int = UNCLEAN_BOOT_THRESHOLD,
     window_s: float = UNCLEAN_WINDOW_S,
 ) -> SafeModeDecision:
-    """Safe mode iff ``threshold`` unclean boots started inside the window.
+    """Safe mode iff ``threshold`` unclean boots *ended* inside the window.
 
+    Counting by end time (the last heartbeat) rather than start time means a
+    gateway that ran for a while before each crash still trips the breaker.
     ``clears_at`` is when the ``threshold``-th newest of them leaves the
     window, the moment the count drops below the threshold.
     """
     in_window = sorted(
-        (row for row in recent if row.started_at >= now - window_s and row.counted),
-        key=lambda row: row.started_at,
+        (row for row in recent if row.end_time >= now - window_s and row.counted),
+        key=lambda row: row.end_time,
         reverse=True,
     )
     count = len(in_window)
@@ -248,7 +276,7 @@ def evaluate_unclean_boots(
         threshold=threshold,
         window_s=window_s,
         since=now,
-        clears_at=pivot.started_at + window_s,
+        clears_at=pivot.end_time + window_s,
         recent=in_window,
     )
 
@@ -357,10 +385,21 @@ class BootTracker:
             recent, now=now, threshold=self._threshold, window_s=self._window_s
         )
         if decision.active:
+            # Same episode: keep when it first tripped, refresh the rest.
+            decision.since = self._decision.since or decision.since
             self._decision = decision
             return False
         await self._clear("window_drained")
         return True
+
+    async def heartbeat(self) -> None:
+        """Record that this boot is alive (maintenance tick). Never raises."""
+        if self._ledger is None or not self._recorded or self._ended:
+            return
+        try:
+            self._ledger.touch(boot_id=self.boot_id, now=self._clock())
+        except (sqlite3.Error, OSError) as exc:
+            log.debug("gateway.boot_ledger_unavailable", error=f"{type(exc).__name__}: {exc}")
 
     async def exit_safe_mode(self, *, reason: str = "operator") -> bool:
         """Leave safe mode now and stop counting the crashes that caused it."""

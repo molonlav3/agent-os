@@ -158,6 +158,60 @@ async def test_manual_override_clears_and_stops_counting_the_crashes(tmp_path: P
     assert _tracker(db, clock, pid=77).start().active is False
 
 
+@pytest.mark.asyncio
+async def test_boots_that_ran_a_while_before_crashing_count_by_when_they_died(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "sessions.db"
+    clock = _Clock()
+    long_run = _tracker(db, clock, pid=200)
+    long_run.start()
+    clock.now += 600  # ran ten minutes, heartbeating, then died
+    await long_run.heartbeat()
+    clock.now += 5
+    _crash_boots(db, clock, 2, gap_s=5)  # and the next two die at once
+    decision = _tracker(db, clock, pid=9).start()
+    # By start time the long run is 10+ minutes old and would not count; by
+    # when it died it is one of three crashes inside five minutes.
+    assert decision.active is True
+    assert decision.unclean_boots == 3
+    assert decision.clears_at == pytest.approx(1_000_000.0 + 600 + UNCLEAN_WINDOW_S)
+    recent = decision.to_payload()["recent"]
+    assert [row["ended_at"] for row in recent] == sorted(
+        (row["ended_at"] for row in recent), reverse=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_safe_mode_since_is_the_first_trip_time(tmp_path: Path) -> None:
+    db = tmp_path / "sessions.db"
+    clock = _Clock()
+    _crash_boots(db, clock, 3)
+    tracker = _tracker(db, clock)
+    first = tracker.start()
+    assert first.active is True
+    tripped = tracker.snapshot()["since"]
+    for _ in range(3):
+        clock.now += 30
+        assert await tracker.reevaluate() is False
+    assert tracker.snapshot()["since"] == tripped
+
+
+def test_an_older_ledger_without_heartbeats_is_upgraded(tmp_path: Path) -> None:
+    db = tmp_path / "sessions.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE gateway_boots (id TEXT PRIMARY KEY, pid INTEGER NOT NULL, "
+            "started_at REAL NOT NULL, ended_at REAL, clean INTEGER, "
+            "reason TEXT NOT NULL DEFAULT '', counted INTEGER NOT NULL DEFAULT 1)"
+        )
+    tracker = _tracker(db, _Clock())
+    assert tracker.start().error is None
+    with sqlite3.connect(db) as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(gateway_boots)")]
+    assert cols[-1] == "last_seen_at"
+
+
 def test_ledger_failure_fails_open(tmp_path: Path) -> None:
     not_a_db = tmp_path / "sessions.db"
     not_a_db.mkdir()  # sqlite cannot open a directory
@@ -188,7 +242,16 @@ def test_migration_v014_matches_the_ledger_schema(tmp_path: Path) -> None:
     assert "V014__gateway_boots" in applied
     with sqlite3.connect(db) as conn:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(gateway_boots)")]
-    assert cols == ["id", "pid", "started_at", "ended_at", "clean", "reason", "counted"]
+    assert cols == [
+        "id",
+        "pid",
+        "started_at",
+        "ended_at",
+        "clean",
+        "reason",
+        "counted",
+        "last_seen_at",
+    ]
     clock = _Clock()
     _crash_boots(db, clock, 3)
     assert _tracker(db, clock).start().active is True
@@ -200,15 +263,17 @@ def test_migration_v014_matches_the_ledger_schema(tmp_path: Path) -> None:
 class _FakeScheduler:
     def __init__(self) -> None:
         self.started = 0
+        self.events: list[str] = []
 
-    def register_handler(self, *_args: Any) -> None:
-        return None
+    def register_handler(self, key: str, *_args: Any) -> None:
+        self.events.append(f"handler:{key}")
 
     async def list_jobs(self) -> list[Any]:
         return []
 
     async def start(self) -> None:
         self.started += 1
+        self.events.append("start")
 
     async def stop(self) -> None:
         return None
@@ -374,10 +439,97 @@ async def test_boot_outside_safe_mode_starts_everything(
     db = tmp_path / "state" / "sessions.db"
     tracker = _tracker(db, _Clock())
     manager = _FakeChannelManager()
+    scheduler = _FakeScheduler()
 
     async def fake_build_services(**kwargs: Any) -> Any:
-        assert kwargs["start_scheduler"] is True
+        # The gateway never lets build_services start the scheduler: the
+        # catch-up must not run before the handlers exist.
+        assert kwargs["start_scheduler"] is False
 
+        async def close() -> None:
+            return None
+
+        return SimpleNamespace(
+            provider_selector=object(),
+            tool_registry=object(),
+            session_manager=object(),
+            skill_loader=object(),
+            usage_tracker=object(),
+            config=kwargs["config"],
+            memory_sync_managers={},
+            model_catalog=None,
+            memory_retrievers={},
+            turn_capture_services={},
+            cron_scheduler=scheduler,
+            task_runtime=None,
+            agent_registry=None,
+            memory_managers={},
+            memory_stores={},
+            _turn_runner_ref=[],
+            close=close,
+        )
+
+    class FakeTurnRunner:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def set_session_lock_provider(self, _provider: Any) -> None:
+            pass
+
+    monkeypatch.setattr("agentos.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr(boot, "build_services", fake_build_services)
+    monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
+    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
+    monkeypatch.setattr("agentos.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
+    monkeypatch.setattr("agentos.gateway.pidlock.GatewayPidLock.release", lambda self: None)
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+    )
+    server = await boot.start_gateway_server(
+        config=config, channel_manager=manager, run=False, boot_tracker=tracker
+    )
+    try:
+        assert manager.calls == ["start_all"]
+        # Started exactly once, after all four handlers were registered.
+        assert scheduler.events == [
+            "handler:agent_run",
+            "handler:static_message",
+            "handler:system_event",
+            "handler:script_run",
+            "start",
+        ]
+        assert server.readiness.state(gateway_ready=True) == "ready"
+        assert server.readiness.startup_complete() is True
+    finally:
+        await server.close()
+    # close() recorded the boot clean.
+    with sqlite3.connect(db) as conn:
+        clean, reason = conn.execute("SELECT clean, reason FROM gateway_boots").fetchone()
+    assert (clean, reason) == (1, "shutdown")
+
+
+@pytest.mark.asyncio
+async def test_a_channel_that_fails_at_boot_is_named_in_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from starlette.testclient import TestClient
+
+    from agentos.gateway import boot
+
+    class FailingManager(_FakeChannelManager):
+        async def start_all(self) -> dict[str, bool]:
+            return {"tg": False}
+
+        def start_errors(self) -> dict[str, dict[str, str]]:
+            return {"tg": {"error_type": "ConnectionError", "error": "no route to host"}}
+
+        def failed_channels(self) -> dict[str, str]:
+            return {"tg": "ConnectionError: no route to host"}
+
+    async def fake_build_services(**kwargs: Any) -> Any:
         async def close() -> None:
             return None
 
@@ -421,15 +573,16 @@ async def test_boot_outside_safe_mode_starts_everything(
         channels={"channels": []},
     )
     server = await boot.start_gateway_server(
-        config=config, channel_manager=manager, run=False, boot_tracker=tracker
+        config=config,
+        channel_manager=FailingManager(),
+        run=False,
+        boot_tracker=_tracker(tmp_path / "state" / "sessions.db", _Clock()),
     )
     try:
-        assert manager.calls == ["start_all"]
-        assert server.readiness.state(gateway_ready=True) == "ready"
-        assert server.readiness.startup_complete() is True
+        body = TestClient(server.app, base_url="http://localhost").get("/ready").json()
+        # A down channel does not make the gateway unready, but it is named.
+        assert body["ready"] is True
+        assert body["failing"] == ["channel:tg"]
+        assert body["startup"]["failed"] == {"channels": "tg: ConnectionError: no route to host"}
     finally:
         await server.close()
-    # close() recorded the boot clean.
-    with sqlite3.connect(db) as conn:
-        clean, reason = conn.execute("SELECT clean, reason FROM gateway_boots").fetchone()
-    assert (clean, reason) == (1, "shutdown")

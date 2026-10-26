@@ -112,6 +112,19 @@ def test_ready_reports_safe_mode_as_ready_with_the_reason() -> None:
     assert body["safe_mode"]["reason"].startswith("3 unclean gateway boots")
 
 
+def test_ready_names_down_channels_without_becoming_unready() -> None:
+    readiness = GatewayReadiness(clock=_Clock())
+    readiness.mark_serving()
+    down = ["tg"]
+    readiness.attach_failing_channels(lambda: list(down))
+    client = _client(_app(readiness, ready_flag=True))
+    resp = client.get("/ready")
+    assert resp.status_code == 200
+    assert resp.json()["failing"] == ["channel:tg"]
+    down.clear()  # the health sweep brought it back
+    assert client.get("/ready").json()["failing"] == []
+
+
 def test_startupz_waits_for_every_boot_sidecar() -> None:
     readiness = GatewayReadiness(clock=_Clock())
     readiness.begin_sidecar(SIDECAR_CHANNELS)

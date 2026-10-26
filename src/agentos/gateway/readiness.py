@@ -81,6 +81,7 @@ class GatewayReadiness:
         self._settled_at: float | None = None
         self._safe_mode: Callable[[], dict[str, Any]] | None = None
         self._active_turns: Callable[[], int] | None = None
+        self._failing_channels: Callable[[], list[str]] | None = None
 
     # ── wiring ──────────────────────────────────────────────────────
 
@@ -90,6 +91,18 @@ class GatewayReadiness:
 
     def attach_active_turns(self, provider: Callable[[], int]) -> None:
         self._active_turns = provider
+
+    def attach_failing_channels(self, provider: Callable[[], list[str]]) -> None:
+        """``provider()`` names channels that are down (failed start, terminal)."""
+        self._failing_channels = provider
+
+    def failing_channels(self) -> list[str]:
+        if self._failing_channels is None:
+            return []
+        try:
+            return sorted(str(name) for name in self._failing_channels())
+        except Exception:  # noqa: BLE001 - a probe must never fail on a channel
+            return []
 
     # ── boot sidecars ───────────────────────────────────────────────
 
@@ -178,13 +191,19 @@ class GatewayReadiness:
         return max(MIN_RESTART_EXPECTED_MS, startup + RESTART_TEARDOWN_MS)
 
     def failing(self, state: GatewayState) -> list[str]:
+        """What is wrong right now. Down channels are listed as ``channel:<name>``.
+
+        They do not make the gateway unready: the control plane and the other
+        channels serve, and the health sweep keeps restarting them.
+        """
         if state == "starting":
             return self.pending_sidecars() or ["startup"]
         if state == "draining":
             return ["draining"]
+        channels = [f"channel:{name}" for name in self.failing_channels()]
         if state == "safe_mode":
-            return ["safe_mode"]
-        return []
+            return ["safe_mode", *channels]
+        return channels
 
     def snapshot(self, *, gateway_ready: bool | None = None) -> dict[str, Any]:
         """The ``/ready`` payload body (the HTTP layer adds ``uptime_ms``)."""

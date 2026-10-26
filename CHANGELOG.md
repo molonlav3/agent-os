@@ -142,6 +142,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `client: {name}` shape is still accepted.
 - The web console reconnects when the socket drops in the middle of the
   handshake instead of staying disconnected.
+- Gateway: the cron scheduler's startup catch-up no longer runs before its
+  handlers are registered, which could fail the first missed reminder or
+  script job with "No handler registered" and leave it with no next run.
 - Scheduler: the next wake is planned on both the wall and the monotonic
   clock, so after a laptop sleep each overdue job runs once (missed runs
   coalesce) and a clock set back never fires a job early or twice. Sleep

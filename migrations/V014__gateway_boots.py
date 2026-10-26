@@ -2,9 +2,10 @@
 
 One row per ``agentos gateway run`` boot: when it started, when and how it
 ended. ``clean`` is NULL while the boot runs, 1 after a graceful shutdown, 0
-for a boot that ended without one (the next boot marks those). ``counted``
-says whether an unclean row counts toward safe mode: an operator override
-and a boot that failed before serving do not.
+for a boot that ended without one (the next boot marks those, with
+``ended_at`` set to its last heartbeat, ``last_seen_at``). ``counted`` says
+whether an unclean row counts toward safe mode: an operator override and a
+boot that failed before serving do not.
 
 ``agentos.gateway.boot_lifecycle`` also creates the table on its own
 (``CREATE TABLE IF NOT EXISTS``, same DDL): a boot is recorded before
@@ -25,7 +26,8 @@ CREATE TABLE IF NOT EXISTS gateway_boots (
     ended_at REAL,
     clean INTEGER,
     reason TEXT NOT NULL DEFAULT '',
-    counted INTEGER NOT NULL DEFAULT 1
+    counted INTEGER NOT NULL DEFAULT 1,
+    last_seen_at REAL
 )
 """
 CREATE_INDEX = (

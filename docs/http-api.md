@@ -86,7 +86,7 @@ governed by CORS configuration regardless of auth mode.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health`, `/healthz` | Liveness probe — `{"ok": true, "status": "live"}`. |
-| `GET` | `/ready`, `/readyz` | Readiness probe — `{ready, state, failing, startup, safe_mode, drain_budget_ms, uptime_ms}`; `state` is `starting`, `ready`, `draining` or `safe_mode`. `503` while starting or draining, `200` when ready and in safe mode. The older `status` field mirrors `state`. |
+| `GET` | `/ready`, `/readyz` | Readiness probe — `{ready, state, failing, startup, safe_mode, drain_budget_ms, uptime_ms}`; `state` is `starting`, `ready`, `draining` or `safe_mode`. `503` while starting or draining, `200` when ready and in safe mode. `failing` also lists down channels as `channel:<name>` without making the gateway unready. The older `status` field mirrors `state`. |
 | `GET` | `/startupz` | Startup probe — `200` once every boot sidecar settled (channels started, router preloaded), `503` with the `pending` list before. |
 
 These require no auth and are safe for load balancers and container probes.

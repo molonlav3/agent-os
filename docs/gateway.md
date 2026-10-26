@@ -101,10 +101,12 @@ state directory.
 
 ### Crash-loop breaker (safe mode)
 
-Every boot is recorded in the gateway database. When a boot finds **3 unclean
-boots in the last 5 minutes** — runs that ended without a clean shutdown
-(killed, crashed, out of memory) — it starts in **safe mode** instead of
-restarting the same crash forever:
+Every boot is recorded in the gateway database, with a heartbeat every 30 s.
+When a boot finds **3 unclean boots that ended in the last 5 minutes** — runs
+that ended without a clean shutdown (killed, crashed, out of memory), counted
+by their last heartbeat, so a gateway that ran for an hour before crashing
+counts as crashing now — it starts in **safe mode** instead of restarting the
+same crash forever:
 
 - the control plane starts as usual: Web UI, WebSocket, HTTP, `agentos doctor`,
   logs, config;
@@ -135,7 +137,7 @@ rely on:
 | Signal | Contract |
 |---|---|
 | `GET /health` | Liveness: `200` whenever the HTTP server answers. |
-| `GET /ready` | `{ready, state, failing, startup, safe_mode, drain_budget_ms, uptime_ms}`. `state` is `starting` (boot sidecars still running; `failing` names them, e.g. `["channels"]`), `ready`, `draining` (stopping or restarting in place; `failing: ["draining"]`) or `safe_mode` (`failing: ["safe_mode"]`). `503` while `starting` or `draining`; `200` for `ready` and `safe_mode`, where the control plane serves so the cause can be fixed. |
+| `GET /ready` | `{ready, state, failing, startup, safe_mode, drain_budget_ms, uptime_ms}`. `state` is `starting` (boot sidecars still running; `failing` names them, e.g. `["channels"]`), `ready`, `draining` (stopping or restarting in place; `failing: ["draining"]`) or `safe_mode` (`failing: ["safe_mode"]`). `503` while `starting` or `draining`; `200` for `ready` and `safe_mode`, where the control plane serves so the cause can be fixed. In `ready` and `safe_mode`, `failing` also names each channel that is down (failed to start, or stopped on bad credentials) as `channel:<name>`; that does not make the gateway unready. `startup.failed.channels` records which channels failed at boot and why. |
 | `GET /startupz` | `200` once every boot sidecar settled (channels started, router preloaded), `503` before; `pending` lists what is left. |
 | WebSocket `connect` during boot | Answered with a retryable error `UNAVAILABLE`, `details: {code: "STARTUP_SIDECARS", retry_after_ms}`, then close `1013` (`gateway starting`). Clients retry after `retry_after_ms`; the CLI retries for up to 30 s, the web console and desktop keep "connecting". |
 | `shutdown` event | Sent before close `1012`: `{reason, restart_expected_ms}`. A number is an in-place restart with an estimate of when the gateway serves again (this boot's own duration plus teardown, at least 3 s); `null` is a terminal stop. |

@@ -2658,7 +2658,9 @@ async def start_gateway_server(
         turn_hooks=turn_hooks,
         compaction_hooks=compaction_hooks,
         tool_hooks=tool_hooks,
-        start_scheduler=not safe_mode.active,
+        # Started below, once its handlers are registered: a catch-up that
+        # ran first would fail missed jobs with "No handler registered".
+        start_scheduler=False,
     )
 
     # Record boot time for uptime calculation (gateway-specific)
@@ -3004,6 +3006,12 @@ async def start_gateway_server(
             scheduler=svc.cron_scheduler,
             agent_ids=_configured_agent_ids(config),
         )
+        # Every handler is registered: now the startup catch-up and the timer
+        # may run (unless safe mode holds them; its resume hook starts them).
+        start_scheduler = getattr(svc.cron_scheduler, "start", None)
+        if not held_back["scheduler"] and callable(start_scheduler):
+            await start_scheduler()
+            log.info("gateway.cron_scheduler_started")
 
     # Build channel adapters (don't start yet -- app doesn't exist)
     webhook_routes: list = []
@@ -3142,15 +3150,29 @@ async def start_gateway_server(
         log.info("gateway.started", host=config.host, port=config.port)
 
     # Start channels (after app is ready to receive webhooks)
+    channel_start_error: str | None = None
     if channel_manager is not None and not safe_mode.active:
-        await _start_all_channels(channel_manager)
+        started = await _start_all_channels(channel_manager)
+        failed_at_boot = sorted(name for name, ok in started.items() if not ok)
+        if failed_at_boot:
+            errors_fn = getattr(channel_manager, "start_errors", None)
+            errors = errors_fn() if callable(errors_fn) else {}
+            channel_start_error = "; ".join(
+                f"{name}: {errors.get(name, {}).get('error_type', 'error')}: "
+                f"{errors.get(name, {}).get('error', '')}".rstrip(": ")
+                for name in failed_at_boot
+            )
     elif channel_manager is not None:
         log.warning(
             "gateway.safe_mode.channels_held",
             count=len(list(channel_manager.items())),
             hint="run 'agentos channels start --yes' to start them now",
         )
-    readiness.settle_sidecar(SIDECAR_CHANNELS)
+    readiness.settle_sidecar(SIDECAR_CHANNELS, error=channel_start_error)
+    failed_channels = getattr(channel_manager, "failed_channels", None)
+    if callable(failed_channels):
+        # Live, not a boot snapshot: a channel the sweep brings back drops out.
+        readiness.attach_failing_channels(lambda: list(failed_channels()))
 
     async def _resume_after_safe_mode(reason: str) -> None:
         """Start what safe mode held back; runs once, when it clears."""
@@ -3195,7 +3217,7 @@ async def start_gateway_server(
             channel_manager_ref=lambda: _cm_holder[0],
             scheduler_ref=lambda: svc.cron_scheduler,
             safe_mode_active=lambda: boot_tracker.safe_mode_active,
-            on_tick=[boot_tracker.reevaluate],
+            on_tick=[boot_tracker.heartbeat, boot_tracker.reevaluate],
             broadcast=get_registry().broadcast,
         )
         maintenance.start()
