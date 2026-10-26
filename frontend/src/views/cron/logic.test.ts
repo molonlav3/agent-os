@@ -1013,11 +1013,16 @@ describe('jobRuntimeHealth', () => {
   })
 
   it('falls back to consecutive_errors and lastResult on older engines', () => {
-    expect(jobRuntimeHealth({ consecutive_errors: 2, lastResult: 'provider 429' })).toEqual({
-      consecutiveFailures: 2,
+    expect(jobRuntimeHealth({ consecutive_errors: 3, lastResult: 'provider 429' })).toEqual({
+      consecutiveFailures: 3,
       lastError: 'provider 429',
       degraded: true,
       source: 'legacy',
+    })
+    // The engine's threshold: two failures are a streak, not yet degraded.
+    expect(jobRuntimeHealth({ consecutive_errors: 2 })).toMatchObject({
+      consecutiveFailures: 2,
+      degraded: false,
     })
     expect(jobRuntimeHealth({ consecutive_errors: 0 })).toMatchObject({ degraded: false })
     expect(jobRuntimeHealth({ consecutive_errors: 0, status: 'failed' })).toMatchObject({

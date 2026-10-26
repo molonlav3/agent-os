@@ -330,6 +330,16 @@ describe('CronPage', () => {
     await waitFor(() => expect(callsTo('cron.list')).toBeGreaterThanOrEqual(2))
   })
 
+  it('reads the list once more after a run finished, when its health is recorded', async () => {
+    wireRpc()
+    renderPage()
+    await waitFor(() => expect(callsTo('cron.list')).toBe(1))
+    mockRpc.emit('cron.run.finished', {})
+    await waitFor(() => expect(callsTo('cron.list')).toBe(2))
+    // The event precedes the run record; one settle read follows it.
+    await waitFor(() => expect(callsTo('cron.list')).toBe(3), { timeout: 3000 })
+  })
+
   it('a cron.run.finished event invalidates an open runs drawer', async () => {
     wireRpc()
     renderPage()
@@ -824,14 +834,14 @@ describe('CronPage job health and overlap', () => {
   it('reads the older engine’s consecutive_errors and lastResult when health is absent', async () => {
     wireRpc({
       jobs: [
-        { ...REMINDER_JOB, consecutive_errors: 2, lastResult: 'provider 429' },
+        { ...REMINDER_JOB, consecutive_errors: 3, lastResult: 'provider 429' },
         { ...AGENT_JOB, enabled: true, consecutive_errors: 0, lastResult: null },
       ],
     })
     renderPage()
     const failing = await screen.findByRole('article', { name: /daily standup/i })
     expect(within(failing).getByTestId('cron-degraded')).toHaveTextContent('Degraded')
-    expect(within(failing).getByTestId('cron-health')).toHaveTextContent('2 consecutive failures')
+    expect(within(failing).getByTestId('cron-health')).toHaveTextContent('3 consecutive failures')
     expect(within(failing).getByText('provider 429')).toBeInTheDocument()
     // No streak, but it has run: healthy, and no Degraded badge.
     const fine = screen.getByRole('article', { name: /health check/i })

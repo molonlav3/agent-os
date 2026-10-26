@@ -620,6 +620,9 @@ function DeleteConfirm({
 }
 
 // ── Page ─────────────────────────────────────────────────────────────────────
+/** How long after `cron.run.finished` the run's record (and health) is in place. */
+const RUN_RECORD_SETTLE_MS = 1500
+
 /** The scheduler refused with UNAVAILABLE: it is not running on this gateway. */
 function isSchedulerUnavailable(err: unknown): boolean {
   return err instanceof RpcError && err.code === 'UNAVAILABLE'
@@ -711,12 +714,24 @@ export function CronPage() {
   // cron.js:313-315 — cron.run.finished → invalidate the job list AND any open
   // runs drawer (targeted refetch). Cleaned up on unmount so the listener never
   // leaks (StrictMode-safe: the unsub closure removes exactly this handler).
+  //
+  // The gateway emits the event while it delivers the run's output, just
+  // before it records the result (the failure streak in `health`), so one
+  // more read a moment later picks up the recorded health. A single settle
+  // read per event, not a poll.
   useEffect(() => {
+    const settles = new Set<ReturnType<typeof setTimeout>>()
     const unsub = rpc.on('cron.run.finished', () => {
       void queryClient.invalidateQueries({ queryKey: ['cron'] })
+      const settle = setTimeout(() => {
+        settles.delete(settle)
+        void queryClient.invalidateQueries({ queryKey: ['cron'] })
+      }, RUN_RECORD_SETTLE_MS)
+      settles.add(settle)
     })
     return () => {
       unsub()
+      for (const settle of settles) clearTimeout(settle)
     }
   }, [rpc, queryClient])
 
