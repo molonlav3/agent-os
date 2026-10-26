@@ -26,6 +26,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `gateway.token_short`, each with the command that fixes it.
 - Docs: `docs/remote-access.md` — SSH tunnel, Tailscale Serve, reverse proxy
   with trusted-proxy mode, token rotation, and what never to do.
+- The Python gateway clients (CLI and MCP bridge) reconnect after a dropped
+  socket (1 s backoff doubling to 30 s), renew session subscriptions from the
+  last `stream_seq`, close and reconnect on an event-sequence gap, and stop on
+  a wrong token or a protocol mismatch.
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up
@@ -44,9 +48,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   blocks, and `X-Forwarded-For` is walked right to left skipping trusted hops
   instead of trusting its left-most entry; a forwarded address naming the
   gateway host itself is ignored as spoofed.
-- The web console and the desktop app send a `client` block `{id, version,
-  platform, mode}` and an exact protocol range in `connect`; the challenge
-  carries a timestamp and `hello-ok.auth` echoes its nonce.
+- The web console, the desktop app and the Python clients send a `client`
+  block `{id, version, platform, mode}` and an exact protocol range in
+  `connect`; the challenge carries a timestamp and `hello-ok.auth` echoes its
+  nonce.
 - `agentos gateway stop` and the desktop app send a second SIGTERM (cancel
   the turns still running) before falling back to SIGKILL.
 
