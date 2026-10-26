@@ -1304,10 +1304,33 @@ Bind precedence:
 
 1. `--listen`
 2. `--bind`
-3. `AGENTOS_LISTEN`
-4. `AGENTOS_GATEWAY_HOST`
-5. config host
-6. `127.0.0.1`
+3. `--bind-mode`
+4. `AGENTOS_LISTEN`
+5. `AGENTOS_GATEWAY_HOST`
+6. `[gateway] bind`
+7. config host
+8. `127.0.0.1`
+
+```toml
+[gateway]
+bind = "loopback"          # loopback | lan | tailnet | custom; unset = use `host`
+public_origin = ""         # e.g. "https://agent.example.com" for a public console
+config_reload = true       # apply edits to this file without a restart
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `gateway.bind` | unset | `loopback` = `127.0.0.1`; `lan` = `0.0.0.0` (token auth required); `tailnet` = the `tailscale ip -4` address plus `127.0.0.1`, never a wildcard (startup fails when Tailscale is unavailable); `custom` = the `host` key. Unset keeps `host` in charge. `--listen` / `--bind` count as `custom`. Restart to apply. |
+| `gateway.public_origin` | `""` | The browser origin a public deployment is opened at. Joins the origin allowlist and the `Host` guard. Required before the Control UI starts on a specific public address. Restart to apply. |
+| `gateway.config_reload` | `true` | Watch the config file; see [Editing the file while the gateway runs](#editing-the-file-while-the-gateway-runs). |
+
+Browser access follows one origin policy on every bind (allowlist, then
+private same-origin, then a loopback origin on a local socket); see
+[Gateway → Browser origins](gateway.md#browser-origins).
+`cors.allowed_origins` entries join that allowlist; its old default `["*"]`
+adds nothing, and CORS never answers `*`. Environment overrides:
+`AGENTOS_GATEWAY_GATEWAY__BIND`, `AGENTOS_GATEWAY_GATEWAY__PUBLIC_ORIGIN`,
+`AGENTOS_GATEWAY_GATEWAY__CONFIG_RELOAD`.
 
 ## Gateway Control
 

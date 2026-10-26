@@ -9,6 +9,7 @@ import logging
 import os
 import secrets
 import signal
+import socket
 import tempfile
 import threading
 import time
@@ -1575,6 +1576,20 @@ class GatewayServer:
         log.info("gateway.stopped", reason=reason, forced=self._forced)
 
 
+def bind_listen_socket(host: str, port: int) -> socket.socket:
+    """Bind one TCP listener the way uvicorn does for its own ``host``/``port``."""
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host.strip("[]"), port))
+    except OSError as exc:
+        sock.close()
+        raise ValueError(f"cannot listen on {host}:{port}: {exc}") from exc
+    sock.set_inheritable(True)
+    return sock
+
+
 def emit_skill_filter_banner(skills_cfg: Any) -> None:
     """One-line startup warning when the ONNX embedding backend is
     unreachable but a non-lexical filter strategy is configured.
@@ -2636,8 +2651,12 @@ async def start_gateway_server(
     compaction_hooks: Sequence[Any] | None = None,
     tool_hooks: Sequence[Any] | None = None,
     boot_tracker: Any = None,
+    extra_listen_hosts: Sequence[str] = (),
 ) -> GatewayServer:
     """
+    ``extra_listen_hosts`` are further addresses the same app listens on
+    (``[gateway] bind = "tailnet"`` adds ``127.0.0.1`` beside the tailnet IP).
+
     Boot sequence:
     1. Load/validate config
     2. Ensure auth token exists
@@ -2672,6 +2691,11 @@ async def start_gateway_server(
     # Runs before any side effect (file logging, PID lock, services) so a
     # refused start leaves no partial state.
     enforce_public_bind_auth_guard(config)
+    # A Control UI on a public address needs a declared browser origin, or
+    # every console request would be refused by the origin policy.
+    from agentos.gateway.origin_policy import enforce_public_bind_origin_guard
+
+    enforce_public_bind_origin_guard(config)
 
     _setup_file_logging(config)
     if config.config_path:
@@ -3240,7 +3264,13 @@ async def start_gateway_server(
             # handlers are restored: the process died before close() ran.
             setattr(server, "capture_signals", contextlib.nullcontext)
 
-        task = create_background_task(server.serve())
+        listen_hosts = list(dict.fromkeys([config.host, *extra_listen_hosts]))
+        if len(listen_hosts) > 1:
+            # One app, several listeners: uvicorn serves pre-bound sockets.
+            sockets = [bind_listen_socket(host, config.port) for host in listen_hosts]
+            task = create_background_task(server.serve(sockets=sockets))
+        else:
+            task = create_background_task(server.serve())
         server_handle._task = task
 
         # Warn loudly before the normal started line so operators
@@ -3256,7 +3286,12 @@ async def start_gateway_server(
                     "a trusted reverse proxy or VPN."
                 ),
             )
-        log.info("gateway.started", host=config.host, port=config.port)
+        log.info(
+            "gateway.started",
+            host=config.host,
+            port=config.port,
+            extra_hosts=list(extra_listen_hosts) or None,
+        )
 
     # Start channels (after app is ready to receive webhooks)
     channel_start_error: str | None = None

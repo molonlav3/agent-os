@@ -135,7 +135,12 @@ class AuthConfig(BaseSettings):
 class CorsConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENTOS_CORS_")
 
-    allowed_origins: list[str] = Field(default_factory=lambda: ["*"])
+    # Extra origins CORS reflects, on top of the gateway's origin policy
+    # (``gateway.origin_policy``): an entry is allowlisted like a
+    # ``control_ui.allowed_origins`` one. ``"*"`` -- the old default, still
+    # found in written configs -- adds nothing: a wildcard is never reflected
+    # with credentials.
+    allowed_origins: list[str] = Field(default_factory=list)
     allow_credentials: bool = True
     allowed_methods: list[str] = Field(default_factory=lambda: ["*"])
     allowed_headers: list[str] = Field(default_factory=lambda: ["*"])
@@ -2243,6 +2248,52 @@ class SchedulerConfig(BaseModel):
     startup_agent_delay_seconds: float = Field(default=120.0, ge=0)
 
 
+GatewayBindMode = Literal["loopback", "lan", "tailnet", "custom"]
+GATEWAY_BIND_MODES: tuple[str, ...] = ("loopback", "lan", "tailnet", "custom")
+
+
+class GatewayServeConfig(BaseModel):
+    """Listener posture and config-file watching (``[gateway]``).
+
+    ``bind`` picks the listener: ``loopback`` (127.0.0.1), ``lan`` (every
+    interface, auth required), ``tailnet`` (the Tailscale IPv4 plus
+    127.0.0.1, never a wildcard) or ``custom`` (the top-level ``host``).
+    Unset keeps the pre-existing behaviour: ``host`` decides, and it defaults
+    to loopback. ``--listen``/``--bind`` still win and count as ``custom``.
+
+    ``public_origin`` is the browser origin a public deployment is opened at
+    (``https://agent.example.com``); it joins the origin allowlist.
+    ``config_reload`` watches the active config file and applies edits.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bind: GatewayBindMode | None = None
+    public_origin: str = ""
+    config_reload: bool = True
+
+    @field_validator("public_origin")
+    @classmethod
+    def _validate_public_origin(cls, value: str) -> str:
+        cleaned = value.strip().rstrip("/")
+        if not cleaned:
+            return ""
+        from urllib.parse import urlsplit
+
+        try:
+            parts = urlsplit(cleaned)
+            host = parts.hostname
+            parts.port  # noqa: B018 - raises on a malformed port
+        except ValueError as exc:
+            raise ValueError(f"gateway.public_origin is not a valid origin: {exc}") from exc
+        if parts.scheme not in {"http", "https"} or not host or parts.path or parts.query:
+            raise ValueError(
+                "gateway.public_origin must be a full origin, scheme://host[:port], "
+                "e.g. https://agent.example.com"
+            )
+        return cleaned
+
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -2546,6 +2597,7 @@ class GatewayConfig(BaseSettings):
     gateway_control: GatewayControlConfig = Field(default_factory=GatewayControlConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     trading: TradingConfig = Field(default_factory=TradingConfig)
+    gateway: GatewayServeConfig = Field(default_factory=GatewayServeConfig)
 
     # Component enable flags
     control_ui: ControlUiConfig = Field(default_factory=ControlUiConfig)
@@ -2884,6 +2936,7 @@ class GatewayConfig(BaseSettings):
             # field existed — an empty table would otherwise be rejected by any
             # older AgentOS the operator rolls back to.
             skills.pop("config", None)
+        _drop_default_sections(data, self)
         llm = data.get("llm")
         if isinstance(llm, dict):
             if not llm.get("api_key_env"):
@@ -3145,6 +3198,20 @@ def redact_public_config(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_public_config(item) for item in value]
     return value
+
+
+#: Sections added after configs were already in the field. Persisted only when
+#: they differ from their defaults, so a file this release writes for an
+#: install that never touched them still loads on the release before it.
+_OMIT_WHEN_DEFAULT_SECTIONS: tuple[tuple[str, type[BaseModel]], ...] = (
+    ("gateway", GatewayServeConfig),
+)
+
+
+def _drop_default_sections(data: dict[str, Any], config: GatewayConfig) -> None:
+    for name, model in _OMIT_WHEN_DEFAULT_SECTIONS:
+        if getattr(config, name, None) == model():
+            data.pop(name, None)
 
 
 def _delete_path(obj: dict[str, Any], path: str) -> None:

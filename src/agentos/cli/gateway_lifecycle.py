@@ -121,8 +121,12 @@ class GatewayLifecycleManager:
         health_timeout: float = 60.0,
         shutdown_timeout: float = 10.0,
         poll_interval: float = 0.2,
+        bind_mode: str | None = None,
     ) -> None:
         self.host = host
+        # Forwarded to the spawned ``gateway run`` instead of ``--listen``
+        # when set (``tailnet`` must resolve its own listeners).
+        self.bind_mode = bind_mode if bind_mode and bind_mode != "custom" else None
         self.probe_host = _health_probe_host(host)
         self.port = port
         self.config_path = str(config_path) if config_path else None
@@ -479,8 +483,7 @@ class GatewayLifecycleManager:
             "agentos.cli.main",
             "gateway",
             "run",
-            "--listen",
-            self.host,
+            *(["--bind-mode", self.bind_mode] if self.bind_mode else ["--listen", self.host]),
             "--port",
             str(self.port),
         ]

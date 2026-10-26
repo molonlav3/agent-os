@@ -117,6 +117,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   only the new messages on reconnect (#3696).
 - Gateway: `hello-ok.features.capabilities` also lists `terminal-replay`,
   `approval-events`, `inflight-snapshot` and `idempotency-keys`.
+- Gateway bind modes: `[gateway] bind = "loopback" | "lan" | "tailnet" | "custom"`
+  and `agentos gateway run|start --bind-mode`. `tailnet` listens on the
+  `tailscale ip -4` address and on `127.0.0.1` in one process, and fails to
+  start instead of falling back to `0.0.0.0` when Tailscale is unavailable.
+  `--listen` / `--bind` keep working and count as `custom` (#3692).
+- `[gateway] public_origin` declares the browser origin a public deployment is
+  opened at. The gateway refuses to start the Control UI on a specific public
+  address without it (or `control_ui.allowed_origins`), with the fix in the
+  error (#3692).
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up
@@ -158,6 +167,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Discord and Slack replies are cleaned the same way as the web console (#3696).
 - Gateway: a `chat.history` page stays under 6 MiB; a message over 128 KiB
   comes back as a short placeholder instead of one huge frame (#3696).
+- One browser-origin policy now guards the WebSocket handshake, `/api/*`
+  requests and CORS on every bind, not only on loopback: declared origins, then
+  a private address opened as itself (`http://192.168.1.20:18791` on a LAN
+  bind), then a loopback origin on this machine. A non-loopback bind used to
+  accept every Origin and reflect it through CORS with credentials. CORS never
+  answers `*`; `cors.allowed_origins = ["*"]` (the old default) adds nothing.
+  The gateway's own `http://localhost:<port>` and `http://127.0.0.1:<port>`
+  are always allowed, so a LAN bind never locks out the local browser (#3692).
+- Off loopback the `Host` guard answers to IP addresses, `.local` / `.ts.net`
+  names and the hostnames of declared origins instead of any name; another
+  name gets `400` naming `[gateway] public_origin` (#3692).
 
 ### Fixed
 - Gateway: SIGTERM — what `agentos gateway stop`, the desktop app, launchd

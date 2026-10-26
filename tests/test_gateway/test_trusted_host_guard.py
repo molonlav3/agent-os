@@ -4,9 +4,9 @@ A loopback bind is not a boundary against a browser: a malicious page can
 rebind ``attacker.com`` to ``127.0.0.1`` and reach the local gateway, with
 the attacker's hostname in the ``Host`` header (CVE-2026-53869 class). On a
 loopback bind we therefore pin ``Host`` to a loopback allowlist. On a
-non-loopback bind (which only starts past ``enforce_public_bind_auth_guard``
-with authentication enabled) we do not constrain Host, since the operator
-deliberately serves other names.
+non-loopback bind the gateway also answers to its own addresses (IP literals)
+and private names, and to the hostnames of declared origins -- never to an
+arbitrary name (#3692).
 """
 
 from __future__ import annotations
@@ -47,10 +47,20 @@ class TestResolveTrustedHosts:
         hosts = resolve_trusted_hosts(_config(host="127.0.0.1"))
         assert "*" not in hosts
 
-    def test_non_loopback_bind_does_not_constrain(self) -> None:
-        """Past the startup guard a public bind has authentication."""
-        hosts = resolve_trusted_hosts(_config(host="0.0.0.0", auth_mode="token"))
-        assert hosts == ["*"]
+    def test_non_loopback_bind_no_longer_answers_wildcard(self) -> None:
+        """A public bind used to take any Host (#3692). It now carries the same
+        declared hostnames as a loopback bind; the policy adds IP literals and
+        private names on top."""
+        hosts = resolve_trusted_hosts(
+            _config(host="0.0.0.0", auth_mode="token", ui_origins=["https://ui.example.com"])
+        )
+        assert "*" not in hosts
+        assert hosts == ["ui.example.com"]
+
+    def test_public_origin_hostname_is_trusted(self) -> None:
+        config = _config(host="0.0.0.0", auth_mode="token")
+        config.gateway.public_origin = "https://agent.example.com"
+        assert resolve_trusted_hosts(config) == ["agent.example.com"]
 
     def test_loopback_bind_includes_configured_ui_origin_host(self) -> None:
         hosts = resolve_trusted_hosts(
@@ -74,6 +84,8 @@ class TestLoopbackHostMiddlewareIntegration:
     def _app(self, config: GatewayConfig) -> Starlette:
         from starlette.middleware import Middleware
 
+        from agentos.gateway.origin_policy import build_origin_policy
+
         async def ok(_request: object) -> PlainTextResponse:
             return PlainTextResponse("ok")
 
@@ -83,6 +95,7 @@ class TestLoopbackHostMiddlewareIntegration:
                 Middleware(
                     LoopbackHostMiddleware,
                     allowed_hosts=resolve_trusted_hosts(config),
+                    policy=build_origin_policy(config),
                 )
             ],
         )
@@ -123,10 +136,40 @@ class TestLoopbackHostMiddlewareIntegration:
         resp = client.get("/probe", headers={"host": "attacker.com"})
         assert resp.status_code == 400
 
-    def test_public_bind_allows_any_host(self) -> None:
+    def test_public_bind_rejects_undeclared_hostname(self) -> None:
+        """A rebinding page reaches a LAN bind by a foreign name; refuse it."""
         client = TestClient(self._app(_config(host="0.0.0.0", auth_mode="token")))
         resp = client.get("/probe", headers={"host": "anything.example.com"})
-        assert resp.status_code == 200
+        assert resp.status_code == 400
+        assert "public_origin" in resp.text
+
+    @pytest.mark.parametrize(
+        "host_header",
+        [
+            "192.168.1.5:18791",
+            "203.0.113.7:18791",
+            "[fd00::5]:18791",
+            "mybox.local:18791",
+            "mybox.tail1234.ts.net:18791",
+            "localhost:18791",
+        ],
+    )
+    def test_public_bind_admits_addresses_and_private_names(self, host_header: str) -> None:
+        client = TestClient(self._app(_config(host="0.0.0.0", auth_mode="token")))
+        assert client.get("/probe", headers={"host": host_header}).status_code == 200
+
+    def test_public_bind_admits_declared_hostname(self) -> None:
+        client = TestClient(
+            self._app(
+                _config(host="0.0.0.0", auth_mode="token", ui_origins=["https://ui.example.com"])
+            )
+        )
+        assert client.get("/probe", headers={"host": "ui.example.com"}).status_code == 200
+
+    def test_loopback_bind_still_rejects_private_names(self) -> None:
+        """A ``.local`` name never borrows a loopback gateway's trust."""
+        client = TestClient(self._app(_config(host="127.0.0.1")))
+        assert client.get("/probe", headers={"host": "mybox.local"}).status_code == 400
 
     @pytest.mark.parametrize(
         ("bind", "host_header"),

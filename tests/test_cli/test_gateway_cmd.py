@@ -155,6 +155,28 @@ def test_gateway_run_refuses_wildcard_bind_without_auth(tmp_path, monkeypatch) -
     assert "LAN-open" not in output
 
 
+def test_gateway_run_public_address_without_origin_exits_ex_config(tmp_path, monkeypatch) -> None:
+    """A Control UI on a public address with no declared origin is
+    config-class like a refused public bind: exit 78, and the section the
+    fix names survives console markup (#3692)."""
+    target = tmp_path / "agentos.toml"
+    target.write_text(
+        '[auth]\nmode = "token"\ntoken = "test-token-0123456789abcdef0123456789"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTOS_STATE_DIR", str(tmp_path / "home"))
+    monkeypatch.delenv("AGENTOS_AUTH_MODE", raising=False)
+
+    result = runner.invoke(
+        app, ["gateway", "run", "--config", str(target), "--listen", "203.0.113.5"]
+    )
+
+    assert result.exit_code == 78
+    compact = "".join((result.stdout + (result.stderr or "")).split())
+    assert "Gatewaycouldnotstart" in compact
+    assert "[gateway]public_origin" in compact
+
+
 def test_gateway_run_warns_for_authenticated_non_loopback_bind(tmp_path, monkeypatch) -> None:
     target = tmp_path / "agentos.toml"
     target.write_text(
@@ -839,3 +861,53 @@ def test_stop_falls_back_to_sigkill_when_the_forced_shutdown_hangs(monkeypatch) 
 
     manager._terminate_pid(4242)  # noqa: SLF001
     assert sent == [_signal.SIGTERM, _signal.SIGTERM, _signal.SIGKILL]
+
+
+def test_gateway_run_start_error_keeps_bracketed_config_names(tmp_path, monkeypatch) -> None:
+    """A refusal that names ``[gateway] public_origin`` must print the section,
+    not have it swallowed as console markup (#3692)."""
+    import pytest
+    import typer
+    from rich.console import Console
+
+    custom_config = tmp_path / "custom.toml"
+    custom_config.write_text('host = "127.0.0.1"\n', encoding="utf-8")
+    recorded = Console(record=True, width=200)
+
+    async def refusing_start_gateway_server(**_kwargs):
+        raise ValueError('set [gateway] public_origin = "https://agent.example.com"')
+
+    monkeypatch.setattr(gateway_cmd, "start_gateway_server", refusing_start_gateway_server)
+    monkeypatch.setattr(gateway_cmd, "console", recorded)
+
+    with pytest.raises(typer.Exit):
+        gateway_cmd.run_gateway(
+            port=None, bind=None, listen="", debug=False, config_path=str(custom_config)
+        )
+
+    assert "[gateway] public_origin" in recorded.export_text()
+
+
+def test_gateway_run_reports_an_unavailable_bind_mode(tmp_path, monkeypatch) -> None:
+    import pytest
+    import typer
+    from rich.console import Console
+
+    custom_config = tmp_path / "custom.toml"
+    custom_config.write_text("", encoding="utf-8")
+    recorded = Console(record=True, width=200)
+    monkeypatch.setattr(gateway_cmd, "console", recorded)
+    monkeypatch.setattr("agentos.gateway.bind_modes.shutil.which", lambda _name: None)
+
+    with pytest.raises(typer.Exit) as excinfo:
+        gateway_cmd.run_gateway(
+            port=None,
+            bind=None,
+            listen="",
+            debug=False,
+            config_path=str(custom_config),
+            bind_mode="tailnet",
+        )
+
+    assert excinfo.value.exit_code == 2
+    assert "tailscale" in recorded.export_text()

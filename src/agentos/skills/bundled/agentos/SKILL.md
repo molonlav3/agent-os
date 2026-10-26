@@ -126,7 +126,7 @@ than reading a version out of `uv tool list` or `pip show`.
 
 | Group | Subcommands |
 | --- | --- |
-| `gateway` | `run`, `start`, `status`, `stop`, `restart` (`--port`, `--bind`, `--listen`, `--config`, `--json`, `--debug`; `restart --force` cancels active turns; `status --deep` adds the installed service), `install` (`--port`, `--config`, `--no-start`, `--json`; macOS LaunchAgent / Linux systemd user unit that restarts the gateway; not on Windows), `uninstall` (`--json`). `restart` restarts a gateway it did not start (desktop app, launchd, systemd, terminal) in place over the `gateway.restart` RPC. `run` exits 78 on a config-class failure (bad TOML/config, failed migration, public bind without auth) |
+| `gateway` | `run`, `start`, `status`, `stop`, `restart` (`--port`, `--bind`, `--listen`, `--config`, `--json`, `--debug`; `run`/`start` also `--bind-mode loopback\|lan\|tailnet\|custom`; `restart --force` cancels active turns; `status --deep` adds the installed service), `install` (`--port`, `--config`, `--no-start`, `--json`; macOS LaunchAgent / Linux systemd user unit that restarts the gateway; not on Windows), `uninstall` (`--json`). `restart` restarts a gateway it did not start (desktop app, launchd, systemd, terminal) in place over the `gateway.restart` RPC. `run` exits 78 on a config-class failure (bad TOML/config, failed migration, public bind without auth) |
 | `config` | `get [key]` (empty key = show all), `set <dot.key> <value>` |
 | `env` | `list [--missing] [--category]`, `get <NAME> [--reveal] [-y]`, `set <NAME> --stdin`, `import <NAME>`, `unset <NAME> [-y]` |
 | `providers` | `list`, `status`, `configure <id> [-m MODEL] [-k API_KEY] [--base-url] [--proxy]` |
@@ -241,7 +241,8 @@ Main `agentos.toml` sections (full commented reference:
 | `[permissions]` | `default_mode` = `off` \| `on` \| `bypass` \| `full` (pair with `agentos sandbox …`); `cron_default_mode` = `off` \| `bypass` \| `full` (default `bypass`) |
 | `[scheduler]` | `startup_agent_delay_seconds` (default 120; 0 = none): agent jobs missed while the gateway was down wait this long after boot; reminders and script jobs catch up at once (at most 5, staggered over 10 s). Restart the gateway after changes |
 | `[auth]` | gateway admission: `mode` (`none` on loopback, `token`, or `trusted-proxy` behind an authenticating reverse proxy), `token`, `trusted_proxy` (proxy IPs or CIDR blocks; `X-Forwarded-For` is read only from them, right to left); `[auth.rate_limit]` throttles wrong tokens per client address, whatever its `Origin` (`enabled`, `max_failures` 10, `window_seconds` 60, `lockout_seconds` 300, `exempt_loopback` true — loopback is only slowed down, except browser attempts, which have their own lockable budget): a locked-out client gets HTTP 429 + `Retry-After`, or `UNAUTHORIZED` with `details.code = "AUTH_RATE_LIMITED"` on the WebSocket |
-| `[control_ui]` | `allowed_origins` for reverse-proxy setups; `show_thinking` (default true) streams model reasoning to the WebUI as collapsible blocks — WebUI-only, channels never receive it |
+| `[gateway]` | `bind` (`loopback` \| `lan` = 0.0.0.0, token required \| `tailnet` = `tailscale ip -4` address + 127.0.0.1, never a wildcard \| `custom` = `host`; unset = `host` decides), `public_origin` (the https origin a public console is opened at; required before the Control UI starts on a public address), `config_reload` (default true: edits to the active config file apply live, restart-only keys are reported as pending) |
+| `[control_ui]` | `allowed_origins` for reverse-proxy setups (joins the origin allowlist with `cors.allowed_origins` and `[gateway] public_origin`; every bind refuses other browser origins except a private same-origin address or the gateway's own localhost); `show_thinking` (default true) streams model reasoning to the WebUI as collapsible blocks — WebUI-only, channels never receive it |
 | `[updates]` | `notify` (default true) — the once-per-24h "new release available" notice |
 | `[acp]` | ACP coding harnesses spawned with `sessions_spawn(runtime="acp")`: `allowed_cwds` (default `[]`) lists extra directories a harness may use as `cwd` besides the agent workspace and managed worktrees; the workspace suits read-only work in a read-only `harness_mode`, a harness that writes needs its project listed (`agentos config set acp.allowed_cwds '["~/Code/my-app"]'` replaces the whole list) or `worktree: true`. A finished `oneshot` child still takes `sessions_send` follow-ups (its harness session is resumed); only `acp close` / `subagents kill` end it. Gateway RPC: `acp.sessions` (live harnesses with `activity`, `activity_kind`, `turn_tool_calls`), `acp.status {session_key}` (any ACP session: `idle`, `closed`, `last_turn`, ...), `acp.cancel`, `acp.close` |
 | `[channels]` | messaging channels (`[[channels.channels]]` entries) |
@@ -322,6 +323,8 @@ agentos gateway stop
 
 Default port **18791**, loopback bind. `--listen HOST` overrides
 `--bind` (use `--port PORT` to specify port, e.g. `--listen 0.0.0.0 --port 18791`).
+`--bind-mode lan|tailnet|loopback|custom` (or `[gateway] bind`) picks a listener
+without naming an address; `tailnet` fails rather than fall back to `0.0.0.0`.
 `gateway status` (and `--json`) reports **both**
 the installed CLI version (`cliVersion`) and the running gateway's version
 (`gatewayVersion`); a `versionMismatch` diagnostic means the gateway is running

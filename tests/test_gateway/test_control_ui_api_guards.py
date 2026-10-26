@@ -4,8 +4,7 @@
 and its fingerprinted assets are navigations/subresources, not RPC sinks. The
 JSON routes mounted under that prefix are a different animal: any page the
 operator visits can ``fetch("http://127.0.0.1:18791/control/api/bootstrap")``
-cross-origin and read the response (CORS defaults to ``["*"]``). Those routes
-must stay behind the guard.
+cross-origin and read the response. Those routes must stay behind the guard.
 """
 
 from __future__ import annotations
@@ -85,19 +84,22 @@ def test_root_api_surface_stays_guarded() -> None:
     assert _client().get("/api/config", headers={"origin": _EVIL}).status_code == 403
 
 
-def test_guard_is_a_noop_on_a_public_bind() -> None:
-    """The guard is loopback-only by design, matching the WS handshake guard.
+def test_guard_applies_on_a_public_bind_too() -> None:
+    """A non-loopback bind used to skip the guard (#3692); it no longer does.
 
-    Note that auth does NOT cover the gap for this one route: ``/api/bootstrap``
-    is deliberately carved out of ``AuthMiddleware`` so the console can read it
-    before it holds a token. What makes that tolerable is the payload itself —
-    with ``config_path`` gone it carries nothing an unauthenticated cross-origin
-    reader may not learn. Any field added back to ``_build_bootstrap_context``
-    has to clear that bar.
+    ``/api/bootstrap`` is carved out of ``AuthMiddleware`` so the console can
+    read it before it holds a token, so on a LAN bind the origin policy is the
+    only thing standing between it and a cross-site reader. A page served from
+    the gateway's own private address is same-origin and still passes.
     """
     client = _client(bind_is_loopback=False)
 
-    assert client.get("/control/api/bootstrap", headers={"origin": _EVIL}).status_code == 200
+    assert client.get("/control/api/bootstrap", headers={"origin": _EVIL}).status_code == 403
+    lan = client.get(
+        "/control/api/bootstrap",
+        headers={"origin": "http://192.168.1.20:18791", "host": "192.168.1.20:18791"},
+    )
+    assert lan.status_code == 200
 
 
 class TestAuthExemptionScope:

@@ -20,6 +20,13 @@ from agentos.gateway.access import ConnectionSurface, resolve_client_ip
 from agentos.gateway.auth import AccessContext
 from agentos.gateway.auth_rate_limit import TOKEN_SCOPE, AuthGuard
 from agentos.gateway.config import GatewayConfig
+from agentos.gateway.origin_policy import (
+    OriginPolicy,
+    build_origin_policy,
+    origin_in_allowlist,  # noqa: F401 - re-exported for existing importers
+    origin_key,
+    request_is_forwarded,
+)
 from agentos.gateway.protocol import (
     CAPABILITIES,
     MAX_BUFFERED_BYTES,
@@ -51,44 +58,9 @@ from agentos.session.keys import canonicalize_session_key
 log = structlog.get_logger(__name__)
 
 
-_ORIGIN_DEFAULT_PORTS = {"http": 80, "https": 443}
-
-
-def _origin_key(value: str) -> tuple[str, str, int | None] | None:
-    """Parse an origin string into a comparable ``(scheme, host, port)`` key.
-
-    Browsers send ``Origin`` in canonical form (lowercase host, default port
-    omitted); operators type whatever variant comes to mind. Normalizing both
-    sides — lowercase, brackets/trailing dot stripped, scheme default port
-    applied — makes semantically equal origins compare equal:
-    ``https://agent.example.com:443`` == ``https://agent.example.com`` ==
-    ``https://agent.example.com.``. Returns ``None`` for values that do not
-    parse as ``scheme://host[:port]`` (they can never match anything).
-    """
-    from urllib.parse import urlsplit
-
-    try:
-        parts = urlsplit(value.strip())
-        host = (parts.hostname or "").rstrip(".")  # lowercased, brackets stripped
-        port = parts.port
-    except ValueError:
-        return None
-    scheme = parts.scheme.lower()
-    scheme = {"ws": "http", "wss": "https"}.get(scheme, scheme)
-    if not scheme or not host:
-        return None
-    if port is None:
-        port = _ORIGIN_DEFAULT_PORTS.get(scheme)
-    return (scheme, host, port)
-
-
-def origin_in_allowlist(origin: str, allowed: list[str]) -> bool:
-    """True if ``origin`` matches an ``allowed`` entry, normalized per
-    ``_origin_key`` (unparseable entries or origins never match)."""
-    key = _origin_key(origin)
-    if key is None:
-        return False
-    return any(_origin_key(entry) == key for entry in allowed)
+# Shared with the HTTP origin guard and CORS (``origin_policy``); re-exported
+# under the names older call sites import.
+_origin_key = origin_key
 
 
 def is_allowed_ws_origin(
@@ -96,58 +68,36 @@ def is_allowed_ws_origin(
     config: GatewayConfig,
     *,
     bind_is_loopback: bool | None = None,
+    host_header: str | None = None,
+    peer_ip: str | None = None,
+    forwarded: bool = False,
+    policy: OriginPolicy | None = None,
 ) -> bool:
     """Return True if a WebSocket handshake ``Origin`` may be accepted.
 
     The WS upgrade skips ``AuthMiddleware`` and a loopback peer may use
     no-auth Control admission, so a malicious page in the victim's browser
-    could otherwise open a socket to the local gateway and drive the Control
-    RPC surface (Cross-Site WebSocket Hijacking;
-    the CVE-2026-53869 class). Browsers always send ``Origin`` on WS
-    handshakes and page JS cannot forge it, so it is the correct gate.
+    could otherwise open a socket to the gateway and drive the Control RPC
+    surface (Cross-Site WebSocket Hijacking; the CVE-2026-53869 class).
+    Browsers always send ``Origin`` on WS handshakes and page JS cannot forge
+    it, so it is the correct gate. The decision is ``origin_policy``'s, the
+    same one the HTTP guard and CORS apply, on every bind: a missing Origin
+    (CLI, node peers) passes, then the allowlist, private same-origin, and a
+    loopback origin on a local socket. A malformed Origin fails closed.
 
-    Allow when:
-
-    * No ``Origin`` header — non-browser clients (CLI, node peers) never send
-      one; browsers always do. Rejecting here would break the CLI.
-    * The gateway is on a **non-loopback bind**. It only starts there past
-      ``enforce_public_bind_auth_guard`` (auth on, or explicit opt-in), the
-      socket is authenticated after ``accept()`` via ``connect.challenge`` /
-      ``resolve_auth``. A remote
-      browser's ``Origin`` names whatever host it navigated to (a LAN IP, a
-      DNS name) — never the bind address (``0.0.0.0``/``::``) — so gating
-      here would reject every legitimate browser without adding security.
-    * The origin's host is loopback (``127.0.0.0/8``, ``::1``, ``localhost``)
-      on any port — the same-origin Control UI and local tools.
-    * The origin matches an entry in ``control_ui.allowed_origins`` (opt-in
-      for a reverse-proxied UI on another host), compared normalized —
-      scheme/host case, default ports, trailing dot/slash.
-
-    Anything else — a cross-site page, a rebound hostname — is rejected. A
-    malformed, unparseable ``Origin`` fails closed (rejected).
+    ``bind_is_loopback`` is the posture captured when the app was built:
+    ``config.apply`` mutates ``config.host`` in place without rebinding the
+    live socket, so reading it here would let a runtime host change alter the
+    guard while the process still listens where it did (P2).
     """
     if not origin:
         return True
-
-    from agentos.gateway.access import is_loopback_address, is_loopback_bind
-
-    # Prefer the bind posture captured when the app was built: config.host is
-    # mutated in place by config.apply without rebinding the live socket, so
-    # reading it here would let a runtime host change silently disable the
-    # guard while the process still listens on loopback (P2).
-    on_loopback = (
-        bind_is_loopback if bind_is_loopback is not None else is_loopback_bind(config.host)
+    if policy is None:
+        policy = build_origin_policy(config, bind_is_loopback=bind_is_loopback)
+    decision = policy.evaluate(
+        origin, host_header=host_header, peer_ip=peer_ip, forwarded=forwarded
     )
-    if not on_loopback:
-        return True
-
-    if origin_in_allowlist(origin, config.control_ui.allowed_origins):
-        return True
-
-    key = _origin_key(origin)
-    if key is None:
-        return False
-    return is_loopback_address(key[1])
+    return decision.allowed
 
 
 # ---------------------------------------------------------------------------
@@ -894,25 +844,33 @@ async def handle_ws_connection(
     memory_retrievers: dict[str, Any] | None = None,
     bind_is_loopback: bool | None = None,
     auth_guard: AuthGuard | None = None,
+    origin_policy: OriginPolicy | None = None,
 ) -> None:
     """Main WebSocket connection handler."""
     conn_id = str(uuid.uuid4())
     conn = WsConnection(conn_id=conn_id, ws=ws)
     registry = get_registry()
 
-    # CSWSH / DNS-rebinding guard (loopback binds): reject a browser handshake
-    # whose Origin is neither loopback nor an explicitly allowed UI origin,
-    # before accept(). A cross-site page cannot forge Origin, so this stops it
-    # from opening a socket to the loopback gateway and inheriting Control
-    # admission. Starlette Headers.get is case-insensitive. bind_is_loopback is
-    # the posture captured at app-build time (P2) — see is_allowed_ws_origin.
+    # CSWSH / DNS-rebinding guard (every bind): reject a browser handshake the
+    # origin policy refuses, before accept(). A cross-site page cannot forge
+    # Origin, so this stops it from opening a socket to the gateway and
+    # inheriting Control admission. Starlette Headers.get is case-insensitive.
+    # bind_is_loopback / origin_policy are captured at app-build time (P2).
     origin = ws.headers.get("origin")
-    if not is_allowed_ws_origin(origin, config, bind_is_loopback=bind_is_loopback):
+    peer_ip = ws.client.host if ws.client is not None else None
+    if not is_allowed_ws_origin(
+        origin,
+        config,
+        bind_is_loopback=bind_is_loopback,
+        host_header=ws.headers.get("host"),
+        peer_ip=peer_ip,
+        forwarded=request_is_forwarded(ws.headers),
+        policy=origin_policy,
+    ):
         log.warning("ws.origin_rejected", conn_id=conn_id, origin=origin)
         await ws.close(code=WS_CLOSE_POLICY_VIOLATION)
         return
 
-    peer_ip = ws.client.host if ws.client is not None else None
     client_ip = resolve_client_ip(
         peer_ip, ws.headers.get("x-forwarded-for"), config.auth.trusted_proxy
     )

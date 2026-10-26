@@ -19,6 +19,11 @@ from agentos.gateway.access import is_loopback_address, peer_is_trusted_proxy, r
 from agentos.gateway.auth import token_matches
 from agentos.gateway.auth_rate_limit import TOKEN_SCOPE, AuthGuard, retry_after_seconds
 from agentos.gateway.config import GatewayConfig
+from agentos.gateway.origin_policy import (
+    OriginPolicy,
+    build_origin_policy,
+    request_is_forwarded,
+)
 from agentos.gateway.protocol import ErrorCode, ErrorDetailCode
 
 log = structlog.get_logger(__name__)
@@ -72,28 +77,35 @@ def _safe_ui_exempt_prefix(base_path: str) -> str | None:
 
 
 class LoopbackHostMiddleware(BaseHTTPMiddleware):
-    """Reject requests whose ``Host`` header is neither loopback nor allowlisted.
+    """Reject requests whose ``Host`` header names a host this gateway never declared.
 
     A drop-in replacement for Starlette's ``TrustedHostMiddleware`` that
     parses the ``Host`` header with ``urlsplit`` so **bracketed IPv6** hosts
     (``[::1]:18791``) compare correctly — Starlette's ``split(":")[0]``
     mangles those and would 400 a legitimate IPv6-loopback bind.
 
-    This is the DNS-rebinding guard: when the check is active (loopback
-    binds), any literal loopback ``Host`` — the shared
-    ``access.is_loopback_address`` predicate, i.e. all of ``127.0.0.0/8``,
-    ``::1``, ``localhost``, IPv4-mapped forms; exactly the binds the startup
-    guard blesses — is admitted, plus the extra hostnames in
-    ``allowed_hosts``. A page that rebinds a hostname to ``127.0.0.1`` still
-    carries its foreign hostname in ``Host`` and is rejected. ``["*"]``
-    disables the check (public binds, already auth-gated).
+    This is the DNS-rebinding guard. A page that rebinds a hostname to the
+    gateway's address still carries its foreign hostname in ``Host`` and is
+    rejected. Admitted: every literal loopback ``Host`` (the shared
+    ``access.is_loopback_address`` predicate — all of ``127.0.0.0/8``,
+    ``::1``, ``localhost``, IPv4-mapped forms), the hostnames of the
+    allowlisted origins (``allowed_hosts``), and — off loopback, where the
+    operator chose to be reachable — any IP literal (rebinding needs a name)
+    and private names (``.local``, ``.ts.net``); see
+    ``OriginPolicy.host_allowed``. ``["*"]`` disables the check.
     """
 
-    def __init__(self, app: ASGIApp, allowed_hosts: list[str]) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        allowed_hosts: list[str],
+        policy: OriginPolicy | None = None,
+    ) -> None:
         super().__init__(app)
         self._allow_any = "*" in allowed_hosts
         # Normalize allowlist to bare lowercased hosts (strip scheme/port/brackets).
         self._allowed = {self._normalize(h) for h in allowed_hosts if h != "*"}
+        self._policy = policy
 
     @staticmethod
     def _normalize(host: str) -> str:
@@ -101,6 +113,13 @@ class LoopbackHostMiddleware(BaseHTTPMiddleware):
         # urlsplit needs a scheme-relative authority to parse host:port / [ipv6].
         parsed = urlsplit(f"//{value}") if "//" not in value else urlsplit(value)
         return (parsed.hostname or value.strip("[]")).rstrip(".")
+
+    def _host_allowed(self, host: str) -> bool:
+        if host in self._allowed:
+            return True
+        if self._policy is not None:
+            return self._policy.host_allowed(host)
+        return is_loopback_address(host)
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if self._allow_any:
@@ -110,38 +129,37 @@ class LoopbackHostMiddleware(BaseHTTPMiddleware):
             host = self._normalize(raw_host)
         except ValueError:
             host = ""
-        if host in self._allowed or is_loopback_address(host):
+        if self._host_allowed(host):
             return await call_next(request)  # type: ignore[no-any-return]
-        # A non-loopback Host on a loopback bind is usually DNS rebinding, but
-        # it can also be a legitimate user reaching the gateway via a custom
-        # hostname (e.g. an /etc/hosts alias to 127.0.0.1). Name the config key
-        # that unblocks that case instead of a bare rejection.
+        # A foreign Host is usually DNS rebinding, but it can also be a
+        # legitimate user reaching the gateway via a custom hostname (an
+        # /etc/hosts alias, a LAN DNS name). Name the config keys that unblock
+        # that case instead of a bare rejection.
         return PlainTextResponse(
-            f"Rejected Host header {host!r}: only loopback hosts are accepted on a "
-            "loopback bind (DNS-rebinding guard). If you reach this gateway via a "
-            "custom hostname, add its origin to control_ui.allowed_origins.",
+            f"Rejected Host header {host!r}: this gateway only answers to loopback, its "
+            "own addresses and declared origins (DNS-rebinding guard). If you reach it "
+            "via this hostname, add its origin to control_ui.allowed_origins or set "
+            "[gateway] public_origin.",
             status_code=400,
         )
 
 
 class LoopbackOriginMiddleware(BaseHTTPMiddleware):
-    """Reject cross-site browser requests to the HTTP surface on a loopback bind.
+    """Reject cross-site browser requests to the HTTP surface, on every bind.
 
     The sibling of the WS handshake Origin guard (``is_allowed_ws_origin``),
     covering the same browser threat over plain HTTP: with
-    ``auth.mode="none"`` a loopback peer is admitted to Control and the
-    default CORS posture (``["*"]`` + credentials) reflects any page Origin,
-    so a malicious page in the victim's browser could otherwise ``fetch()``
-    the same Control RPC surface the WS guard protects (``/api/config``,
-    ``/api/sessions``, ``/api/chat``) and read the responses.
+    ``auth.mode="none"`` a loopback peer is admitted to Control, so a
+    malicious page in the victim's browser could otherwise ``fetch()`` the
+    Control RPC surface the WS guard protects (``/api/config``,
+    ``/api/sessions``, ``/api/chat``) and read the responses. Both guards
+    apply one ``OriginPolicy``: the allowlist (``control_ui.allowed_origins``,
+    explicit ``cors.allowed_origins`` entries, ``[gateway] public_origin``,
+    the seeded loopback origins), private same-origin, and a loopback origin
+    on a local socket. Before it, a non-loopback bind skipped this check.
 
     Requests without an ``Origin`` header (CLI, curl, browser navigations)
-    pass through untouched. A browser request carries the page origin, which
-    must be loopback or explicitly allowed — ``control_ui.allowed_origins``
-    or a non-wildcard ``cors.allowed_origins`` entry (deliberate operator
-    intent; the wildcard default is exactly the posture this guard fences).
-    On a non-loopback bind the check is a no-op, matching the WS guard: the
-    gateway only starts there with enforced token authentication.
+    pass through untouched.
 
     Public paths are exempt, mirroring ``AuthMiddleware.PUBLIC_PATHS`` and the
     Control UI prefix: health probes carry no credentials and no Control surface,
@@ -153,22 +171,27 @@ class LoopbackOriginMiddleware(BaseHTTPMiddleware):
     below): the shell and its fingerprinted assets are top-level navigations
     and subresource loads, but the JSON routes mounted under the UI prefix
     (``/control/api/bootstrap``) are fetch-only and therefore exactly the
-    drive-by target this guard exists for — with ``cors.allowed_origins``
-    defaulting to ``["*"]``, any page the operator visits could read the
-    response. Un-exempting the whole ``/api/`` subtree rather than that one
-    path keeps future JSON routes gated by default (#351).
+    drive-by target this guard exists for. Un-exempting the whole ``/api/``
+    subtree rather than that one path keeps future JSON routes gated by
+    default (#351).
     """
 
-    def __init__(self, app: ASGIApp, config: GatewayConfig, bind_is_loopback: bool) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        config: GatewayConfig,
+        bind_is_loopback: bool,
+        policy: OriginPolicy | None = None,
+    ) -> None:
         super().__init__(app)
         self._config = config
-        self._cors_origins = [o for o in config.cors.allowed_origins if o != "*"]
         self._ui_prefix = _safe_ui_exempt_prefix(config.control_ui.base_path)
         # Passed in from create_gateway_app, computed eagerly at build time.
         # Starlette instantiates BaseHTTPMiddleware lazily (first request), so
         # capturing here would read an already-mutated config.host; the caller
         # captures the posture before config.apply can change it (P2).
         self._bind_is_loopback = bind_is_loopback
+        self._policy = policy or build_origin_policy(config, bind_is_loopback=bind_is_loopback)
 
     def _is_ui_path(self, path: str) -> bool:
         if self._ui_prefix is None:
@@ -186,17 +209,14 @@ class LoopbackOriginMiddleware(BaseHTTPMiddleware):
             return await call_next(request)  # type: ignore[no-any-return]
         origin = request.headers.get("origin")
         if origin:
-            # Shared predicate with the WS handshake guard (one threat model,
-            # one allowlist). Local import: websocket.py pulls the RPC stack.
-            from agentos.gateway.websocket import (
-                is_allowed_ws_origin,
-                origin_in_allowlist,
+            decision = self._policy.evaluate(
+                origin,
+                host_header=request.headers.get("host"),
+                peer_ip=request.client.host if request.client else None,
+                forwarded=request_is_forwarded(request.headers),
             )
-
-            if not (
-                is_allowed_ws_origin(origin, self._config, bind_is_loopback=self._bind_is_loopback)
-                or origin_in_allowlist(origin, self._cors_origins)
-            ):
+            if not decision.allowed:
+                log.info("gateway.origin_rejected", origin=origin, path=path)
                 return PlainTextResponse("Origin not allowed", status_code=403)
         return await call_next(request)  # type: ignore[no-any-return]
 

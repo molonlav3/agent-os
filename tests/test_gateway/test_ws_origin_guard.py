@@ -80,38 +80,81 @@ class TestIsAllowedWsOrigin:
         """A browser-sendable but unparseable Origin must fail closed, not crash."""
         assert is_allowed_ws_origin(origin, _config()) is False
 
-    def test_public_bind_allows_own_bind_origin(self) -> None:
-        """A legit remote browser hitting a public+auth deployment is admitted."""
-        cfg = GatewayConfig(
-            host="203.0.113.7",
-            port=18791,
-            control_ui=ControlUiConfig(allowed_origins=[]),
+    def test_public_bind_allows_same_origin_private_address(self) -> None:
+        """A browser on the LAN opens the console at the gateway's own address."""
+        cfg = GatewayConfig(host="0.0.0.0", port=18791, auth=AuthConfig(mode="token"))
+        assert (
+            is_allowed_ws_origin("http://192.168.1.10:18791", cfg, host_header="192.168.1.10:18791")
+            is True
         )
-        assert is_allowed_ws_origin("http://203.0.113.7:18791", cfg) is True
 
-    def test_public_bind_does_not_gate_origin(self) -> None:
-        """On a non-loopback bind Origin gating buys no security: the WS is
-        authenticated after accept() (connect.challenge -> resolve_auth) and
-        loopback implicit admission is unavailable. A remote browser's Origin is
-        whatever host it navigated to — never the bind address — so gating
-        would only reject legitimate browsers."""
-        cfg = GatewayConfig(host="203.0.113.7", port=18791)
-        assert is_allowed_ws_origin("http://evil.com", cfg) is True
+    def test_public_bind_gates_origin(self) -> None:
+        """A non-loopback bind used to accept every Origin (#3692)."""
+        cfg = GatewayConfig(host="203.0.113.7", port=18791, auth=AuthConfig(mode="token"))
+        assert is_allowed_ws_origin("http://evil.com", cfg, host_header="evil.com") is False
+        assert (
+            is_allowed_ws_origin("http://evil.com:18791", cfg, host_header="evil.com:18791")
+            is False
+        )
+
+    def test_public_ip_same_origin_needs_declaring(self) -> None:
+        cfg = GatewayConfig(host="203.0.113.7", port=18791, auth=AuthConfig(mode="token"))
+        origin = "http://203.0.113.7:18791"
+        assert is_allowed_ws_origin(origin, cfg, host_header="203.0.113.7:18791") is False
+        cfg.gateway.public_origin = origin
+        assert is_allowed_ws_origin(origin, cfg, host_header="203.0.113.7:18791") is True
 
     @pytest.mark.parametrize(
-        ("host", "origin"),
+        ("host", "origin", "host_header"),
         [
-            # Wildcard binds: no browser ever carries "0.0.0.0"/"::" in Origin —
-            # the Control UI connects with the Origin the user navigated to.
-            ("0.0.0.0", "http://192.168.1.10:18791"),
-            ("::", "http://[2001:db8::7]:18791"),
-            # Specific public IP reached via a DNS name.
-            ("192.168.1.5", "http://myserver.lan:18791"),
+            ("0.0.0.0", "http://192.168.1.10:18791", "192.168.1.10:18791"),
+            ("::", "http://[fd12::7]:18791", "[fd12::7]:18791"),
+            ("0.0.0.0", "http://mybox.local:18791", "mybox.local:18791"),
+            ("100.101.102.103", "http://mybox.tail1.ts.net:18791", "mybox.tail1.ts.net:18791"),
+            ("100.101.102.103", "http://100.101.102.103:18791", "100.101.102.103:18791"),
         ],
     )
-    def test_non_loopback_bind_admits_remote_browser_origin(self, host: str, origin: str) -> None:
+    def test_non_loopback_bind_admits_private_same_origin(
+        self, host: str, origin: str, host_header: str
+    ) -> None:
         cfg = GatewayConfig(host=host, port=18791, auth=AuthConfig(mode="token"))
-        assert is_allowed_ws_origin(origin, cfg) is True
+        assert is_allowed_ws_origin(origin, cfg, host_header=host_header) is True
+
+    @pytest.mark.parametrize(
+        ("origin", "host_header"),
+        [
+            # A public IPv6 / an undeclared DNS name: not private.
+            ("http://[2001:db8::7]:18791", "[2001:db8::7]:18791"),
+            ("http://myserver.example:18791", "myserver.example:18791"),
+            # Private, but not the Host the request was sent to.
+            ("http://192.168.1.11:18791", "192.168.1.10:18791"),
+        ],
+    )
+    def test_non_loopback_bind_refuses_other_origins(self, origin: str, host_header: str) -> None:
+        cfg = GatewayConfig(host="0.0.0.0", port=18791, auth=AuthConfig(mode="token"))
+        assert is_allowed_ws_origin(origin, cfg, host_header=host_header) is False
+
+    def test_seeded_loopback_origin_admitted_on_a_lan_bind(self) -> None:
+        """A LAN bind never locks out the browser on the gateway's own machine."""
+        cfg = GatewayConfig(host="0.0.0.0", port=18791, auth=AuthConfig(mode="token"))
+        assert (
+            is_allowed_ws_origin(
+                "http://127.0.0.1:18791", cfg, host_header="192.168.1.10:18791", peer_ip="10.0.0.9"
+            )
+            is True
+        )
+
+    def test_other_loopback_port_needs_a_local_peer_off_loopback(self) -> None:
+        cfg = GatewayConfig(host="0.0.0.0", port=18791, auth=AuthConfig(mode="token"))
+        origin = "http://localhost:5173"
+        assert is_allowed_ws_origin(origin, cfg, peer_ip="127.0.0.1") is True
+        assert is_allowed_ws_origin(origin, cfg, peer_ip="192.168.1.30") is False
+        assert is_allowed_ws_origin(origin, cfg, peer_ip="127.0.0.1", forwarded=True) is False
+
+    def test_loopback_bind_does_not_trust_private_names(self) -> None:
+        """mDNS names are spoofable on a LAN; they never borrow loopback trust."""
+        origin = "http://evil.local:18791"
+        assert is_allowed_ws_origin(origin, _config(), host_header="evil.local:18791") is False
 
 
 class TestAllowedOriginNormalization:

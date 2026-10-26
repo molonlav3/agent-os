@@ -290,9 +290,15 @@ def _bind_restart_fingerprint(config: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
     auth = data.get("auth")
+    gateway = data.get("gateway")
+    gateway = gateway if isinstance(gateway, dict) else {}
     return {
         "host": data.get("host"),
         "auth_mode": auth.get("mode") if isinstance(auth, dict) else None,
+        # The listener and the origin policy built from it are captured at
+        # boot, like ``host``.
+        "bind": gateway.get("bind"),
+        "public_origin": gateway.get("public_origin"),
     }
 
 
