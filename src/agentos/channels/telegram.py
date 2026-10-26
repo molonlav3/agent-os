@@ -1008,29 +1008,27 @@ class TelegramChannel:
                 log.warning("telegram.callback_keyerror_answer_failed", error=str(exc))
             return
 
-        session_key = entry.params.get("sessionKey")
-        if isinstance(session_key, str) and session_key:
-            parts = session_key.split(":")
-            if parts and parts[0] == "subagent":
-                parts = parts[1:]
-            if len(parts) >= 5:
-                session_channel = parts[2]
-                session_mode = parts[3]
-                session_peer = parts[4]
-                expected_peer = chat_id if session_mode in ("group", "channel") else sender_id
-                if session_channel != self.config.name or session_peer != expected_peer:
-                    try:
-                        await self._api(
-                            "answerCallbackQuery",
-                            {
-                                "callback_query_id": cb_id,
-                                "text": "Unauthorized: Approval does not belong to this chat.",
-                                "show_alert": True,
-                            },
-                        )
-                    except Exception as exc:
-                        log.warning("telegram.callback_mismatch_answer_failed", error=str(exc))
-                    return
+        # Custody: only the chat this approval's session is delivered to may
+        # answer it (see gateway.approval_custody).
+        from agentos.gateway.approval_custody import channel_custody, log_custody_refusal
+
+        custody = channel_custody(
+            entry, channel_name=self.config.name, sender_id=sender_id, chat_id=chat_id
+        )
+        if not custody.allowed:
+            log_custody_refusal(custody, channel=self.config.name, approval_id=approval_id)
+            try:
+                await self._api(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": cb_id,
+                        "text": "Unauthorized: Approval does not belong to this chat.",
+                        "show_alert": True,
+                    },
+                )
+            except Exception as exc:
+                log.warning("telegram.callback_mismatch_answer_failed", error=str(exc))
+            return
 
         # 3. Resolve Approval Queue
         try:

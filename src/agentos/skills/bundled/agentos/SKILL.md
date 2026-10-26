@@ -245,6 +245,7 @@ Main `agentos.toml` sections (full commented reference:
 | `[control_ui]` | `allowed_origins` for reverse-proxy setups (joins the origin allowlist with `cors.allowed_origins` and `[gateway] public_origin`; every bind refuses other browser origins except a private same-origin address or the gateway's own localhost); `show_thinking` (default true) streams model reasoning to the WebUI as collapsible blocks — WebUI-only, channels never receive it |
 | `[updates]` | `notify` (default true) — the once-per-24h "new release available" notice |
 | `[artifacts]` | `legacy_session_key_urls` (default true): the deprecated `?sessionKey=` artifact/attachment URLs keep working this release; clients mint ticketed URLs with the `artifacts.download` RPC (5-minute, connection-bound `/api/v1/artifacts/download/<conn>/<ticket>`, no auth header) |
+| `[push]` | `web_enabled` (default true) — Web Push for approval prompts (the console's Settings toggle; VAPID keys in `<state_dir>/web_push_vapid.json`), `vapid_subject` |
 | `[acp]` | ACP coding harnesses spawned with `sessions_spawn(runtime="acp")`: `allowed_cwds` (default `[]`) lists extra directories a harness may use as `cwd` besides the agent workspace and managed worktrees; the workspace suits read-only work in a read-only `harness_mode`, a harness that writes needs its project listed (`agentos config set acp.allowed_cwds '["~/Code/my-app"]'` replaces the whole list) or `worktree: true`. A finished `oneshot` child still takes `sessions_send` follow-ups (its harness session is resumed); only `acp close` / `subagents kill` end it. Gateway RPC: `acp.sessions` (live harnesses with `activity`, `activity_kind`, `turn_tool_calls`), `acp.status {session_key}` (any ACP session: `idle`, `closed`, `last_turn`, ...), `acp.cancel`, `acp.close` |
 | `[channels]` | messaging channels (`[[channels.channels]]` entries) |
 | `[auxiliary]` | model for work AgentOS runs itself, not the agent's turn (document analysis, image description): `provider`, `model`, `timeout_seconds`, `[auxiliary.tasks.<task>]`. Empty = reuse `[llm]` |
@@ -745,7 +746,8 @@ payload|error}` for an allowlist of reads and of methods that create, rename or
 send (a `chat.send` there runs a turn exactly as over WS); config writes,
 secrets, env, trading, restarts and deletes answer 403 `FORBIDDEN`),
 and `WS /ws` (primary RPC transport; `projects.*` CRUD lives there alongside
-`sessions.*`; `artifacts.download` mints ticketed file URLs). On loopback binds
+`sessions.*`; `artifacts.download` mints ticketed file URLs, `push.web.*` manages approval
+push subscriptions). On loopback binds
 auth is optional; on public binds the `[auth]` token gates every request
 (or, in `trusted-proxy` mode, only the listed reverse proxy is admitted).
 Full reference: `docs/http-api.md` (https://useagentos.dev/docs/http-api).

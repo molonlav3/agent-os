@@ -20,6 +20,10 @@ from agentos.gateway.channel_dispatch import (
     _send_channel_approval_prompt,
 )
 
+#: The DM session a Telegram approval in these tests belongs to: channel
+#: "telegram" (the default entry name), chat/sender 12345.
+_TELEGRAM_DM_SESSION = "agent:main:telegram:direct:12345"
+
 
 @pytest.fixture(autouse=True)
 def clean_approval_queue():
@@ -31,7 +35,10 @@ def clean_approval_queue():
 @pytest.mark.asyncio
 async def test_telegram_callback_query_parsing_and_resolution() -> None:
     queue = get_approval_queue()
-    approval_id = queue.request("exec", {"argv": ["rm", "-rf"], "action_kind": "exec"})
+    approval_id = queue.request(
+        "exec",
+        {"argv": ["rm", "-rf"], "action_kind": "exec", "sessionKey": _TELEGRAM_DM_SESSION},
+    )
 
     channel = TelegramChannel(TelegramChannelConfig(token="test-token"))
     calls = []
@@ -136,9 +143,48 @@ async def test_telegram_callback_query_session_mismatch() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"argv": ["rm", "-rf"]},
+        {"argv": ["rm", "-rf"], "sessionKey": "agent:main:webchat:default"},
+    ],
+    ids=["no-session", "web-console-session"],
+)
+async def test_telegram_cannot_answer_an_approval_not_delivered_to_it(
+    params: dict[str, Any],
+) -> None:
+    """#3694 custody: a paired sender used to be able to approve any request
+    whose session key did not name a channel -- a console prompt included."""
+    queue = get_approval_queue()
+    approval_id = queue.request("exec", params)
+    channel = TelegramChannel(TelegramChannelConfig(token="test-token"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_api(method: str, payload: dict | None = None) -> Any:
+        calls.append((method, payload or {}))
+        return True
+
+    channel._api = fake_api
+    admission = ChannelAdmission("telegram", "12345", "grant1", 1)
+    with patch.object(channel.pairing_store, "admission", return_value=admission):
+        await channel._handle_telegram_callback(_approval_callback(approval_id, "ok?"))
+
+    assert queue.get(approval_id).resolved is False
+    assert "does not belong to this chat" in calls[0][1]["text"]
+
+
+@pytest.mark.asyncio
 async def test_slack_interactive_payload_handling() -> None:
     queue = get_approval_queue()
-    approval_id = queue.request("exec", {"argv": ["rm", "-rf"], "action_kind": "exec"})
+    approval_id = queue.request(
+        "exec",
+        {
+            "argv": ["rm", "-rf"],
+            "action_kind": "exec",
+            "sessionKey": "agent:main:slack:channel:C12345",
+        },
+    )
 
     channel = SlackChannel(token="xoxb-test", slack_channel_id="C12345")
 
@@ -332,7 +378,14 @@ async def test_slack_url_verification_still_answered_unsigned() -> None:
 @pytest.mark.asyncio
 async def test_discord_component_interaction_handling() -> None:
     queue = get_approval_queue()
-    approval_id = queue.request("exec", {"argv": ["rm", "-rf"], "action_kind": "exec"})
+    approval_id = queue.request(
+        "exec",
+        {
+            "argv": ["rm", "-rf"],
+            "action_kind": "exec",
+            "sessionKey": "agent:main:discord:direct:usr123",
+        },
+    )
 
     channel = DiscordChannel(DiscordChannelConfig(token="test-token"))
 
@@ -553,7 +606,9 @@ async def test_telegram_approval_edit_escapes_the_prompt_text() -> None:
     """#2997: Telegram returns ``text`` as plain text, so a prompt showing a
     shell redirect or a tag came back with raw ``<``/``>``/``&`` and the
     HTML-mode edit was refused, leaving the buttons live."""
-    approval_id = get_approval_queue().request("exec", {"argv": ["sh"], "action_kind": "exec"})
+    approval_id = get_approval_queue().request(
+        "exec", {"argv": ["sh"], "action_kind": "exec", "sessionKey": _TELEGRAM_DM_SESSION}
+    )
     channel = TelegramChannel(TelegramChannelConfig(token="test-token"))
     calls: list[tuple[str, dict]] = []
 
@@ -576,7 +631,9 @@ async def test_telegram_approval_edit_escapes_the_prompt_text() -> None:
 @pytest.mark.asyncio
 async def test_telegram_approval_clears_buttons_when_the_edit_is_refused() -> None:
     """A resolved request must lose its buttons even if the text edit fails."""
-    approval_id = get_approval_queue().request("exec", {"argv": ["sh"], "action_kind": "exec"})
+    approval_id = get_approval_queue().request(
+        "exec", {"argv": ["sh"], "action_kind": "exec", "sessionKey": _TELEGRAM_DM_SESSION}
+    )
     channel = TelegramChannel(TelegramChannelConfig(token="test-token"))
     calls: list[tuple[str, dict]] = []
 

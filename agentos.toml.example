@@ -718,6 +718,11 @@ cron_default_mode = "bypass"            # off | bypass | full
 # ticketed URLs from the artifacts.download RPC.
 # legacy_session_key_urls = true
 
+# [push]
+# Web Push for approval prompts (Settings -> "Push notifications for approvals").
+# web_enabled = true
+# vapid_subject = "https://useagentos.dev"
+
 # [channels]
 # [[channels.channels]]
 # name = "my-slack"

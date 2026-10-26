@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+from agentos.application import approval_delivery
 from agentos.application.approval_events import (
     APPROVAL_REQUESTED,
     APPROVAL_RESOLVED,
@@ -49,6 +50,12 @@ class PendingApproval:
     #: Per-row lifespan end (epoch seconds); ``None`` = ``created_at`` plus
     #: the queue's ``default_timeout``.
     expires_at: float | None = None
+    #: Sessions whose viewers should see this request: the requesting
+    #: session, then its subagent / coding-agent ancestors (nearest first).
+    audience_session_keys: tuple[str, ...] = ()
+    #: How it was resolved once it is: ``approved``, ``denied``, ``expired``
+    #: or ``cancelled``; ``None`` while pending (and on a re-read row).
+    decision: str | None = None
     _event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -181,6 +188,8 @@ class ApprovalQueue:
             self._conn.execute("ALTER TABLE approval_queue ADD COLUMN payload TEXT")
         if "expires_at" not in columns:
             self._conn.execute("ALTER TABLE approval_queue ADD COLUMN expires_at REAL")
+        if "audience" not in columns:
+            self._conn.execute("ALTER TABLE approval_queue ADD COLUMN audience TEXT")
         self._conn.commit()
 
     def _serialize_params(self, params: dict | None) -> str:
@@ -201,6 +210,7 @@ class ApprovalQueue:
         keys = row.keys()
         raw_payload = row["payload"] if "payload" in keys else None
         raw_expires = row["expires_at"] if "expires_at" in keys else None
+        raw_audience = row["audience"] if "audience" in keys else None
         return PendingApproval(
             approval_id=aid,
             namespace=str(row["namespace"]),
@@ -211,14 +221,27 @@ class ApprovalQueue:
             consumed=bool(row["consumed"]),
             payload=self._deserialize_params(raw_payload) if raw_payload is not None else None,
             expires_at=float(raw_expires) if raw_expires is not None else None,
+            audience_session_keys=self._deserialize_audience(raw_audience),
             _event=existing._event if existing is not None else asyncio.Event(),
         )
+
+    @staticmethod
+    def _deserialize_audience(raw: object) -> tuple[str, ...]:
+        if raw is None:
+            return ()
+        try:
+            parsed = json.loads(str(raw))
+        except (TypeError, ValueError):
+            return ()
+        if not isinstance(parsed, list):
+            return ()
+        return tuple(str(item) for item in parsed if isinstance(item, str) and item)
 
     def _load_pending(self) -> None:
         self._pending = {}
         for row in self._conn.execute(
             "SELECT approval_id, namespace, params, created_at, resolved, approved, consumed, "
-            "payload, expires_at "
+            "payload, expires_at, audience "
             "FROM approval_queue WHERE resolved = 0"
         ):
             entry = self._row_to_entry(row)
@@ -229,7 +252,7 @@ class ApprovalQueue:
             sqlite3.Row | None,
             self._conn.execute(
                 "SELECT approval_id, namespace, params, created_at, resolved, approved, consumed, "
-                "payload, expires_at "
+                "payload, expires_at, audience "
                 "FROM approval_queue WHERE approval_id = ?",
                 (approval_id,),
             ).fetchone(),
@@ -296,14 +319,17 @@ class ApprovalQueue:
             raise
         for approval_id in expired:
             entry = self._pending.get(approval_id)
-            namespace = entry.namespace if entry is not None else None
             if entry is not None:
                 entry.resolved = True
                 entry.approved = False
                 # Wake an in-process waiter the same way a resolve would.
                 entry._event.set()
             self._notify_resolved(
-                approval_id, namespace=namespace, decision="expired", resolved_by="timeout"
+                approval_id,
+                namespace=entry.namespace if entry is not None else None,
+                decision="expired",
+                resolved_by="timeout",
+                entry=entry,
             )
         for approval_id in pruned:
             self._pending.pop(approval_id, None)
@@ -329,6 +355,8 @@ class ApprovalQueue:
             )
         self._sweep()
         payload = self._serialize_params(params or {})
+        audience = approval_delivery.audience_for((params or {}).get("sessionKey"))
+        audience_json = json.dumps(list(audience)) if audience else None
         while True:
             approval_id = uuid.uuid4().hex[:12]
             now = time.time()
@@ -338,9 +366,9 @@ class ApprovalQueue:
                 self._conn.execute(
                     "INSERT INTO approval_queue "
                     "(approval_id, namespace, params, created_at, resolved, approved, consumed, "
-                    "expires_at) "
-                    "VALUES (?, ?, ?, ?, 0, 0, 0, ?)",
-                    (approval_id, namespace, payload, now, expires_at),
+                    "expires_at, audience) "
+                    "VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?)",
+                    (approval_id, namespace, payload, now, expires_at, audience_json),
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError:
@@ -354,21 +382,17 @@ class ApprovalQueue:
             params=params or {},
             created_at=now,
             expires_at=expires_at,
+            audience_session_keys=audience,
         )
         self._pending[approval_id] = entry
-        notify_approval_event(
-            APPROVAL_REQUESTED,
-            approval_requested_payload(
-                approval_id=approval_id,
-                namespace=namespace,
-                params=entry.params,
-                created_at=now,
-                # A row without its own lifespan still ends: at the default.
-                expires_at=expires_at if expires_at is not None else now + self._timeout,
-                mode=self._global_settings.mode,
-            ),
-        )
+        self._notify_requested(entry)
         return approval_id
+
+    def lifespan_end(self, entry: PendingApproval) -> float:
+        """Epoch seconds at which ``entry`` stops being answerable."""
+        if entry.expires_at is not None:
+            return entry.expires_at
+        return entry.created_at + self._timeout
 
     def get(self, approval_id: str) -> PendingApproval:
         row = self._get_row(approval_id)
@@ -441,7 +465,11 @@ class ApprovalQueue:
         entry._event.set()
         self._pending[approval_id] = entry
         self._notify_resolved(
-            approval_id, namespace=entry.namespace, decision="expired", resolved_by="timeout"
+            approval_id,
+            namespace=entry.namespace,
+            decision="expired",
+            resolved_by="timeout",
+            entry=entry,
         )
         return entry.approved
 
@@ -523,6 +551,7 @@ class ApprovalQueue:
             namespace=entry.namespace,
             decision=decision or ("approved" if approved else "denied"),
             resolved_by=resolved_by or "operator",
+            entry=entry,
         )
 
         if approved and elevated_mode in VALID_ELEVATED_MODES:
@@ -533,6 +562,24 @@ class ApprovalQueue:
         if approved and entry.namespace == "exec" and (allow_always or remember_intent):
             self._persist_command_intent(entry.params, allow_always=allow_always)
 
+    def _notify_requested(self, entry: PendingApproval) -> None:
+        """The one place a new row is announced: the ``approval.requested``
+        event for consoles, then delivery (Web Push, the parent's channel)."""
+        notify_approval_event(
+            APPROVAL_REQUESTED,
+            approval_requested_payload(
+                approval_id=entry.approval_id,
+                namespace=entry.namespace,
+                params=entry.params,
+                created_at=entry.created_at,
+                # A row without its own lifespan still ends: at the default.
+                expires_at=self.lifespan_end(entry),
+                mode=self._global_settings.mode,
+                audience_session_keys=entry.audience_session_keys,
+            ),
+        )
+        approval_delivery.on_requested(entry)
+
     def _notify_resolved(
         self,
         approval_id: str,
@@ -540,10 +587,17 @@ class ApprovalQueue:
         namespace: str | None,
         decision: str,
         resolved_by: str,
+        entry: PendingApproval | None = None,
     ) -> None:
-        if namespace is None:
+        """The one place a resolution is announced, whatever decided it: the
+        ``approval.resolved`` event, then delivery, which replaces a pushed
+        prompt (also when it ``expired`` or was ``cancelled``)."""
+        if entry is None or namespace is None:
             row = self._get_row(approval_id)
-            namespace = str(row["namespace"]) if row is not None else "exec"
+            if entry is None and row is not None:
+                entry = self._row_to_entry(row)
+            if namespace is None:
+                namespace = str(row["namespace"]) if row is not None else "exec"
         notify_approval_event(
             APPROVAL_RESOLVED,
             approval_resolved_payload(
@@ -554,6 +608,9 @@ class ApprovalQueue:
                 resolved_at=time.time(),
             ),
         )
+        if entry is not None:
+            entry.decision = decision
+            approval_delivery.on_resolved(entry)
 
     def take_payload(self, approval_id: str) -> dict | None:
         """Return the resolver payload once and clear it from the row.
@@ -645,20 +702,21 @@ class ApprovalQueue:
             "consumed": entry.consumed,
             "expires_at": entry.expires_at,
             "has_payload": entry.payload is not None,
+            "audience_session_keys": list(entry.audience_session_keys),
         }
 
     def list_pending(self, namespace: str | None = None) -> list[dict]:
         self._sweep()
         if namespace:
             rows = self._conn.execute(
-                "SELECT approval_id, namespace, params, created_at, expires_at "
+                "SELECT approval_id, namespace, params, created_at, expires_at, audience "
                 "FROM approval_queue "
                 "WHERE resolved = 0 AND namespace = ?",
                 (namespace,),
             )
         else:
             rows = self._conn.execute(
-                "SELECT approval_id, namespace, params, created_at, expires_at "
+                "SELECT approval_id, namespace, params, created_at, expires_at, audience "
                 "FROM approval_queue "
                 "WHERE resolved = 0",
             )
@@ -669,6 +727,7 @@ class ApprovalQueue:
                 "params": self._deserialize_params(row["params"]),
                 "created_at": float(row["created_at"]),
                 "expires_at": (float(row["expires_at"]) if row["expires_at"] is not None else None),
+                "audience_session_keys": list(self._deserialize_audience(row["audience"])),
             }
             for row in rows
         ]
@@ -705,7 +764,7 @@ class ApprovalQueue:
         cancelled: list[str] = []
         for row in self._conn.execute(
             "SELECT approval_id, namespace, params, created_at, resolved, approved, consumed, "
-            "payload, expires_at "
+            "payload, expires_at, audience "
             "FROM approval_queue WHERE resolved = 0",
         ).fetchall():
             entry = self._row_to_entry(row)
@@ -744,7 +803,7 @@ class ApprovalQueue:
         count = 0
         for row in self._conn.execute(
             "SELECT approval_id, namespace, params, created_at, resolved, approved, consumed, "
-            "payload, expires_at "
+            "payload, expires_at, audience "
             "FROM approval_queue "
             "WHERE resolved = 0 AND namespace = 'exec'",
         ).fetchall():

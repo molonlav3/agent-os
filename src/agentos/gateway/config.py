@@ -2309,6 +2309,24 @@ class ArtifactsConfig(BaseModel):
     legacy_session_key_urls: bool = True
 
 
+class PushConfig(BaseModel):
+    """Web Push for approval prompts (``[push]``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    web_enabled: bool = True
+    # The VAPID ``sub`` claim push services may use to reach the sender.
+    vapid_subject: str = "https://useagentos.dev"
+
+    @field_validator("vapid_subject")
+    @classmethod
+    def _validate_vapid_subject(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned.startswith(("mailto:", "https://")):
+            raise ValueError("push.vapid_subject must be a mailto: or https:// URL")
+        return cleaned
+
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -2614,6 +2632,7 @@ class GatewayConfig(BaseSettings):
     trading: TradingConfig = Field(default_factory=TradingConfig)
     gateway: GatewayServeConfig = Field(default_factory=GatewayServeConfig)
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
+    push: PushConfig = Field(default_factory=PushConfig)
 
     # Component enable flags
     control_ui: ControlUiConfig = Field(default_factory=ControlUiConfig)
@@ -3222,6 +3241,7 @@ def redact_public_config(value: Any) -> Any:
 _OMIT_WHEN_DEFAULT_SECTIONS: tuple[tuple[str, type[BaseModel]], ...] = (
     ("gateway", GatewayServeConfig),
     ("artifacts", ArtifactsConfig),
+    ("push", PushConfig),
 )
 
 

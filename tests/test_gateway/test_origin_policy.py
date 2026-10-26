@@ -436,7 +436,7 @@ def test_lifecycle_manager_forwards_bind_mode_to_the_spawned_gateway() -> None:
 def test_new_default_sections_are_not_persisted() -> None:
     """An install that never sets them writes a file older releases still load."""
     data = GatewayConfig().to_toml_dict()
-    for section in ("gateway", "artifacts"):
+    for section in ("gateway", "artifacts", "push"):
         assert section not in data
     changed = GatewayConfig(gateway=GatewayServeConfig(bind="lan")).to_toml_dict()
     assert changed["gateway"]["bind"] == "lan"

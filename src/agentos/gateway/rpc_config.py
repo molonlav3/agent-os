@@ -441,6 +441,7 @@ def _has_unproven_live_change(changed_paths: set[str]) -> bool:
         "image_generation",
         "audio",
         "trading",
+        "push",
         "artifacts",
     )
     search_paths = {

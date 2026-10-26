@@ -1059,24 +1059,29 @@ class SlackChannel:
                     log.warning("slack.interactive_keyerror_post_failed", error=str(exc))
             return
 
-        session_key = entry.params.get("sessionKey")
-        if isinstance(session_key, str) and session_key:
-            parts = session_key.split(":")
-            if parts and parts[0] == "subagent":
-                parts = parts[1:]
-            if len(parts) >= 5:
-                session_channel = parts[2]
-                session_mode = parts[3]
-                session_peer = parts[4]
-                expected_peer = channel_id if session_mode in ("group", "channel") else user_id
-                if session_channel != self.name or session_peer != expected_peer:
-                    log.warning(
-                        "slack.interactive_mismatch",
-                        session_key=session_key,
-                        expected_peer=expected_peer,
-                        session_peer=session_peer,
-                    )
-                    return
+        # Custody: only the chat this approval's session is delivered to may
+        # answer it (see gateway.approval_custody).
+        from agentos.gateway.approval_custody import channel_custody, log_custody_refusal
+
+        custody = channel_custody(
+            entry, channel_name=self.name, sender_id=user_id, chat_id=channel_id
+        )
+        if not custody.allowed:
+            log_custody_refusal(custody, channel=self.name, approval_id=approval_id)
+            response_url = payload.get("response_url")
+            if response_url:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        await client.post(
+                            response_url,
+                            json={
+                                "text": "Unauthorized: Approval does not belong to this chat.",
+                                "response_type": "ephemeral",
+                            },
+                        )
+                except Exception as exc:
+                    log.warning("slack.interactive_mismatch_post_failed", error=str(exc))
+            return
 
         # 3. Resolve Approval Queue
         try:

@@ -1415,18 +1415,24 @@ log_retention_sweep_interval_s = 3600.0
 - **OTLP Trace Export**: `otlp_enabled` (default `false`) sends trace events as OTLP spans over HTTP to `otlp_endpoint` (e.g. OpenTelemetry Collector).
 - **Log Retention**: `log_retention_days` (TTL) and `log_retention_max_total_mb` (total size cap) bound disk growth in `~/.agentos/logs`. Background sweeps run every `log_retention_sweep_interval_s`.
 
-## Downloads
+## Downloads and Web Push
 
 ```toml
 [artifacts]
 legacy_session_key_urls = true    # keep the deprecated ?sessionKey= download URLs this release
+
+[push]
+web_enabled = true                # browsers may subscribe to approval notifications
+vapid_subject = "https://useagentos.dev"   # VAPID `sub`: a mailto: or https: contact
 ```
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `artifacts.legacy_session_key_urls` | `true` | `false` makes `/api/v1/artifacts/{id}?sessionKey=` and `/api/v1/attachments/{sha256}?sessionKey=` answer `404`. Clients use ticketed URLs from `artifacts.download`; see [HTTP API](http-api.md#ticketed-downloads). |
+| `push.web_enabled` | `true` | Web Push for approvals. The VAPID key pair is generated once into `<state_dir>/web_push_vapid.json` (0600); subscriptions live in `<state_dir>/web_push.sqlite`. |
+| `push.vapid_subject` | `https://useagentos.dev` | Contact push services may use to reach the sender. |
 
-Read per request: no restart.
+Both are read per request: no restart.
 
 ## Raw Config Editing
 

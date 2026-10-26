@@ -137,7 +137,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `X-Content-Type-Options: nosniff`. The web console and the desktop app load
   previews, audio, cards and downloads through it, so no token appears in a
   page URL any more and image previews work on token-auth gateways (#3693).
-- `hello-ok.features.capabilities` advertises `artifact-tickets`.
+- Web Push for approvals: Settings → *Push notifications for approvals* in the
+  web console subscribes the browser (RPCs `push.web.vapid_public_key`,
+  `push.web.subscribe`, `push.web.unsubscribe`). Each approval is pushed with a
+  deep link and a TTL equal to its remaining lifetime, and replaced by a "no
+  longer pending" notice when it is resolved. RFC 8291/8292 with a VAPID key
+  generated once into the state directory; `[push] web_enabled = false` turns
+  it off (#3694).
+- An approval raised by a subagent or coding-harness child now names its
+  parent sessions as well (`audience_session_keys` in the queue, the
+  `/api/approvals` listing and `approval.list`), so the parent's viewers can be
+  told about the child's prompt (#3694).
+- `hello-ok.features.capabilities` advertises `artifact-tickets` and `web-push`.
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up
@@ -190,6 +201,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Off loopback the `Host` guard answers to IP addresses, `.local` / `.ts.net`
   names and the hostnames of declared origins instead of any name; another
   name gets `400` naming `[gateway] public_origin` (#3692).
+- Approval buttons on Telegram, Discord and Slack resolve a request only in the
+  chat its session is delivered to (a child session's parent chat, the main DM
+  session's last chat). A paired sender could previously approve any request
+  whose session key named no channel, a web console or desktop prompt
+  included (#3694).
+
 ### Deprecated
 - `GET /api/v1/artifacts/{id}?sessionKey=` and
   `GET /api/v1/attachments/{sha256}?sessionKey=`: they keep working for this

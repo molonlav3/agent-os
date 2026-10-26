@@ -63,6 +63,7 @@ CAPABILITIES: frozenset[str] = frozenset(
         "supervisor-contract",
         "terminal-replay",
         "typed-errors",
+        "web-push",
     }
 )
 

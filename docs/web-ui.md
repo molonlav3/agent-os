@@ -300,6 +300,11 @@ Use the approvals area when:
 - a channel or external action needs human confirmation;
 - unattended automation should pause before a risky operation.
 
+Settings → *Push notifications for approvals* sends a notification to this
+browser for every new approval, even with the console closed (HTTPS or
+`localhost` only); see
+[Approvals and Permissions](approvals-and-permissions.md#where-a-prompt-reaches-you).
+
 ## MCP Servers
 
 Open **Settings > MCP Servers** to add and manage external MCP connections. The

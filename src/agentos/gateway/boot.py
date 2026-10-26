@@ -1298,6 +1298,8 @@ class GatewayServer:
     # ``gateway.restart.GatewayRestarter`` once wired; ``run_gateway`` awaits
     # its task after the server task ends so the exec happens outside the loop.
     _restarter: Any = field(default=None, repr=False)
+    # Approval delivery wired at boot (Web Push listener); undone on close.
+    _web_push: Any = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
     # Signal-driven shutdown (``install_signal_handlers``): the first SIGTERM
     # / SIGINT starts ``close()`` in ``_shutdown_task``; a second sets
@@ -1560,6 +1562,8 @@ class GatewayServer:
         if self._services is not None:
             await self._services.close()
 
+        _unwire_approval_delivery(self._web_push)
+        self._web_push = None
         if self._boot_tracker is not None:
             self._boot_tracker.mark_clean(reason)
             from agentos.gateway.boot_lifecycle import get_boot_tracker, set_boot_tracker
@@ -1574,6 +1578,49 @@ class GatewayServer:
 
         self.remove_signal_handlers()
         log.info("gateway.stopped", reason=reason, forced=self._forced)
+
+
+def wire_approval_delivery(config: GatewayConfig) -> Any:
+    """Point the approval queue at session lineage and Web Push; return the push service.
+
+    The queue asks for a request's audience (its session plus subagent /
+    coding-agent ancestors) through a read-only view of ``sessions.db``; the
+    channel custody check reads delivery routes from the same view.
+    """
+    from agentos.application import approval_delivery
+    from agentos.gateway.approval_queue import get_approval_queue
+    from agentos.gateway.session_index import SessionIndex, set_session_index
+    from agentos.gateway.web_push import get_web_push_service
+
+    index = SessionIndex(_state_path(config, "sessions.db"))
+    set_session_index(index)
+    approval_delivery.set_lineage_resolver(index.parents)
+    try:
+        service = get_web_push_service(config)
+    except Exception:  # noqa: BLE001 - push is best-effort, never a boot blocker
+        log.warning("gateway.web_push_unavailable", exc_info=True)
+        service = None
+    if service is not None:
+        service._loop = asyncio.get_running_loop()
+        service._lifespan_end = lambda entry: get_approval_queue().lifespan_end(entry)
+        approval_delivery.register_listener(service)
+    return service
+
+
+def _unwire_approval_delivery(service: Any) -> None:
+    from agentos.application import approval_delivery
+    from agentos.gateway.session_index import set_session_index
+    from agentos.gateway.web_push import set_web_push_service
+
+    if service is not None:
+        approval_delivery.unregister_listener(service)
+        try:
+            service.close()
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            pass
+        set_web_push_service(None)
+    approval_delivery.set_lineage_resolver(None)
+    set_session_index(None)
 
 
 def bind_listen_socket(host: str, port: int) -> socket.socket:
@@ -3339,6 +3386,7 @@ async def start_gateway_server(
     boot_tracker.set_resume_hook(_resume_after_safe_mode)
 
     if run:
+        server_handle._web_push = wire_approval_delivery(config)
         readiness.begin_sidecar(SIDECAR_ROUTER)
         create_background_task(_router_preload_sidecar(config, readiness, SIDECAR_ROUTER))
         # If the previous image restarted in place on request, tell the chat
