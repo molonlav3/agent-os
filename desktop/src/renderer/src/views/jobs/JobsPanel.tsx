@@ -35,6 +35,9 @@ interface RunResult {
 /** Gateway events after which the list or a run history is stale. */
 const CRON_EVENTS = ['cron.run.start', 'cron.run.finished']
 
+/** How long after `cron.run.finished` the run's record (and health) is in place. */
+const RUN_RECORD_SETTLE_MS = 1500
+
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
@@ -156,10 +159,28 @@ function ConnectedJobs({ titleId, onClose }: { titleId: string; onClose: () => v
   // subscribed to the cron topic for the app's lifetime (job notifications,
   // lib/use-notifications), so this panel only listens; the poll above is
   // the backstop.
+  //
+  // `cron.run.finished` goes out while the gateway delivers a run's output,
+  // just before it records the result (the failure streak in `health`), so
+  // one more read a moment later picks the recorded health up: a single
+  // settle read per finished run, not a poll.
   useEffect(() => {
     const invalidate = () => void queryClient.invalidateQueries({ queryKey: ['cron'] })
+    const settles = new Set<ReturnType<typeof setTimeout>>()
     const offs = CRON_EVENTS.map((event) => rpc.on(event, invalidate))
-    return () => offs.forEach((off) => off())
+    offs.push(
+      rpc.on('cron.run.finished', () => {
+        const settle = setTimeout(() => {
+          settles.delete(settle)
+          invalidate()
+        }, RUN_RECORD_SETTLE_MS)
+        settles.add(settle)
+      }),
+    )
+    return () => {
+      offs.forEach((off) => off())
+      for (const settle of settles) clearTimeout(settle)
+    }
   }, [rpc, queryClient])
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['cron'] })
