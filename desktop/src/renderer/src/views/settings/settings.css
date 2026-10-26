@@ -1585,3 +1585,13 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Engine update preflight (About › Engine): what the restart interrupts. */
+.stg-preflight {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.stg-preflight__reason {
+  color: var(--danger);
+}

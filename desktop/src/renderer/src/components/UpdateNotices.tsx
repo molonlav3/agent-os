@@ -110,8 +110,9 @@ function sameStep(a: ReleaseUpdate, b: ReleaseUpdate): boolean {
 
 /**
  * Mounted once in the shell. Watches both updaters and fires the notices;
- * an "Update" or "Restart gateway" that would cut a live session opens
- * Settings › About instead, where the warning and "Update anyway" live.
+ * an "Update" that touches the engine, or a "Restart gateway" that would cut
+ * a live session, opens Settings › About instead, where the preflight and
+ * "Update anyway" live.
  */
 export function UpdateNotices() {
   const engine = useUpdates((s) => s.engine)
@@ -134,8 +135,11 @@ export function UpdateNotices() {
     if (!loaded) return
     const act: NoticeActions = {
       update: () => {
+        // An engine update restarts the gateway: it goes through the
+        // preflight in Settings › About (running sessions, jobs due soon,
+        // pending approvals) and is applied only once confirmed there.
         const needsGateway = useUpdates.getState().engine.availability === 'outdated'
-        if (needsGateway && liveRef.current) openSettings('about')
+        if (needsGateway) openSettings('about')
         else void useUpdates.getState().updateAll()
       },
       restart: () => void useUpdates.getState().installApp(),

@@ -6,6 +6,8 @@ export const approvals = defineNamespace('approvals', {
   title: 'Approvals',
   subtitle: 'Tool execution gate — keep risky actions paused until you say go.',
   refreshTitle: 'Refresh approvals',
+  inboxLink: 'Attention inbox',
+  inboxLinkTitle: 'Approvals, agent questions and runtime issues in one list',
   refresh: 'Refresh',
   refreshing: 'Refreshing…',
 

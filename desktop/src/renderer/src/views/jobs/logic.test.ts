@@ -39,6 +39,13 @@ describe('jobHealth', () => {
     expect(jobHealth(job({ lastResult: 'boom', last_run: '2026-09-10T00:00:00Z' }))).toBe('failing')
     expect(jobHealth(job())).toBe('active')
   })
+
+  it('takes the gateway reported health (cron.list `health`) when it is sent', () => {
+    expect(jobHealth(job({ health: { degraded: true, consecutive_failures: 0 } }))).toBe('failing')
+    expect(jobHealth(job({ health: { consecutive_failures: 2 } }))).toBe('failing')
+    expect(jobHealth(job({ health: { consecutive_failures: 0, degraded: false } }))).toBe('active')
+    expect(jobHealth(job({ enabled: false, health: { degraded: true } }))).toBe('paused')
+  })
 })
 
 describe('filters', () => {

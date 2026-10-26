@@ -56,6 +56,9 @@ const loadLogs: LazyRoute = async () => ({
 const loadMemory: LazyRoute = async () => ({
   Component: (await import('@/views/memory/MemoryPage')).MemoryPage,
 })
+const loadInbox: LazyRoute = async () => ({
+  Component: (await import('@/views/inbox/InboxPage')).InboxPage,
+})
 const loadEnv: LazyRoute = async () => ({
   Component: (await import('@/views/env/EnvPage')).EnvPage,
 })
@@ -64,6 +67,7 @@ const loadEnv: LazyRoute = async () => ({
 // module constant, so a title resolved here would freeze at module-evaluation
 // time and survive a later locale change (#258).
 const VIEW_ROUTES: ReadonlyArray<ViewRoute> = [
+  { path: 'inbox', titleKey: 'shell.viewInbox', lazy: loadInbox },
   { path: 'overview', titleKey: 'shell.viewOverview', lazy: loadOverview },
   { path: 'health', titleKey: 'shell.viewHealth', lazy: loadHealth },
   { path: 'chat', titleKey: 'shell.viewChat', lazy: loadChat },

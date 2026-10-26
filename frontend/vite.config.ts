@@ -31,6 +31,8 @@ export default defineConfig(({ command }) => ({
       // and POSTs /api/approvals/resolve. Without this the dev server 404s them
       // and the approvals view / global prompt appear broken.
       '/api': { target: gateway, changeOrigin: true },
+      // The truth badge reads the gateway's readiness probe (root-absolute too).
+      '/ready': { target: gateway, changeOrigin: true },
     },
   },
   test: {

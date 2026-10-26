@@ -18,6 +18,7 @@ import { copyWithFallback } from '@/lib/clipboard'
 import {
   jobCreatedFrom,
   jobElevated,
+  jobRuntimeHealth,
   jobSessionKey,
   type RawJob,
   type RawRun,
@@ -46,6 +47,13 @@ type PayloadKind = 'reminder' | 'agent_turn' | 'system_event' | 'script'
 function payloadKind(job: RawJob): PayloadKind {
   const kind = String(job.payloadKind || job.payload_kind || 'agent_turn')
   return kind === 'reminder' || kind === 'system_event' || kind === 'script' ? kind : 'agent_turn'
+}
+
+/** "1 failure in a row", "3 failures in a row". */
+function failuresInARow(count: number): string {
+  return count === 1
+    ? t('jobs.health.failures.one')
+    : t('jobs.health.failures.many').replace('{count}', String(count))
 }
 
 const HEALTH_TONE: Record<JobHealth, 'ok' | 'warn' | 'danger' | 'dim'> = {
@@ -111,7 +119,11 @@ export function JobDetail({
   const script = String(job.script || '').trim()
   const createdFrom = jobCreatedFrom(job)
   const sessionKey = jobSessionKey(job)
-  const lastError = typeof job.lastResult === 'string' ? job.lastResult.trim() : ''
+  // The gateway's run health (cron.list `health`), when it reports one: the
+  // degraded flag, the failure streak and the last error. Absent, nothing new.
+  const reported = jobRuntimeHealth(job)
+  const lastError =
+    reported?.lastError || (typeof job.lastResult === 'string' ? job.lastResult.trim() : '')
 
   async function copyId() {
     try {
@@ -154,6 +166,14 @@ export function JobDetail({
             <span className="mac-chip" data-tone={HEALTH_TONE[health]}>
               {t(`jobs.health.${health}`)}
             </span>
+            {reported?.degraded ? (
+              <span className="mac-chip" data-tone="danger" data-testid="job-degraded">
+                {t('jobs.health.degraded')}
+                {reported.consecutiveFailures
+                  ? ` · ${failuresInARow(reported.consecutiveFailures)}`
+                  : ''}
+              </span>
+            ) : null}
             <span className="mac-chip">{t(`jobs.kind.${kind}`)}</span>
             {elevated ? (
               <span className="mac-chip" data-tone="danger" title={t('jobs.detail.elevatedHint')}>

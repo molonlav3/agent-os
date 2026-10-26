@@ -13,6 +13,7 @@ import {
   jobElevated,
   jobKindClass,
   jobKindLabel,
+  jobRuntimeHealth,
   jobSchedule,
   shortCronId,
   jobTarget,
@@ -994,5 +995,42 @@ describe('jobElevated', () => {
   })
   it('ignores a null wire field rather than reporting it as a mode', () => {
     expect(jobElevated({ id: 'x', elevated: null })).toBe('')
+  })
+})
+
+describe('jobRuntimeHealth', () => {
+  it('prefers the health block when the gateway sends one', () => {
+    expect(
+      jobRuntimeHealth({
+        health: { consecutive_failures: 3, last_error: ' boom ', degraded: true },
+        consecutive_errors: 0,
+      }),
+    ).toEqual({ consecutiveFailures: 3, lastError: 'boom', degraded: true, source: 'health' })
+    expect(jobRuntimeHealth({ health: { consecutiveFailures: 1, lastError: 'x' } })).toMatchObject({
+      consecutiveFailures: 1,
+      degraded: false,
+    })
+  })
+
+  it('falls back to consecutive_errors and lastResult on older engines', () => {
+    expect(jobRuntimeHealth({ consecutive_errors: 3, lastResult: 'provider 429' })).toEqual({
+      consecutiveFailures: 3,
+      lastError: 'provider 429',
+      degraded: true,
+      source: 'legacy',
+    })
+    // The engine's threshold: two failures are a streak, not yet degraded.
+    expect(jobRuntimeHealth({ consecutive_errors: 2 })).toMatchObject({
+      consecutiveFailures: 2,
+      degraded: false,
+    })
+    expect(jobRuntimeHealth({ consecutive_errors: 0 })).toMatchObject({ degraded: false })
+    expect(jobRuntimeHealth({ consecutive_errors: 0, status: 'failed' })).toMatchObject({
+      degraded: true,
+    })
+  })
+
+  it('says nothing when the job carries neither', () => {
+    expect(jobRuntimeHealth({ id: 'j', enabled: true })).toBeNull()
   })
 })

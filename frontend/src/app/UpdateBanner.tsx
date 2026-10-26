@@ -1,8 +1,15 @@
 import { LoaderCircle, X } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { t } from '@/i18n'
+import { useRuntimeSignals } from '@/lib/runtime-signals'
 import { useRpc } from './providers'
+
+// The preflight dialog (and the modal/motion code under it) loads only when
+// the operator asks to update, never in the entry bundle.
+const UpdatePreflightDialog = lazy(async () => ({
+  default: (await import('./UpdatePreflightDialog')).UpdatePreflightDialog,
+}))
 
 export interface UpdateCheck {
   current: string
@@ -26,13 +33,19 @@ const POLL_MS = 2000
  * detached job, the gateway restarts under us, and `updates.status` keeps
  * answering from whichever gateway process is up — so polling simply rides
  * through the reconnect.
+ *
+ * "Update now" never applies directly: it opens the preflight
+ * (UpdatePreflightDialog), which lists what the restart would interrupt and
+ * blocks while an approval is pending. Only its confirm calls `updates.apply`.
  */
 export function UpdateBanner({ check, onDismiss }: { check: UpdateCheck; onDismiss: () => void }) {
   const rpc = useRpc()
   const [job, setJob] = useState<UpdateJob | null>(null)
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [confirming, setConfirming] = useState(false)
   const timer = useRef<number | null>(null)
+  const noteUpdateFailure = useRuntimeSignals((s) => s.noteUpdateFailure)
 
   const running = starting || job?.status === 'running'
 
@@ -72,6 +85,14 @@ export function UpdateBanner({ check, onDismiss }: { check: UpdateCheck; onDismi
 
   const lastLine = job?.logTail?.length ? job.logTail[job.logTail.length - 1] : null
 
+  // A failed update is a runtime issue too (attention inbox); a finished one
+  // clears it.
+  const failure = job?.status === 'failed' ? lastLine || t('shell.issueUpdateFailedTitle') : error
+  useEffect(() => {
+    if (failure) noteUpdateFailure(failure)
+    else if (job?.status === 'done') noteUpdateFailure(null)
+  }, [failure, job?.status, noteUpdateFailure])
+
   let message: string
   if (job?.status === 'done') {
     message = t('shell.updateDone', { latest: job.result?.new ?? check.latest ?? '' })
@@ -109,7 +130,13 @@ export function UpdateBanner({ check, onDismiss }: { check: UpdateCheck; onDismi
             {t('shell.updateReload')}
           </Button>
         ) : (
-          <Button variant="outline" size="xs" disabled={running} onClick={() => void apply()}>
+          <Button
+            variant="outline"
+            size="xs"
+            disabled={running || confirming}
+            aria-haspopup="dialog"
+            onClick={() => setConfirming(true)}
+          >
             {running ? (
               <>
                 <LoaderCircle className="animate-spin" aria-hidden />
@@ -133,6 +160,18 @@ export function UpdateBanner({ check, onDismiss }: { check: UpdateCheck; onDismi
           <X className="size-4" />
         </Button>
       </div>
+      {confirming ? (
+        <Suspense fallback={null}>
+          <UpdatePreflightDialog
+            latest={check.latest ?? ''}
+            onCancel={() => setConfirming(false)}
+            onConfirm={() => {
+              setConfirming(false)
+              void apply()
+            }}
+          />
+        </Suspense>
+      ) : null}
     </div>
   )
 }

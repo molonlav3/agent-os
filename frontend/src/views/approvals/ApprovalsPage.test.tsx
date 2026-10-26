@@ -1,10 +1,12 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { toast } from 'sonner'
 import { ApprovalsPage } from './ApprovalsPage'
 import { useApprovals, type Approval } from '@/services/approval-monitor'
 import { approvalMonitor, saveApprovalMode, setBrowserElevated } from '@/services/approval-monitor'
+import { useConnection } from '@/stores/connection'
 
 vi.mock('sonner', () => ({
   toast: { success: vi.fn(), warning: vi.fn(), error: vi.fn() },
@@ -52,7 +54,9 @@ function renderPage() {
     <QueryClientProvider
       client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
     >
-      <ApprovalsPage />
+      <MemoryRouter>
+        <ApprovalsPage />
+      </MemoryRouter>
     </QueryClientProvider>,
   )
 }
@@ -69,6 +73,7 @@ describe('ApprovalsPage', () => {
     vi.mocked(toast.error).mockClear()
     setStore([], 'prompt')
     useApprovals.setState({ elevatedMode: '' })
+    useConnection.getState().setState('connected')
     localStorage.clear()
   })
   afterEach(() => {
@@ -185,7 +190,9 @@ describe('ApprovalsPage', () => {
     setStore([{ id: 'a2', namespace: 'exec', toolName: 't', command: 'ls' }])
     rerender(
       <QueryClientProvider client={new QueryClient()}>
-        <ApprovalsPage />
+        <MemoryRouter>
+          <ApprovalsPage />
+        </MemoryRouter>
       </QueryClientProvider>,
     )
     expect(screen.getByRole('button', { name: /always allow/i })).toBeInTheDocument()
@@ -255,5 +262,31 @@ describe('ApprovalsPage', () => {
     })
     await waitFor(() => expect(screen.getByText('Session BYPASS')).toBeInTheDocument())
     expect(screen.queryByText('Approval prompts')).not.toBeInTheDocument()
+  })
+})
+
+describe('ApprovalsPage while the gateway is unreachable', () => {
+  afterEach(() => {
+    setStore([], 'prompt')
+    useConnection.getState().setState('connected')
+  })
+
+  it('keeps the card, disables its answers and says why', () => {
+    mockRpc.call.mockResolvedValue({ permissions: { default_mode: '' } })
+    useConnection.getState().setState('disconnected')
+    setStore([{ id: 'a1', namespace: 'exec', toolName: 't', command: 'ls' }])
+    renderPage()
+    const card = screen.getByRole('article', { name: /t/ })
+    for (const name of [/approve this time|approve once/i, /bypass/i, /^deny$/i]) {
+      expect(within(card).getByRole('button', { name })).toBeDisabled()
+    }
+    expect(
+      within(card).getByText('The gateway is offline. Reconnect to use this.'),
+    ).toBeInTheDocument()
+    expect(card.querySelector('[data-disabled-reason="gateway_offline"]')).not.toBeNull()
+
+    act(() => useConnection.getState().setState('connected'))
+    expect(within(card).getByRole('button', { name: /^deny$/i })).toBeEnabled()
+    expect(within(card).queryByText(/The gateway is offline/)).toBeNull()
   })
 })

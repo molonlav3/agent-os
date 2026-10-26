@@ -32,6 +32,7 @@ import {
   ShieldCheck,
   Sun,
   History,
+  Inbox,
   type LucideIcon,
 } from 'lucide-react'
 import { Toaster } from '@/components/ui/sonner'
@@ -48,9 +49,11 @@ import { t, tPlural, useLocale, type MessageKey } from '@/i18n'
 import { useTheme } from '@/stores/theme'
 import { useConnection } from '@/stores/connection'
 import { useApprovals } from '@/services/approval-monitor'
+import { useAttentionInbox } from '@/lib/useAttentionInbox'
 import { useBootstrap, useRpc } from './providers'
 import { defaultViewPath } from './routes'
 import { ShellHeaderSlotProvider } from './ShellHeaderSlot'
+import { TruthBadge } from './TruthBadge'
 import { UpdateBanner, type UpdateCheck } from './UpdateBanner'
 import agentosMark from '@/assets/agentos-mark.png'
 
@@ -78,6 +81,7 @@ function navGroups(): ReadonlyArray<{
     {
       label: t('shell.navGroupControl'),
       items: [
+        { path: 'inbox', title: t('shell.viewInbox'), icon: Inbox },
         { path: 'overview', title: t('shell.viewOverview'), icon: LayoutDashboard },
         { path: 'health', title: t('shell.viewHealth'), icon: Activity },
         { path: 'channels', title: t('shell.viewChannels'), icon: Radio },
@@ -117,25 +121,6 @@ function mobileQuery(): MediaQueryList | null {
 // a bare "v" never renders.
 function sidebarVersion(rawVersion: string): string {
   return (rawVersion.split('+')[0] || '').replace(/[^0-9A-Za-z.\-]/g, '').slice(0, 32)
-}
-
-// app.js:174-183 — legacy maps rpc state to a persistent pill variant + label.
-const PILL_VARIANT: Record<string, string> = {
-  connected: 'ok',
-  connecting: 'warn',
-  disconnected: 'err',
-}
-
-// Legacy derived the label by capitalising the state id. Translating it needs a
-// real map; an unmapped state still falls back to the capitalised id so a new
-// RpcState can never render an empty pill.
-function pillLabel(state: string): string {
-  const labels: Record<string, string> = {
-    connected: t('shell.connConnected'),
-    connecting: t('shell.connConnecting'),
-    disconnected: t('shell.connDisconnected'),
-  }
-  return labels[state] ?? state.charAt(0).toUpperCase() + state.slice(1)
 }
 
 export const SIDEBAR_COLLAPSED_STORAGE_KEY = 'agentos-sidebar-collapsed'
@@ -186,6 +171,7 @@ export const NAV_SHORTCUTS: ReadonlyArray<NavShortcutSpec> = [
   { combo: 'g e', path: 'env', descriptionKey: 'shell.shortcutNavEnv' },
   { combo: 'g l', path: 'logs', descriptionKey: 'shell.shortcutNavLogs' },
   { combo: 'g v', path: 'approvals', descriptionKey: 'shell.shortcutNavApprovals' },
+  { combo: 'g i', path: 'inbox', descriptionKey: 'shell.shortcutNavInbox' },
 ]
 
 function NavShortcut({
@@ -226,6 +212,8 @@ export function AppShell() {
   // on the Approvals item (legacy #approval-count, hidden at 0).
   const approvalCount = useApprovals((s) => s.count)
   const hasPendingApprovals = useApprovals((s) => s.pending.length > 0)
+  // The attention inbox badge: approvals, operator questions, runtime issues.
+  const { count: attentionCount } = useAttentionInbox()
   const bootstrap = useBootstrap()
   const location = useLocation()
   const shortcutOverlay = useShortcutOverlay()
@@ -455,13 +443,6 @@ export function AppShell() {
     main.scrollLeft = 0
   }, [location.pathname])
 
-  // The sidebar footer is the shell's single connection indicator. Keeping the
-  // reactive state here avoids duplicating the same readout in the header.
-  const pillState = connState
-  const pillVariant = PILL_VARIANT[pillState] ?? 'err'
-  const connectionLabel = pillLabel(pillState)
-  const pillOk = pillVariant === 'ok'
-
   const version = sidebarVersion(bootstrap.version)
   const themeName = mode === 'dark' ? t('shell.themeDark') : t('shell.themeLight')
 
@@ -556,8 +537,11 @@ export function AppShell() {
                 // a blinking terminal caret.
                 const active = activePath === v.path
                 const Icon = v.icon
-                // approval_monitor.js:118-138 — pending count badge on Approvals.
-                const showBadge = v.path === 'approvals' && approvalCount > 0
+                // approval_monitor.js:118-138 — pending count badge on Approvals;
+                // the inbox carries the count of everything waiting on you.
+                const badgeCount =
+                  v.path === 'approvals' ? approvalCount : v.path === 'inbox' ? attentionCount : 0
+                const showBadge = badgeCount > 0
                 return (
                   <Link
                     key={v.path}
@@ -581,12 +565,16 @@ export function AppShell() {
                     <span className="shell-nav-link__label">{v.title}</span>
                     {showBadge ? (
                       <span
-                        id="approval-count"
-                        data-testid="approval-badge"
+                        id={v.path === 'approvals' ? 'approval-count' : 'inbox-count'}
+                        data-testid={v.path === 'approvals' ? 'approval-badge' : 'inbox-badge'}
                         className="shell-nav-link__badge t-data ml-auto inline-flex min-w-5 items-center justify-center rounded-full border border-warn/40 px-1.5 text-[10px] font-semibold text-warn"
-                        aria-label={tPlural('shell.navApprovalBadge', approvalCount)}
+                        aria-label={
+                          v.path === 'approvals'
+                            ? tPlural('shell.navApprovalBadge', badgeCount)
+                            : tPlural('shell.navInboxBadge', badgeCount)
+                        }
                       >
-                        {approvalCount}
+                        {badgeCount}
                       </span>
                     ) : null}
                   </Link>
@@ -595,37 +583,11 @@ export function AppShell() {
             </div>
           ))}
         </nav>
-        {/* One authoritative TTY status bar. The connection state is always
-            present; only the optional bootstrap version label is suppressed. */}
+        {/* One authoritative TTY status bar: the truth badge (runtime state,
+            freshness, one recovery action). Only the optional bootstrap
+            version label is suppressed. */}
         <div className="shell-sidebar__footer mt-auto">
-          <div
-            id="conn-pill"
-            role="status"
-            aria-live="polite"
-            className="shell-sidebar__connection t-data"
-            data-testid="nav-foot"
-            data-variant={pillVariant}
-            title={
-              version
-                ? t('shell.connWithVersion', { state: connectionLabel, version })
-                : connectionLabel
-            }
-          >
-            <span
-              aria-hidden="true"
-              className={`shell-sidebar__status-dot size-1.5 shrink-0 rounded-full ${
-                pillOk ? 'bg-ok' : pillVariant === 'warn' ? 'bg-warn' : 'bg-danger'
-              }`}
-            />
-            <span
-              className={`shell-sidebar__status-label ${
-                pillOk ? 'text-ok' : pillVariant === 'warn' ? 'text-warn' : 'text-danger'
-              }`}
-            >
-              {connectionLabel.toUpperCase()}
-            </span>
-            {version ? <span className="shell-sidebar__version ml-auto">v{version}</span> : null}
-          </div>
+          <TruthBadge version={version} />
           {/* #137: the overlay needs a way in that is not a keyboard shortcut.
               '?' is deliberately inert while focus sits in the composer (which
               autofocuses on desktop) and on touch devices there is no keyboard
@@ -748,10 +710,12 @@ export function AppShell() {
           </ShellHeaderSlotProvider>
         </main>
       </div>
-      {/* approval_monitor.js:140-184 — global approval prompt, loaded only when needed. */}
-      {hasPendingApprovals ? (
+      {/* approval_monitor.js:140-184 — global approval prompt, loaded only when
+          needed. The attention inbox answers approvals in place, so the modal
+          stays out of its way there (it would cover the very list). */}
+      {hasPendingApprovals && activePath !== 'inbox' ? (
         <Suspense fallback={null}>
-          <ApprovalPrompt />
+          <ApprovalPrompt onOpenInbox={() => navigateTo('inbox')} />
         </Suspense>
       ) : null}
       <Toaster />

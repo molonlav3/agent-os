@@ -28,6 +28,21 @@
 .ap-stage__refresh {
   position: relative;
 }
+.ap-stage__header-actions {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.ap-stage__inbox {
+  color: var(--primary);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.ap-stage__inbox:hover {
+  text-decoration: underline;
+}
 
 /* Stat row: hairline-separated tiles. The hero tile carries the strategy tone. */
 .ap-stats {
@@ -664,4 +679,13 @@
   .ap-radio {
     transition: none;
   }
+}
+
+/* Disabled-with-reason around the card actions: the action row keeps its own
+   layout, the reason sits under it inside the card's padding. */
+.ap-card__gate > .disabled-reason__controls {
+  display: block;
+}
+.ap-card__gate > .disabled-reason__text {
+  padding: 0 1rem 1rem;
 }

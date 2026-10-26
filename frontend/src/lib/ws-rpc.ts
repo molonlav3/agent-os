@@ -127,6 +127,35 @@ export class WsRpcClient {
     return this.stateValue
   }
 
+  /**
+   * Connect again now, with the URL and credentials of the last `connect()`,
+   * skipping any pending backoff delay. This is the "Retry connection"
+   * action: after a refused handshake the client does not retry by itself.
+   *
+   * A connection that is up is left alone, unless `force` is set: a socket
+   * that still reads "connected" but has gone silent (the gateway process is
+   * frozen, the network path is half-open) is dropped and reopened. A forced
+   * drop goes through "disconnected" like any other, so everything that
+   * resubscribes on (re)connect does so again.
+   */
+  reconnect(options: { force?: boolean } = {}): void {
+    if (!this.url) return
+    if (this.stateValue === 'connected' && !options.force) return
+    this.autoReconnect = true
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    this.reconnectDelay = 800
+    this.dropSocket()
+    this.doConnect()
+  }
+
+  /** Epoch ms of the last frame the gateway sent (0 before the first). */
+  get lastFrameTime(): number {
+    return this.lastFrameAt
+  }
+
   get policy(): Record<string, unknown> {
     return this.policyValue ?? {}
   }
@@ -274,6 +303,11 @@ export class WsRpcClient {
         }
       } else if (data.type === 'event') {
         if (data.event === 'shutdown') this.noteShutdown(data.payload)
+        // The gateway may stamp a state_version revision on an event frame;
+        // listeners that cache snapshot-derived state refresh when it moves.
+        if (data.state_version && typeof data.state_version === 'object') {
+          this.emit('_state_version', data.state_version)
+        }
         const meta = (data.meta as Record<string, unknown>) ?? {}
         this.emit(String(data.event), data.payload, meta)
         this.emit('*', String(data.event), data.payload, meta)
@@ -311,6 +345,33 @@ export class WsRpcClient {
     if (Number.isFinite(ms) && ms > 0) {
       this.reconnectDelay = Math.min(Math.max(ms, 500), this.maxReconnectDelay)
     }
+  }
+
+  /**
+   * Let go of the current socket without waiting for its close handshake (a
+   * silent peer may never answer it), settle every call that waited on it,
+   * and report "disconnected". The caller decides when to connect again.
+   */
+  private dropSocket(): void {
+    this.stopPing()
+    this.stopTickWatch()
+    if (this.ws) {
+      const stale = this.ws
+      this.ws = null
+      stale.onopen = null
+      stale.onmessage = null
+      stale.onclose = null
+      stale.onerror = null
+      try {
+        stale.close()
+      } catch {
+        /* noop */
+      }
+    }
+    for (const [, p] of this.pending) p.reject(new Error('Connection closed'))
+    this.pending.clear()
+    this.startupRetry = false
+    this.setState('disconnected')
   }
 
   private emit(event: string, ...args: unknown[]): void {
@@ -361,11 +422,10 @@ export class WsRpcClient {
         const idleMs = Date.now() - this.lastFrameAt
         if (idleMs <= this.tickTimeoutMs) return
         this.emit('_gap', { reason: 'tick_timeout', idleMs })
-        try {
-          this.ws.close()
-        } catch {
-          /* noop */
-        }
+        // A silent socket is treated as dropped now: waiting for the close
+        // handshake of a peer that stopped answering can take another minute.
+        this.dropSocket()
+        this.scheduleReconnect()
       },
       Math.min(tickMs, 10000),
     )

@@ -1,14 +1,18 @@
 import './approvals.css'
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { Link } from 'react-router'
 import { CheckIcon, RefreshCwIcon, ShieldAlertIcon, XIcon } from 'lucide-react'
 import { toast } from 'sonner'
 import { CommandLine } from '@/components/CommandLine'
+import { DisabledReason } from '@/components/DisabledReason'
 import { Button } from '@/components/ui/button'
 import { useBootstrap, useRpc } from '@/app/providers'
 // Registers this view's copy; it ships in this chunk, not the entry bundle.
 import '@/i18n/en/approvals'
 import { t } from '@/i18n'
+import { gate, requireConnection, type Gate } from '@/lib/disabled-reason'
+import { useConnection } from '@/stores/connection'
 import {
   approvalCommand,
   approvalMonitor,
@@ -34,10 +38,13 @@ interface ConfigGetResponse {
 function ApprovalCard({
   item,
   busy,
+  answer,
   onResolve,
 }: {
   item: Approval
   busy: boolean
+  /** Whether an answer can be delivered now (disabled-with-reason when not). */
+  answer: Gate
   onResolve: (item: Approval, action: 'once' | 'always' | 'bypass' | 'deny') => void
 }) {
   const toolName = item.toolName || item.actionKind || t('approvals.cardUnknownTool')
@@ -84,40 +91,46 @@ function ApprovalCard({
           <pre className="ap-card__pre">{detail}</pre>
         </div>
       ) : null}
-      <div className="ap-card__actions">
-        <Button type="button" disabled={busy} onClick={() => onResolve(item, 'once')}>
-          <CheckIcon />
-          <span>{t('approvals.cardApproveOnce')}</span>
-        </Button>
-        {showAlways ? (
+      <DisabledReason gate={answer} className="ap-card__gate">
+        <div className="ap-card__actions">
+          <Button
+            type="button"
+            disabled={busy || answer.disabled}
+            onClick={() => onResolve(item, 'once')}
+          >
+            <CheckIcon />
+            <span>{t('approvals.cardApproveOnce')}</span>
+          </Button>
+          {showAlways ? (
+            <Button
+              type="button"
+              variant="outline"
+              disabled={busy || answer.disabled}
+              onClick={() => onResolve(item, 'always')}
+            >
+              {t('approvals.cardAlways')}
+            </Button>
+          ) : null}
           <Button
             type="button"
             variant="outline"
-            disabled={busy}
-            onClick={() => onResolve(item, 'always')}
+            disabled={busy || answer.disabled}
+            title={t('approvals.cardBypassTitle')}
+            onClick={() => onResolve(item, 'bypass')}
           >
-            {t('approvals.cardAlways')}
+            {t('approvals.cardBypass')}
           </Button>
-        ) : null}
-        <Button
-          type="button"
-          variant="outline"
-          disabled={busy}
-          title={t('approvals.cardBypassTitle')}
-          onClick={() => onResolve(item, 'bypass')}
-        >
-          {t('approvals.cardBypass')}
-        </Button>
-        <Button
-          type="button"
-          variant="destructive"
-          disabled={busy}
-          onClick={() => onResolve(item, 'deny')}
-        >
-          <XIcon />
-          <span>{t('approvals.cardDeny')}</span>
-        </Button>
-      </div>
+          <Button
+            type="button"
+            variant="destructive"
+            disabled={busy || answer.disabled}
+            onClick={() => onResolve(item, 'deny')}
+          >
+            <XIcon />
+            <span>{t('approvals.cardDeny')}</span>
+          </Button>
+        </div>
+      </DisabledReason>
     </article>
   )
 }
@@ -131,6 +144,10 @@ export function ApprovalsPage() {
   // Bypass resolve persists it (setBrowserElevated updates this store slice),
   // not only on a coincidental re-render that re-reads localStorage.
   const elevatedMode = useApprovals((s) => s.elevatedMode)
+  // An answer needs the gateway: while it is unreachable the cards stay, with
+  // their buttons disabled and the reason shown (disabled-with-reason).
+  const rpcState = useConnection((s) => s.state)
+  const answer = gate(requireConnection(rpcState))
 
   useEffect(() => {
     document.title = t('approvals.documentTitle')
@@ -223,16 +240,21 @@ export function ApprovalsPage() {
           <h1 className="t-display">{t('approvals.title')}</h1>
           <p className="ap-stage__subtitle">{t('approvals.subtitle')}</p>
         </div>
-        <Button
-          variant="outline"
-          title={t('approvals.refreshTitle')}
-          className="ap-stage__refresh text-xs uppercase tracking-[0.14em]"
-          disabled={refreshing}
-          onClick={() => void onRefresh()}
-        >
-          <RefreshCwIcon className={refreshing ? 'ap-refresh-spin' : undefined} />
-          <span>{refreshing ? t('approvals.refreshing') : t('approvals.refresh')}</span>
-        </Button>
+        <div className="ap-stage__header-actions">
+          <Link to="/inbox" className="ap-stage__inbox" title={t('approvals.inboxLinkTitle')}>
+            {t('approvals.inboxLink')}
+          </Link>
+          <Button
+            variant="outline"
+            title={t('approvals.refreshTitle')}
+            className="ap-stage__refresh text-xs uppercase tracking-[0.14em]"
+            disabled={refreshing}
+            onClick={() => void onRefresh()}
+          >
+            <RefreshCwIcon className={refreshing ? 'ap-refresh-spin' : undefined} />
+            <span>{refreshing ? t('approvals.refreshing') : t('approvals.refresh')}</span>
+          </Button>
+        </div>
       </header>
 
       <section className="ap-command" aria-label={t('approvals.opsLandmark')}>
@@ -296,7 +318,13 @@ export function ApprovalsPage() {
             </header>
             <div className="ap-pending__list">
               {pending.map((item) => (
-                <ApprovalCard key={item.id} item={item} busy={busy} onResolve={onResolve} />
+                <ApprovalCard
+                  key={item.id}
+                  item={item}
+                  busy={busy}
+                  answer={answer}
+                  onResolve={onResolve}
+                />
               ))}
             </div>
           </section>

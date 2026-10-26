@@ -6,6 +6,8 @@ import { Toaster } from '@/components/ui/sonner'
 import { initLocale } from '@/i18n'
 import { fallbackBootstrap, fetchBootstrap, resolveWsUrl, type Bootstrap } from '@/lib/bootstrap'
 import { WsRpcClient, type RpcState } from '@/lib/ws-rpc'
+import { bindPendingQuestions } from '@/lib/pending-questions'
+import { bindRuntimeSignals } from '@/lib/runtime-signals'
 import { approvalMonitor } from '@/services/approval-monitor'
 import { useConnection } from '@/stores/connection'
 import { useTheme as useWebTheme } from '@/stores/theme'
@@ -61,10 +63,19 @@ export function GatewayProviders({ children }: { children: ReactNode }) {
     void loadSettings()
   }, [loadSettings])
 
-  // One-time wiring shared with the console: locale + connection-state mirror.
+  // One-time wiring shared with the console: locale, the connection-state
+  // mirror, and the runtime signals + pending questions the truth badge and
+  // the attention panel read.
   useEffect(() => {
     initLocale()
-    return rpc.on('_state', (s) => useConnection.getState().setState(s as RpcState))
+    const offState = rpc.on('_state', (s) => useConnection.getState().setState(s as RpcState))
+    const offSignals = bindRuntimeSignals(rpc)
+    const offQuestions = bindPendingQuestions(rpc)
+    return () => {
+      offState()
+      offSignals()
+      offQuestions()
+    }
   }, [rpc])
 
   // The transcript's chart theme reads the console's theme store; keep it in

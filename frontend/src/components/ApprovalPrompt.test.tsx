@@ -1,7 +1,9 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApprovalPrompt } from './ApprovalPrompt'
+import { overlayDepth } from '@/components/overlay-layer'
 import { approvalMonitor, useApprovals, type Approval } from '@/services/approval-monitor'
+import { useConnection } from '@/stores/connection'
 
 // The modal drives resolution through the singleton; spy on it and assert the
 // action mapping. resolve() itself is unit-tested in approval-monitor.test.ts.
@@ -25,6 +27,7 @@ describe('ApprovalPrompt', () => {
   beforeEach(() => {
     resolveSpy.mockReset().mockResolvedValue(undefined)
     useApprovals.setState({ pending: [], count: 0, mode: 'prompt' })
+    useConnection.getState().setState('connected')
   })
   afterEach(() => {
     useApprovals.setState({ pending: [], count: 0, mode: 'prompt' })
@@ -66,7 +69,7 @@ describe('ApprovalPrompt', () => {
 
     const dialog = screen.getByRole('alertdialog')
     const first = screen.getByRole('button', { name: /copy command/i })
-    const last = screen.getByRole('button', { name: /^deny$/i })
+    const last = screen.getByRole('button', { name: /answer later/i })
     expect(first).toHaveFocus()
 
     fireEvent.keyDown(first, { key: 'Tab', shiftKey: true })
@@ -149,6 +152,52 @@ describe('ApprovalPrompt', () => {
     render(<ApprovalPrompt />)
     screen.getByRole('button', { name: /^deny$/i }).click()
     await waitFor(() => expect(resolveSpy).toHaveBeenCalledWith(item, 'deny'))
+  })
+
+  it('keeps its answers visible but disabled, with the reason, while offline', () => {
+    useConnection.getState().setState('disconnected')
+    setPending([{ id: 'a1', namespace: 'exec', command: 'ls', toolName: 't' }])
+    render(<ApprovalPrompt />)
+    for (const name of [/approve this time/i, /always allow/i, /bypass/i, /^deny$/i]) {
+      expect(screen.getByRole('button', { name })).toBeDisabled()
+    }
+    expect(screen.getByText('The gateway is offline. Reconnect to use this.')).toBeInTheDocument()
+    // Stepping aside is always possible.
+    expect(screen.getByRole('button', { name: /answer later/i })).toBeEnabled()
+    act(() => useConnection.getState().setState('connected'))
+    expect(screen.getByRole('button', { name: /^deny$/i })).toBeEnabled()
+  })
+
+  it('"Answer later" swaps the modal for a dock that blocks nothing, and comes back', () => {
+    const openInbox = vi.fn()
+    setPending([{ id: 'a1', namespace: 'exec', command: 'ls', toolName: 't' }])
+    render(<ApprovalPrompt onOpenInbox={openInbox} />)
+    expect(overlayDepth()).toBe(1)
+    fireEvent.click(screen.getByRole('button', { name: /answer later/i }))
+    expect(screen.queryByRole('alertdialog')).toBeNull()
+    // No overlay layer: the console's shortcuts (g i …) work again.
+    expect(overlayDepth()).toBe(0)
+    const dock = screen.getByTestId('approval-dock')
+    expect(dock).toHaveTextContent('1 approval waiting')
+    fireEvent.click(screen.getByRole('button', { name: 'Open inbox' }))
+    expect(openInbox).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Answer now' }))
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument()
+  })
+
+  it('brings the modal back for a new approval and forgets once the queue empties', () => {
+    const first: Approval = { id: 'a1', namespace: 'exec', command: 'ls', toolName: 't' }
+    setPending([first])
+    render(<ApprovalPrompt />)
+    fireEvent.click(screen.getByRole('button', { name: /answer later/i }))
+    expect(screen.queryByRole('alertdialog')).toBeNull()
+    act(() => setPending([first, { id: 'a2', namespace: 'exec', command: 'pwd', toolName: 't' }]))
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /answer later/i }))
+    act(() => setPending([]))
+    act(() => setPending([first]))
+    // Same id again after the queue emptied: it is a new prompt.
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument()
   })
 
   it('disables all buttons while a resolve is in flight', async () => {

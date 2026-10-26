@@ -7,6 +7,7 @@ import { config } from './config'
 import { cron } from './cron'
 import { env } from './env'
 import { health } from './health'
+import { inbox } from './inbox'
 import { logs } from './logs'
 import { mcp } from './mcp'
 import { memory } from './memory'
@@ -44,6 +45,7 @@ export const en = {
   cron,
   env,
   health,
+  inbox,
   logs,
   mcp,
   memory,

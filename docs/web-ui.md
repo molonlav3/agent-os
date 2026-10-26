@@ -69,16 +69,37 @@ agentos gateway run
 npm --prefix frontend run dev
 ```
 
-Vite serves `/control/` and proxies the gateway API and WebSocket. Production
+Vite serves `/control/` and proxies the gateway API, the WebSocket, the root
+approvals REST routes and the `/ready` probe the truth badge reads (point it at
+another gateway with `AGENTOS_GATEWAY=http://127.0.0.1:<port>`). Production
 builds use relative assets plus a server-provided runtime base, so custom
 non-root mounts such as `/console/` work without rebuilding. Root, `/api`, and
 `/ws` mounts are rejected because they overlap the gateway's public endpoints.
+
+### Conventions for console controls
+
+- **Disabled with a reason, never hidden or silent.** A control that cannot
+  be used right now stays where it is, disabled, with the exact reason next
+  to it ("The gateway is offline. Reconnect to use this."). The checks are
+  headless and shared with the desktop app (`frontend/src/lib/disabled-reason.ts`:
+  `gate(requireConnection(state), requireScheduler(down), …)` returns
+  `{disabled, code, reason}`); the console renders the reason with its
+  `DisabledReason` wrapper. A transient busy state is not a reason; a
+  spinner already says that.
+- **Every RPC method the console calls is listed** in
+  `frontend/src/lib/required-methods.ts` (the desktop's extra ones in
+  `desktop/src/renderer/src/lib/required-methods.ts`). A vitest fails when a
+  literal `rpc.call('…')` is missing from the list, and
+  `tests/test_console_required_methods.py` fails when a listed method is not
+  in the gateway's advertised `features.methods`. Names built at runtime are
+  listed by hand.
 
 ## Main Areas
 
 | Area | Use it for |
 | --- | --- |
 | Chat | Run and resume chat sessions, inspect tool activity, publish artifacts, and use manual compact controls. |
+| Inbox | Everything waiting on you in one list: approvals, agent questions and runtime issues, answered in place. |
 | Projects | Group chat sessions, edit each project's shared knowledge (injected into every member session), and start new chats inside a project. |
 | Overview / Health | See readiness, provider state, memory state, sandbox posture, and recovery hints. |
 | Channels | Inspect configured channel adapter status and jump to Agent Setup for configuration changes. |
@@ -92,6 +113,70 @@ non-root mounts such as `/console/` work without rebuilding. Root, `/api`, and
 | Environment | Set, replace, and remove the environment variables skills and providers read. |
 | Logs | Inspect runtime logs and diagnostics. |
 | Approvals | Respond to sensitive tool-call approval requests. |
+
+## Runtime status (truth badge)
+
+The status bar at the bottom of the sidebar answers "is what I am seeing true
+and fresh". It shows one of six states and how fresh the view is:
+
+| State | Meaning |
+| --- | --- |
+| Ready | Connected, frames are arriving, and the doctor reports no error-level finding. |
+| Degraded | Connected, but a doctor finding is at error level, `/ready` reports `safe_mode` or `draining`, or no frame has arrived for 2.5 tick intervals (the view is a snapshot). |
+| Connecting | The WebSocket is opening, `/ready` reports `starting`, or the gateway announced an in-place restart (`shutdown` with `restart_expected_ms`) and is on its way back. |
+| Blocked | The gateway refused the handshake, read from its typed error: bad credentials (`UNAUTHORIZED`), too many failed sign-ins (`AUTH_RATE_LIMITED`), or a different protocol version (`PROTOCOL_MISMATCH`; when the console is the older side, reloading the page fixes it). The console does not retry these by itself. |
+| Offline | No connection. What is on screen is the last snapshot. |
+| Unknown | Connected, but the doctor report has not arrived or could not be loaded, so "Ready" cannot be claimed. |
+
+Next to the state is the source and its age: `Live · 12 s` (age of the last
+frame the gateway sent), `Snapshot · 3 min` (the connection dropped; data is
+from before), or `Unavailable` (never connected). Press the badge for the
+reason and exactly one recovery action: **Retry connection** (reconnects at
+once, skipping the backoff, and opens a new socket when the current one still
+looks open but has gone silent), **Open attention inbox**, or **Open
+Health**. A connection with no frame for 2.5 tick intervals is dropped and
+reopened by itself.
+
+The badge refreshes from the connection itself: the hello, every event frame,
+the gateway's `tick` (every 30 s), and a shallow `doctor.status` plus
+`GET /ready` (its `state`: starting, ready, draining, safe_mode, and the
+`failing` checks) read on connect and every fourth tick (a `health` event or
+a `state_version` revision triggers an extra read, once the gateway sends
+them). It runs no polling timer of its own; a one-second display clock only
+ages the "Live · 12 s" readout. Screen readers hear the state when it
+changes, not the ageing freshness.
+
+## Attention inbox
+
+**Inbox** (`g i`) lists everything that waits on you, with a count on its
+nav item:
+
+- **Approvals** of every namespace (the same queue as the Approvals page).
+  The same command waiting in several sessions is one item, "Seen in N
+  sessions", and each occurrence keeps its own **Approve once** / **Deny**
+  and a link into its session. "Always allow" and "Bypass" stay on the
+  Approvals page. The global approval prompt does not pop over the inbox.
+- **Agent questions** (`ask_user`): the option chips and a free-text reply,
+  sent as your next message in that session (to every session, when the
+  same question was asked in several). The gateway has no listing of
+  unanswered questions, so the inbox collects them from the sessions this
+  console has open; a question asked in a session you have not opened shows
+  in its chat when you open it.
+- **Runtime issues**, typed from `doctor.status` findings and the connection
+  state: `gateway_unreachable`, `auth_failed`, `protocol_mismatch`,
+  `model_auth_required`, `rate_limited`, `channel_terminal`, `safe_mode`,
+  `update_failed` and `doctor_warning`. Each offers the actions that fit it:
+  the doctor's fix steps in place, a jump to the right settings screen,
+  **Retry connection**, and **Dismiss** (for this browser session only).
+  While the console is offline only the connection issue is listed; the
+  last doctor report is not repeated as if it were current.
+
+Approvals come from the same store as the Approvals page, which the gateway
+keeps current with `approval.requested` / `approval.resolved` events (one
+backfill per connect), and the list updates when that store changes; the
+inbox adds no timer and no polling of its own (**Re-check** asks for one
+backfill), and items show when they started waiting ("since 11:32"). An empty inbox says "Nothing
+needs you" only while the console is connected.
 
 ## Keyboard Shortcuts
 
@@ -108,12 +193,13 @@ The Web UI features a comprehensive set of keyboard shortcuts to facilitate mous
 The Web UI supports two-step chords (Gmail/GitHub style) to switch between sidebar views. Press `g` followed by a destination letter/key within **1.5 seconds** to navigate:
 
 - `g` then `c` - Go to Chat
+- `g` then `i` - Go to the attention inbox
 - `g` then `o` - Go to Overview
 - `g` then `h` - Go to Health
 - `g` then `n` - Go to Channels
 - `g` then `m` - Go to MCP Servers
 - `g` then `k` - Go to Skills
-- `g` then `j` - Go to Projects
+- `g` then `p` - Go to Projects
 - `g` then `s` - Go to Sessions
 - `g` then `a` - Go to Agents
 - `g` then `u` - Go to Usage
@@ -121,7 +207,8 @@ The Web UI supports two-step chords (Gmail/GitHub style) to switch between sideb
 - `g` then `,` - Go to Agent Setup
 - `g` then `e` - Go to Environment
 - `g` then `l` - Go to Logs
-- `g` then `p` - Go to Approvals
+- `g` then `y` - Go to Memory
+- `g` then `v` - Go to Approvals
 
 > [!NOTE]
 > Keyboard shortcuts are automatically suppressed while focus is inside a text input field, textarea, or content-editable region, and while modal dialogs or overlays are open.
@@ -252,7 +339,8 @@ tool. The chat renders a question card with clickable options (plus a
 free-text field); picking an answer sends it as your next message and the
 agent continues from there. Asking ends the agent's turn, so nothing blocks
 while you decide, and typing a reply in the composer works exactly the same
-as clicking the card.
+as clicking the card. Open questions also appear in the
+[attention inbox](#attention-inbox), answerable from there.
 
 ## Manual Compaction
 
@@ -304,6 +392,27 @@ Settings → *Push notifications for approvals* sends a notification to this
 browser for every new approval, even with the console closed (HTTPS or
 `localhost` only); see
 [Approvals and Permissions](approvals-and-permissions.md#where-a-prompt-reaches-you).
+
+While the gateway connection is down the cards stay listed, with their
+buttons disabled and the reason shown, since an answer could not be
+delivered; the global approval prompt does the same. The prompt's **Answer
+later** swaps it for a small dock ("1 approval waiting", **Answer now**,
+**Open inbox**) so the rest of the console and its shortcuts stay usable; a
+new approval brings the prompt back. The [attention inbox](#attention-inbox)
+lists the same approvals next to agent questions and runtime issues.
+
+## Cron job health
+
+A job that keeps failing is marked on its card: a **Degraded** badge, the
+consecutive failure count and the last error. They come from the `health`
+block on `cron.list` (the engine calls a job degraded at 3 failures in a
+row); a gateway older than that is read from the job's `consecutive_errors`
+and last error with the same threshold. When the job carries an overlap
+policy (`concurrency`), an **Overlap** picker sets it (`forbid` skips a run while one is going,
+`replace` stops the running one, `allow` runs them side by side) through
+`cron.update`; it does not appear when the job has no `concurrency`. **Run**
+and **Pause** are disabled, with the reason, while the gateway is offline or
+after the scheduler answered that it is not running.
 
 ## MCP Servers
 
@@ -439,6 +548,14 @@ state, session state, and user-visible errors.
 ## Update Banner
 
 If a newer release of `use-agent-os` is available on PyPI, a dismissible banner is displayed at the top of the Web UI console. The banner matches the 24h throttling behavior of the CLI update checks, and dismissing the banner suppresses it for that release version (persisted in local storage). This banner honors both the global `updates.notify` setting and the `AGENTOS_NO_UPDATE_NOTICE` environment flag.
+
+**Update now** opens a preflight before anything runs. The update restarts
+the gateway, so the preflight lists what that would interrupt: running
+sessions (`sessions.list`), scheduled jobs due in the next 10 minutes
+(`cron.list`), and pending approvals. A pending approval blocks the update,
+with the reason and a way to the inbox; running sessions and due jobs only
+warn, and the update starts once you confirm (**Update anyway**). A failed
+update is also listed in the attention inbox.
 
 ## Safety
 

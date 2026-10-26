@@ -264,14 +264,22 @@ describe('keepalive and reconnect', () => {
     expect(FakeWebSocket.instances.length).toBe(count + 1)
   })
 
-  it('closes the socket when no frame arrives within the tick timeout', () => {
+  it('drops the socket when no frame arrives within the tick timeout', () => {
     const { client, ws } = newClient()
     handshake(ws) // tick_interval_ms 30000 -> timeout 75s, checked every 10s
     const gap = vi.fn()
     client.on('_gap', gap)
-    // Idle exceeds the 75s timeout at the next 10s check tick (80s), so advance past it.
-    vi.advanceTimersByTime(81_000)
+    // A silent peer never completes the close handshake: the client must not
+    // wait for it before calling the connection lost.
+    ws.close = () => {}
+    const count = FakeWebSocket.instances.length
+    // Idle exceeds the 75s timeout at the next 10s check tick (80s).
+    vi.advanceTimersByTime(80_000)
     expect(gap).toHaveBeenCalledWith(expect.objectContaining({ reason: 'tick_timeout' }))
+    expect(client.state).toBe('disconnected')
+    expect(FakeWebSocket.instances.length).toBe(count)
+    vi.advanceTimersByTime(800)
+    expect(FakeWebSocket.instances.length).toBe(count + 1)
   })
 })
 
@@ -400,5 +408,103 @@ describe('callIdempotent', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('handshake refusal and manual retry', () => {
+  function refuse(ws: FakeWebSocket, code: string, message: string) {
+    ws.serverSend({ type: 'event', event: 'connect.challenge' })
+    const req = JSON.parse(ws.sent.at(-1)!)
+    ws.serverSend({ type: 'res', id: req.id, ok: false, error: { code, message } })
+  }
+
+  it('emits the typed refusal and does not retry by itself', () => {
+    const { client, ws } = newClient()
+    const refused = vi.fn()
+    client.on('_handshakeError', refused)
+    refuse(ws, 'UNAUTHORIZED', 'Authentication failed')
+    expect(refused).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'UNAUTHORIZED', message: 'Authentication failed' }),
+    )
+    expect(client.state).toBe('disconnected')
+    const count = FakeWebSocket.instances.length
+    vi.advanceTimersByTime(60_000)
+    expect(FakeWebSocket.instances.length).toBe(count)
+  })
+
+  it('reconnect() opens a new socket at once after a refusal', () => {
+    const { client, ws } = newClient()
+    refuse(ws, 'UNAUTHORIZED', 'Authentication failed')
+    const count = FakeWebSocket.instances.length
+    client.reconnect()
+    expect(FakeWebSocket.instances.length).toBe(count + 1)
+    expect(client.state).toBe('connecting')
+    const next = FakeWebSocket.instances.at(-1)!
+    next.serverOpen()
+    handshake(next)
+    expect(client.state).toBe('connected')
+  })
+
+  it('reconnect() skips the backoff wait and leaves a live connection alone', () => {
+    const { client, ws } = newClient()
+    handshake(ws)
+    const live = FakeWebSocket.instances.length
+    client.reconnect()
+    expect(FakeWebSocket.instances.length).toBe(live)
+    expect(client.state).toBe('connected')
+    ws.close()
+    client.reconnect()
+    expect(FakeWebSocket.instances.length).toBe(live + 1)
+  })
+
+  it('reconnect({force: true}) drops a silent "connected" socket and opens a new one', async () => {
+    const { client, ws } = newClient()
+    handshake(ws)
+    const states: unknown[] = []
+    client.on('_state', (s) => states.push(s))
+    const inflight = client.call('a.b')
+    // The old socket never answers its close handshake (a frozen peer).
+    ws.close = () => {}
+    const count = FakeWebSocket.instances.length
+    client.reconnect({ force: true })
+    await expect(inflight).rejects.toThrow('Connection closed')
+    expect(FakeWebSocket.instances.length).toBe(count + 1)
+    // It cycles through "disconnected", so subscribers resubscribe on connect.
+    expect(states).toEqual(['disconnected', 'connecting'])
+    const next = FakeWebSocket.instances.at(-1)!
+    next.serverOpen()
+    handshake(next)
+    expect(client.state).toBe('connected')
+    // A late frame on the abandoned socket is ignored.
+    expect(ws.onmessage).toBeNull()
+  })
+
+  it('a socket that drops mid-handshake still schedules the reconnect', () => {
+    const { client, ws } = newClient()
+    const refused = vi.fn()
+    client.on('_handshakeError', refused)
+    ws.serverSend({ type: 'event', event: 'connect.challenge' })
+    const count = FakeWebSocket.instances.length
+    ws.close()
+    expect(refused).not.toHaveBeenCalled()
+    expect(client.state).toBe('disconnected')
+    vi.advanceTimersByTime(800)
+    expect(FakeWebSocket.instances.length).toBe(count + 1)
+  })
+
+  it('surfaces an event frame state_version as _state_version', () => {
+    const { client, ws } = newClient()
+    handshake(ws)
+    const revision = vi.fn()
+    client.on('_state_version', revision)
+    ws.serverSend({
+      type: 'event',
+      event: 'tick',
+      payload: {},
+      seq: 1,
+      state_version: { presence: 1, health: 4 },
+    })
+    expect(revision).toHaveBeenCalledWith({ presence: 1, health: 4 })
+    expect(client.lastFrameTime).toBeGreaterThan(0)
   })
 })

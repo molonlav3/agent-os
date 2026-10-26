@@ -4,6 +4,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { toast } from 'sonner'
 import { CronPage } from './CronPage'
+import { RpcError } from '@/lib/ws-rpc'
+import { useConnection } from '@/stores/connection'
 
 vi.mock('sonner', () => ({
   toast: {
@@ -157,6 +159,7 @@ function callsTo(method: string) {
 describe('CronPage', () => {
   beforeEach(() => {
     mockRpc = makeRpc()
+    useConnection.getState().setState('connected')
     navigateSpy.mockReset()
     vi.mocked(toast.success).mockClear()
     vi.mocked(toast.warning).mockClear()
@@ -325,6 +328,16 @@ describe('CronPage', () => {
     await waitFor(() => expect(callsTo('cron.list')).toBe(1))
     mockRpc.emit('cron.run.finished', {})
     await waitFor(() => expect(callsTo('cron.list')).toBeGreaterThanOrEqual(2))
+  })
+
+  it('reads the list once more after a run finished, when its health is recorded', async () => {
+    wireRpc()
+    renderPage()
+    await waitFor(() => expect(callsTo('cron.list')).toBe(1))
+    mockRpc.emit('cron.run.finished', {})
+    await waitFor(() => expect(callsTo('cron.list')).toBe(2))
+    // The event precedes the run record; one settle read follows it.
+    await waitFor(() => expect(callsTo('cron.list')).toBe(3), { timeout: 3000 })
   })
 
   it('a cron.run.finished event invalidates an open runs drawer', async () => {
@@ -783,5 +796,122 @@ describe('CronPage — create/edit panel', () => {
     await waitFor(() => expect(screen.getByText(/No schedules yet/i)).toBeInTheDocument())
     fireEvent.click(screen.getByRole('button', { name: /create your first schedule/i }))
     expect(await screen.findByRole('dialog')).toBeInTheDocument()
+  })
+})
+
+describe('CronPage job health and overlap', () => {
+  beforeEach(() => {
+    mockRpc = makeRpc()
+    useConnection.getState().setState('connected')
+  })
+
+  it('shows nothing extra when the gateway sends no health or concurrency', async () => {
+    wireRpc()
+    renderPage()
+    await waitFor(() => expect(screen.getByText('Daily standup')).toBeInTheDocument())
+    expect(screen.queryByTestId('cron-health')).toBeNull()
+    expect(screen.queryByTestId('cron-degraded')).toBeNull()
+    expect(screen.queryByRole('combobox', { name: /overlap policy/i })).toBeNull()
+  })
+
+  it('marks a degraded job and shows its failures and last error', async () => {
+    wireRpc({
+      jobs: [
+        {
+          ...REMINDER_JOB,
+          health: { consecutive_failures: 3, last_error: 'boom: provider 500', degraded: true },
+        },
+      ],
+    })
+    renderPage()
+    const card = await screen.findByRole('article', { name: /daily standup/i })
+    expect(within(card).getByTestId('cron-degraded')).toHaveTextContent('Degraded')
+    expect(within(card).getByTestId('cron-health')).toHaveTextContent('3 consecutive failures')
+    expect(within(card).getByText('boom: provider 500')).toBeInTheDocument()
+    expect(card).toHaveAttribute('data-degraded', 'true')
+  })
+
+  it('reads the older engine’s consecutive_errors and lastResult when health is absent', async () => {
+    wireRpc({
+      jobs: [
+        { ...REMINDER_JOB, consecutive_errors: 3, lastResult: 'provider 429' },
+        { ...AGENT_JOB, enabled: true, consecutive_errors: 0, lastResult: null },
+      ],
+    })
+    renderPage()
+    const failing = await screen.findByRole('article', { name: /daily standup/i })
+    expect(within(failing).getByTestId('cron-degraded')).toHaveTextContent('Degraded')
+    expect(within(failing).getByTestId('cron-health')).toHaveTextContent('3 consecutive failures')
+    expect(within(failing).getByText('provider 429')).toBeInTheDocument()
+    // No streak, but it has run: healthy, and no Degraded badge.
+    const fine = screen.getByRole('article', { name: /health check/i })
+    expect(within(fine).queryByTestId('cron-degraded')).toBeNull()
+    expect(within(fine).getByTestId('cron-health')).toHaveTextContent('Healthy')
+    // The overlap picker stays hidden: the older engine has no concurrency field.
+    expect(screen.queryByRole('combobox', { name: /overlap policy/i })).toBeNull()
+  })
+
+  it('offers the overlap picker only when the job carries concurrency, and saves it', async () => {
+    wireRpc({
+      jobs: [
+        {
+          ...REMINDER_JOB,
+          concurrency: 'forbid',
+          last_run: Date.now() - 60_000,
+          health: { consecutive_failures: 0 },
+        },
+        AGENT_JOB,
+      ],
+    })
+    renderPage()
+    const picker = await screen.findByRole('combobox', {
+      name: /overlap policy for daily standup/i,
+    })
+    expect(screen.queryByRole('combobox', { name: /overlap policy for health check/i })).toBeNull()
+    expect(screen.getByTestId('cron-health')).toHaveTextContent('Healthy')
+    fireEvent.change(picker, { target: { value: 'replace' } })
+    await waitFor(() =>
+      expect(mockRpc.call).toHaveBeenCalledWith('cron.update', {
+        id: 'job-rem',
+        concurrency: 'replace',
+      }),
+    )
+  })
+
+  it('disables run and pause with the reason while the gateway is offline', async () => {
+    wireRpc()
+    renderPage()
+    const card = await screen.findByRole('article', { name: /daily standup/i })
+    useConnection.getState().setState('disconnected')
+    await waitFor(() =>
+      expect(within(card).getByRole('button', { name: /run daily standup now/i })).toBeDisabled(),
+    )
+    expect(within(card).getByRole('button', { name: /pause daily standup/i })).toBeDisabled()
+    expect(
+      within(card).getByText('The gateway is offline. Reconnect to use this.'),
+    ).toBeInTheDocument()
+  })
+
+  it('disables run and pause once the scheduler answers UNAVAILABLE', async () => {
+    wireRpc()
+    const base = mockRpc.call.getMockImplementation()!
+    mockRpc.call.mockImplementation((method: string, params?: unknown) => {
+      if (method === 'cron.run') {
+        const err = new RpcError('Cron scheduler is not available')
+        err.code = 'UNAVAILABLE'
+        return Promise.reject(err)
+      }
+      return base(method, params)
+    })
+    renderPage()
+    const card = await screen.findByRole('article', { name: /daily standup/i })
+    fireEvent.click(within(card).getByRole('button', { name: /run daily standup now/i }))
+    await waitFor(() =>
+      expect(
+        within(card).getByText('The scheduler is not running on this gateway.'),
+      ).toBeInTheDocument(),
+    )
+    expect(within(card).getByRole('button', { name: /run daily standup now/i })).toBeDisabled()
+    expect(within(card).getByRole('button', { name: /pause daily standup/i })).toBeDisabled()
   })
 })

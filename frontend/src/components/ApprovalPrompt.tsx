@@ -1,9 +1,13 @@
 import './ApprovalPrompt.css'
 import { useState } from 'react'
+import { create } from 'zustand'
 import { Button } from '@/components/ui/button'
 import { CommandLine } from '@/components/CommandLine'
+import { DisabledReason } from '@/components/DisabledReason'
 import { ModalShell } from '@/components/ModalShell'
-import { t } from '@/i18n'
+import { t, tPlural } from '@/i18n'
+import { gate, requireConnection } from '@/lib/disabled-reason'
+import { useConnection } from '@/stores/connection'
 import {
   approvalCommand,
   approvalDetail,
@@ -13,6 +17,20 @@ import {
   useApprovals,
   type Approval,
 } from '@/services/approval-monitor'
+
+/**
+ * Approvals the operator chose to answer later. While every pending approval
+ * is in here the modal steps aside for a small dock (no backdrop, no focus
+ * trap, shortcuts work), so the rest of the console, the status bar's
+ * recovery action and the attention inbox stay reachable. A new approval
+ * brings the modal back; an empty queue forgets the list.
+ */
+const useAnswerLater = create<{ ids: readonly string[] }>(() => ({ ids: [] }))
+useApprovals.subscribe((state) => {
+  if (state.pending.length === 0 && useAnswerLater.getState().ids.length > 0) {
+    useAnswerLater.setState({ ids: [] })
+  }
+})
 
 /**
  * Global approval prompt modal — the React port of approval_monitor.js's
@@ -31,10 +49,15 @@ import {
  * state) on a dimmed backdrop; the command renders through the common
  * <CommandLine>. Status color flows only through the `--tone` primitive.
  */
-export function ApprovalPrompt() {
+export function ApprovalPrompt({ onOpenInbox }: { onOpenInbox?: () => void } = {}) {
   const pending = useApprovals((s) => s.pending)
   const mode = useApprovals((s) => s.mode)
   const [busy, setBusy] = useState(false)
+  // An answer is delivered through the gateway: while it is unreachable the
+  // buttons stay, disabled, with the reason (disabled-with-reason).
+  const rpcState = useConnection((s) => s.state)
+  const answer = gate(requireConnection(rpcState))
+  const later = useAnswerLater((s) => s.ids)
 
   // approval_monitor.js:90-91 — legacy PINNED the modal to the item captured at
   // open time and short-circuited polls while the modal was open (`if (_modal)
@@ -71,6 +94,28 @@ export function ApprovalPrompt() {
   }
 
   if (!item) return null
+
+  if (pending.every((p) => later.includes(p.id))) {
+    return (
+      <div
+        className="approval-dock tone-warn"
+        role="region"
+        aria-label={t('shell.approvalDockLandmark')}
+        data-testid="approval-dock"
+      >
+        <span className="approval-dock__light" aria-hidden="true" />
+        <span className="approval-dock__text">{tPlural('shell.approvalDock', pending.length)}</span>
+        <Button type="button" size="xs" onClick={() => useAnswerLater.setState({ ids: [] })}>
+          {t('shell.approvalDockAnswer')}
+        </Button>
+        {onOpenInbox ? (
+          <Button type="button" size="xs" variant="ghost" onClick={onOpenInbox}>
+            {t('shell.approvalDockInbox')}
+          </Button>
+        ) : null}
+      </div>
+    )
+  }
 
   const command = approvalCommand(item)
   const detail = approvalDetail(item)
@@ -118,41 +163,53 @@ export function ApprovalPrompt() {
         {detail ? <pre className="approval-modal__detail">{detail}</pre> : null}
       </div>
       <div className="approval-modal__foot">
-        <Button
-          type="button"
-          disabled={busy}
-          title={t('shell.approvalOnceTitle')}
-          onClick={() => void resolve('once')}
-        >
-          {t('shell.approvalOnce')}
-        </Button>
-        {showAlways ? (
+        <DisabledReason gate={answer} className="approval-modal__answers">
+          <Button
+            type="button"
+            disabled={busy || answer.disabled}
+            title={t('shell.approvalOnceTitle')}
+            onClick={() => void resolve('once')}
+          >
+            {t('shell.approvalOnce')}
+          </Button>
+          {showAlways ? (
+            <Button
+              type="button"
+              variant="outline"
+              disabled={busy || answer.disabled}
+              title={t('shell.approvalAlwaysTitle')}
+              onClick={() => void resolve('always')}
+            >
+              {t('shell.approvalAlways')}
+            </Button>
+          ) : null}
           <Button
             type="button"
             variant="outline"
-            disabled={busy}
-            title={t('shell.approvalAlwaysTitle')}
-            onClick={() => void resolve('always')}
+            disabled={busy || answer.disabled}
+            title={t('shell.approvalBypassTitle')}
+            onClick={() => void resolve('bypass')}
           >
-            {t('shell.approvalAlways')}
+            {t('shell.approvalBypass')}
           </Button>
-        ) : null}
+          <Button
+            type="button"
+            variant="destructive"
+            disabled={busy || answer.disabled}
+            onClick={() => void resolve('deny')}
+          >
+            {t('shell.approvalDeny')}
+          </Button>
+        </DisabledReason>
+        {/* Always usable: stepping aside never answers anything. */}
         <Button
           type="button"
-          variant="outline"
-          disabled={busy}
-          title={t('shell.approvalBypassTitle')}
-          onClick={() => void resolve('bypass')}
+          variant="ghost"
+          className="approval-modal__later"
+          title={t('shell.approvalLaterTitle')}
+          onClick={() => useAnswerLater.setState({ ids: pending.map((p) => p.id) })}
         >
-          {t('shell.approvalBypass')}
-        </Button>
-        <Button
-          type="button"
-          variant="destructive"
-          disabled={busy}
-          onClick={() => void resolve('deny')}
-        >
-          {t('shell.approvalDeny')}
+          {t('shell.approvalLater')}
         </Button>
       </div>
     </ModalShell>

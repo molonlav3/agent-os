@@ -202,6 +202,77 @@ export function isOkStatus(status: string | undefined | null): boolean {
   return status === 'ok' || status === 'success'
 }
 
+// ── Job health + overlap policy (cron.list `health` / `concurrency`) ─────────
+
+/** A job's recent-run health, as the card shows it. */
+export interface JobRuntimeHealth {
+  consecutiveFailures: number
+  lastError: string
+  /** The job keeps failing: the scheduler is backing it off, or gave up on it. */
+  degraded: boolean
+  /** Where it came from: the `health` block, or the older flat fields. */
+  source: 'health' | 'legacy'
+}
+
+function failureCount(raw: unknown): number {
+  const n = Number(raw ?? 0)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
+}
+
+/** The streak at which the engine calls a job degraded (`job_health` in the scheduler). */
+export const DEGRADED_FAILURE_THRESHOLD = 3
+
+/**
+ * The job's run health, normalised. Gateways from this release send a
+ * `health` block (`consecutive_failures`, `last_error`, `degraded`; snake or
+ * camel case) and it is used as is. Older ones send `consecutive_errors` and
+ * `lastResult` (the last error) flat on the job; the same rule the engine
+ * applies then decides `degraded` (a streak of 3, or a job the scheduler
+ * gave up on). Null when the job carries neither, so nothing is shown
+ * rather than a guessed "healthy".
+ */
+export function jobRuntimeHealth(job: RawJob): JobRuntimeHealth | null {
+  const raw = job.health
+  if (raw && typeof raw === 'object') {
+    const h = raw as Record<string, unknown>
+    const lastError = h.last_error ?? h.lastError
+    return {
+      consecutiveFailures: failureCount(h.consecutive_failures ?? h.consecutiveFailures),
+      lastError: typeof lastError === 'string' ? lastError.trim() : '',
+      degraded: h.degraded === true,
+      source: 'health',
+    }
+  }
+  const streak = job.consecutive_errors ?? job.consecutiveErrors
+  const lastResult = typeof job.lastResult === 'string' ? job.lastResult.trim() : ''
+  if (streak === undefined && !lastResult) return null
+  const consecutiveFailures = failureCount(streak)
+  return {
+    consecutiveFailures,
+    lastError: lastResult,
+    degraded: consecutiveFailures >= DEGRADED_FAILURE_THRESHOLD || job.status === 'failed',
+    source: 'legacy',
+  }
+}
+
+export type ConcurrencyPolicy = 'forbid' | 'replace' | 'allow'
+
+export const CONCURRENCY_POLICIES: readonly ConcurrencyPolicy[] = ['forbid', 'replace', 'allow']
+
+/** The job's overlap policy, or null when the payload has no (known) `concurrency`. */
+export function jobConcurrency(job: RawJob): ConcurrencyPolicy | null {
+  const raw = job.concurrency
+  return typeof raw === 'string' && (CONCURRENCY_POLICIES as readonly string[]).includes(raw)
+    ? (raw as ConcurrencyPolicy)
+    : null
+}
+
+export function concurrencyLabel(policy: ConcurrencyPolicy): string {
+  if (policy === 'forbid') return t('cron.concurrencyForbid')
+  if (policy === 'replace') return t('cron.concurrencyReplace')
+  return t('cron.concurrencyAllow')
+}
+
 // ── next-run text derivations (cron.js:362-377) ─────────────────────────────
 
 /**

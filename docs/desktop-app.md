@@ -125,6 +125,26 @@ Settings › Behaviour › Quick Ask turns the shortcut off or moves it to
 running, even with its window closed. A question asked while the gateway is
 stopped waits in the chat and is sent once the gateway is running again.
 
+## Runtime status and what needs you
+
+The toolbar's status capsule shows the same runtime truth as the Web UI's
+footer badge: **Ready**, **Degraded**, **Connecting**, **Blocked**,
+**Offline** or **Unknown**, with how fresh the view is (`Live · 12 s`,
+`Snapshot · 3 min`, `Unavailable`). Click it for the reason and one way
+forward. Because the app runs the gateway, a stopped gateway reads Offline
+and offers **Start gateway** (an external gateway offers **Retry
+connection** instead).
+
+The tray icon beside it opens **Needs you**: approvals of every kind, agent
+questions (`ask_user`) and runtime issues in one list, with a count on the
+icon. Approve, deny, pick an answer or type a reply right there; the same
+command waiting in several sessions is grouped ("Seen in N sessions") and
+each occurrence links to its session. Runtime issues come from the doctor
+and the connection: open the fix steps in place, jump to the right
+Settings section, dismiss for this session, or **Restart gateway**, which
+asks before restarting. Questions are collected from the sessions this
+window has open; the gateway does not list unanswered questions.
+
 ## Notifications
 
 The app notifies you when a reply finishes or fails, when an approval is
@@ -185,8 +205,14 @@ The app and the engine update together from one release.
   the running version and a **Latest** row with the newest version ("Not
   checked yet" before the first check) and, while the app downloads, the
   download percent beside it.
-- If an update would interrupt a live reply, the app sends you to
-  Settings › About first, where **Update anyway** lives.
+- An engine update restarts the gateway, so it goes through a preflight
+  in Settings › About first: running sessions, scheduled jobs due in the
+  next 10 minutes, and pending approvals. A pending approval blocks the
+  update (with a way to **Needs you**); running work only warns, and the
+  update starts once you confirm (**Update anyway**). The notice's
+  **Update** opens that preflight too.
+- Scheduled jobs the gateway reports as degraded carry a **Degraded** chip
+  with the failure streak, and the last error, in the job's detail pane.
 - After `agentos upgrade` in a terminal, the app offers **Restart gateway**
   so the running gateway picks up the new engine.
 

@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { useApprovals } from '@/services/approval-monitor'
 import { useConnection } from '@/stores/connection'
 import { IDLE_ENGINE, idleAppState } from '@shared/updates'
 import { useSettings } from '~/stores/settings'
@@ -63,13 +64,28 @@ describe('AboutPane · engine', () => {
     renderPane()
     expect(await screen.findByText('2026.9.11')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Update engine' }))
+    // The preflight runs first; with nothing running it confirms with "Update".
+    const notice = await screen.findByTestId('engine-preflight')
+    await within(notice).findByText('0 sessions are running')
+    expect(applyEngine).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByTestId('engine-preflight-confirm'))
     expect(applyEngine).toHaveBeenCalledTimes(1)
   })
 
-  it('asks before interrupting active sessions', async () => {
-    rpcCall.mockImplementation(async (method: string) =>
-      method === 'status' ? { version: '2026.8.23', uptime_ms: 1, active_sessions: 2 } : {},
-    )
+  it('says what the restart interrupts and asks before going ahead', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'status') return { version: '2026.8.23', uptime_ms: 1, active_sessions: 2 }
+      if (method === 'sessions.list')
+        return {
+          sessions: [
+            { key: 'a', active_task: { status: 'running' } },
+            { key: 'b', run_status: 'queued' },
+          ],
+        }
+      if (method === 'cron.list')
+        return [{ id: 'j', name: 'Digest', enabled: true, next_run: Date.now() + 120_000 }]
+      return {}
+    })
     useUpdates.setState({
       engine: {
         ...IDLE_ENGINE,
@@ -83,9 +99,37 @@ describe('AboutPane · engine', () => {
     await screen.findAllByText('2026.8.23')
     fireEvent.click(screen.getByRole('button', { name: 'Update engine' }))
     expect(applyEngine).not.toHaveBeenCalled()
-    expect(screen.getByText(/2 sessions are active/)).toBeInTheDocument()
+    const notice = await screen.findByTestId('engine-preflight')
+    await within(notice).findByText('2 sessions are running')
+    expect(notice).toHaveTextContent('1 scheduled job is due in the next 10 minutes (Digest)')
     fireEvent.click(screen.getByRole('button', { name: 'Update anyway' }))
     expect(applyEngine).toHaveBeenCalledTimes(1)
+  })
+
+  it('blocks the update with the reason while an approval is pending', async () => {
+    useApprovals.setState({ pending: [{ id: 'x', namespace: 'exec', command: 'ls' }], count: 1 })
+    try {
+      useUpdates.setState({
+        engine: {
+          ...IDLE_ENGINE,
+          current: '2026.8.23',
+          latest: '2026.9.11',
+          availability: 'outdated',
+        },
+      })
+      renderPane()
+      fireEvent.click(await screen.findByRole('button', { name: 'Update engine' }))
+      const notice = await screen.findByTestId('engine-preflight')
+      await within(notice).findByText('1 approval is pending')
+      const confirm = screen.getByTestId('engine-preflight-confirm')
+      expect(confirm).toBeDisabled()
+      expect(notice).toHaveTextContent('1 approval is waiting. Answer it before updating.')
+      expect(screen.getByRole('button', { name: 'Show what needs you' })).toBeInTheDocument()
+      fireEvent.click(confirm)
+      expect(applyEngine).not.toHaveBeenCalled()
+    } finally {
+      useApprovals.setState({ pending: [], count: 0 })
+    }
   })
 
   it('points at the terminal for a non-delegated install', () => {
@@ -274,7 +318,7 @@ describe('AboutPane · app', () => {
     expect(appCard().textContent).not.toContain('Latest')
   })
 
-  it('offers Update all when both are outdated', () => {
+  it('offers Update all when both are outdated, through the engine preflight', async () => {
     const updateAll = vi.fn(async () => {})
     useUpdates.setState({
       updateAll,
@@ -283,6 +327,10 @@ describe('AboutPane · app', () => {
     })
     renderPane()
     fireEvent.click(screen.getByRole('button', { name: 'Update all' }))
+    expect(updateAll).not.toHaveBeenCalled()
+    await within(await screen.findByTestId('engine-preflight')).findByText('0 sessions are running')
+    fireEvent.click(screen.getByTestId('engine-preflight-confirm'))
     expect(updateAll).toHaveBeenCalledTimes(1)
+    expect(applyEngine).not.toHaveBeenCalled()
   })
 })
