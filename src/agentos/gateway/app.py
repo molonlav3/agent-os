@@ -32,6 +32,7 @@ from agentos.gateway.middleware import (
     SecurityHeadersMiddleware,
 )
 from agentos.gateway.protocol import ErrorCode, error_category
+from agentos.gateway.readiness import readiness_payload, startup_payload
 from agentos.gateway.rpc import RpcContext, get_dispatcher
 from agentos.gateway.websocket import handle_ws_connection
 
@@ -169,14 +170,14 @@ def create_gateway_app(
         return RedirectResponse(url=f"{config.control_ui.base_path}/")
 
     async def ready(request: Request) -> JSONResponse:
-        uptime = int((time.time() - _start_time) * 1000)
-        is_ready = bool(getattr(request.app.state, "gateway_ready", True))
-        payload = {
-            "ready": is_ready,
-            "status": "ready" if is_ready else "starting",
-            "uptime_ms": uptime,
-        }
-        return JSONResponse(payload, status_code=200 if is_ready else 503)
+        # ``{ready, state, failing}``: the supervisor contract (gateway/readiness.py).
+        payload, status_code = readiness_payload(request.app.state)
+        payload["uptime_ms"] = int((time.time() - _start_time) * 1000)
+        return JSONResponse(payload, status_code=status_code)
+
+    async def startupz(request: Request) -> JSONResponse:
+        payload, status_code = startup_payload(request.app.state)
+        return JSONResponse(payload, status_code=status_code)
 
     async def api_config(request: Request) -> JSONResponse:
         ctx = _make_ctx(request)
@@ -597,6 +598,7 @@ def create_gateway_app(
         Route("/healthz", health, methods=["GET"]),
         Route("/ready", ready, methods=["GET"]),
         Route("/readyz", ready, methods=["GET"]),
+        Route("/startupz", startupz, methods=["GET"]),
         Route("/api/config", api_config, methods=["GET"]),
         Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/chat", api_chat, methods=["POST"]),
@@ -680,10 +682,26 @@ def create_gateway_app(
         except Exception:  # noqa: BLE001 - shutdown must not raise
             pass
 
+    def _record_clean_shutdown(_app: Starlette) -> None:
+        """A SIGTERM ends here (uvicorn's graceful shutdown), not in ``close()``.
+
+        Recording the boot as clean at this point keeps ``agentos gateway
+        stop`` and a supervisor's stop out of the crash-loop breaker's count;
+        only a process that dies without any shutdown is unclean.
+        """
+        tracker = getattr(_app.state, "boot_tracker", None)
+        mark_clean = getattr(tracker, "mark_clean", None)
+        if callable(mark_clean):
+            try:
+                mark_clean()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
+
     @contextlib.asynccontextmanager
     async def _lifespan(_app: Starlette) -> AsyncIterator[None]:
         yield
         _close_browser_sessions()
+        _record_clean_shutdown(_app)
 
     app = Starlette(
         routes=routes,

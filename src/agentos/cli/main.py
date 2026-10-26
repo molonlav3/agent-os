@@ -788,6 +788,11 @@ def gateway_status(
         help="Remote gateway URL to inspect instead of local lifecycle state.",
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    deep: bool = typer.Option(
+        False,
+        "--deep",
+        help="Also report the installed launchd/systemd service (agentos gateway install).",
+    ),
 ) -> None:
     """Inspect the managed gateway process without mutating state."""
     from agentos.cli.gateway_cmd import status_gateway
@@ -799,7 +804,46 @@ def gateway_status(
         config_path=config_path,
         gateway_url=gateway_url,
         json_output=json_output,
+        deep=deep,
     )
+
+
+@gateway_app.command("install")
+def gateway_install(
+    port: int | None = typer.Option(
+        None,
+        "--port",
+        "-p",
+        help="Port the service binds (default: config port, usually 18791)",
+    ),
+    config_path: str | None = typer.Option(
+        None, "--config", help="Config file the service runs with (made absolute)."
+    ),
+    no_start: bool = typer.Option(
+        False, "--no-start", help="Write the unit file but do not load or start it."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+) -> None:
+    """Run the gateway as a user service that restarts it when it dies.
+
+    macOS: a LaunchAgent (dev.useagentos.gateway). Linux: a systemd user
+    unit (agentos-gateway.service). Not supported on Windows. Refuses when a
+    different unit with the same name exists; installing the same unit again
+    is a no-op.
+    """
+    from agentos.cli.gateway_service import install_gateway
+
+    install_gateway(port=port, config_path=config_path, start=not no_start, json_output=json_output)
+
+
+@gateway_app.command("uninstall")
+def gateway_uninstall(
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+) -> None:
+    """Stop and remove the service 'agentos gateway install' created (no-op if none)."""
+    from agentos.cli.gateway_service import uninstall_gateway
+
+    uninstall_gateway(json_output=json_output)
 
 
 @gateway_app.command("stop")

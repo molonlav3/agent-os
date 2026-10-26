@@ -29,6 +29,19 @@ export const WEB_CLIENT_INFO: ClientInfo = {
 /** Protocol version this client speaks (min = max: no older dialects). */
 export const CLIENT_PROTOCOL_VERSION = 3
 
+/**
+ * A gateway that is still booting answers `connect` with a retryable
+ * UNAVAILABLE whose `details.code` is STARTUP_SIDECARS, then closes 1013.
+ * Returns the delay the gateway asked for, or null for any other error.
+ */
+function startupRetryAfterMs(err: unknown): number | null {
+  if (!(err instanceof RpcError) || err.code !== 'UNAVAILABLE') return null
+  const details = err.details as { code?: unknown; retry_after_ms?: unknown } | undefined
+  if (!details || details.code !== 'STARTUP_SIDECARS') return null
+  const ms = Number(details.retry_after_ms)
+  return Number.isFinite(ms) && ms > 0 ? ms : 1000
+}
+
 export class WsRpcClient {
   private ws: WebSocket | null = null
   private reqId = 0
@@ -53,6 +66,8 @@ export class WsRpcClient {
   private challengeNonce: string | null = null
   private capabilitiesValue: string[] = []
   private clientInfo: ClientInfo
+  /** Set while a handshake refused with STARTUP_SIDECARS is being retried. */
+  private startupRetry = false
   private readonly WebSocketImpl: typeof WebSocket
 
   constructor(opts?: { WebSocketImpl?: typeof WebSocket; clientInfo?: Partial<ClientInfo> }) {
@@ -177,6 +192,15 @@ export class WsRpcClient {
             // The socket closing mid-handshake is not a refusal: onclose
             // reconnects with backoff as for any drop.
             if (!(error instanceof RpcError)) return
+            // A gateway still booting asks to be retried: stay "connecting"
+            // and try again when it said (supervisor contract).
+            const retryMs = startupRetryAfterMs(error)
+            if (retryMs !== null && this.autoReconnect) {
+              this.startupRetry = true
+              this.reconnectDelay = Math.min(retryMs, this.maxReconnectDelay)
+              this.ws?.close()
+              return
+            }
             // A refused handshake (wrong token, rate limit, protocol
             // mismatch) does not heal by retrying: stop, and let the UI read
             // the typed error (code + details) from `_handshakeError`.
@@ -249,6 +273,7 @@ export class WsRpcClient {
           }
         }
       } else if (data.type === 'event') {
+        if (data.event === 'shutdown') this.noteShutdown(data.payload)
         const meta = (data.meta as Record<string, unknown>) ?? {}
         this.emit(String(data.event), data.payload, meta)
         this.emit('*', String(data.event), data.payload, meta)
@@ -261,6 +286,11 @@ export class WsRpcClient {
       for (const [, p] of this.pending) p.reject(new Error('Connection closed'))
       this.pending.clear()
       this.ws = null
+      if (this.startupRetry) {
+        this.startupRetry = false
+        this.scheduleReconnect()
+        return
+      }
       if (this.stateValue !== 'disconnected') {
         this.setState('disconnected')
         this.scheduleReconnect()
@@ -268,6 +298,19 @@ export class WsRpcClient {
     }
 
     this.ws.onerror = () => {}
+  }
+
+  /**
+   * `shutdown {reason, restart_expected_ms}` precedes close 1012. A number
+   * means an in-place restart: reconnect when the gateway expects to be back
+   * instead of walking the backoff. `null` is a terminal stop; the normal
+   * backoff applies (a supervisor may still bring it back).
+   */
+  private noteShutdown(payload: unknown): void {
+    const ms = Number((payload as { restart_expected_ms?: unknown } | null)?.restart_expected_ms)
+    if (Number.isFinite(ms) && ms > 0) {
+      this.reconnectDelay = Math.min(Math.max(ms, 500), this.maxReconnectDelay)
+    }
   }
 
   private emit(event: string, ...args: unknown[]): void {

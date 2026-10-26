@@ -44,6 +44,9 @@ def _status_for(*, connected: bool, enabled: bool, dispatch_state: str | None) -
         return "disabled"
     if dispatch_state in {"dead", "exhausted", "restarting"}:
         return dispatch_state
+    if dispatch_state == "retrying":
+        # A failed automatic restart the manager is retrying with backoff.
+        return "restarting"
     return _channel_status(connected)
 
 
@@ -114,9 +117,75 @@ def _required_string(params: dict | None, key: str) -> str:
     return value
 
 
+async def _runtime_status_map(ctx: RpcContext) -> dict[str, dict[str, Any]]:
+    probe = getattr(ctx.channel_manager, "runtime_status", None) if ctx.channel_manager else None
+    if not callable(probe):
+        return {}
+    try:
+        result = await probe()
+    except Exception:  # noqa: BLE001 - status must not fail on the runtime probe
+        log.warning("channels.runtime_status_failed", exc_info=True)
+        return {}
+    return result if isinstance(result, dict) else {}
+
+
+def _runtime_fields(runtime: dict[str, Any] | None, *, now: float) -> dict[str, Any]:
+    """``state``, ``last_event_at``, ``terminal_reason``: the health sweep's view."""
+    from agentos.gateway.maintenance import ChannelHealthPolicy, classify, get_maintenance
+
+    if not runtime:
+        return {"state": None, "last_event_at": None, "terminal_reason": None, "start_error": None}
+    maintenance = get_maintenance()
+    policy = maintenance.policy if maintenance is not None else ChannelHealthPolicy()
+    last_event = runtime.get("last_event_at")
+    return {
+        "state": classify(runtime, now=now, policy=policy),
+        "last_event_at": _iso_ts(last_event),
+        "terminal_reason": runtime.get("terminal_reason"),
+        "start_error": runtime.get("start_error"),
+    }
+
+
+def _iso_ts(value: Any) -> str | None:
+    if not isinstance(value, (int, float)) or not value:
+        return None
+    from datetime import UTC, datetime
+
+    return (
+        datetime.fromtimestamp(float(value), UTC)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _health_policy_payload() -> dict[str, Any]:
+    """The auto-restart policy plus the last sweep/thaw, for ``channels.status``."""
+    from agentos.gateway.boot_lifecycle import get_boot_tracker
+    from agentos.gateway.maintenance import ChannelHealthPolicy, get_maintenance
+
+    maintenance = get_maintenance()
+    if maintenance is not None:
+        payload = maintenance.snapshot()
+        payload["active"] = True
+    else:
+        payload = {
+            "policy": ChannelHealthPolicy().to_payload(),
+            "last_sweep": None,
+            "last_thaw": None,
+            "active": False,
+        }
+    tracker = get_boot_tracker()
+    payload["safe_mode"] = tracker.snapshot() if tracker is not None else {"active": False}
+    return payload
+
+
 @_d.method("channels.status")
 async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    import time
+
     health_map = await ctx.channel_manager.health() if ctx.channel_manager else {}
+    runtime_map = await _runtime_status_map(ctx)
+    now = time.time()
     manager_types = (
         getattr(ctx.channel_manager, "_channel_types", {}) if ctx.channel_manager else {}
     )
@@ -153,6 +222,7 @@ async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[
                 "capability_profile": capability_profile,
                 "platform_manifest": platform_manifest,
                 "diagnostics": _diagnostics_payload(),
+                **_runtime_fields(runtime_map.get(name), now=now),
             }
         )
         seen.add(name)
@@ -184,10 +254,11 @@ async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[
                 "capability_profile": capability_profile,
                 "platform_manifest": platform_manifest,
                 "diagnostics": _diagnostics_payload(),
+                **_runtime_fields(runtime_map.get(name), now=now),
             }
         )
 
-    return {"channels": channels}
+    return {"channels": channels, "health_policy": _health_policy_payload()}
 
 
 def _telegram_delivery_targets(row: dict[str, Any]) -> list[dict[str, str]]:
@@ -352,6 +423,55 @@ async def _handle_channels_logout(params: dict | None, ctx: RpcContext) -> dict[
         raise KeyError(f"Channel not found: {channel_name}")
     await ctx.channel_manager.stop_channel(channel_name)
     return {"status": "disconnected", "channel": channel_name}
+
+
+@_d.method("channels.start")
+async def _handle_channels_start(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Start one channel by name, or every channel; the safe-mode override.
+
+    Without a name: leaves the gateway's safe mode (acknowledging the crashes
+    that tripped it, so the next boot does not re-enter it) and starts every
+    channel, the scheduler and the heartbeat. With a name: starts just that
+    channel and leaves safe mode as it is -- the way to find which channel
+    crashed the gateway.
+    """
+    from agentos.gateway.boot_lifecycle import get_boot_tracker
+
+    channel_name = None
+    if isinstance(params, dict):
+        channel_name = params.get("channel") or params.get("name")
+    manager = ctx.channel_manager
+    tracker = get_boot_tracker()
+    safe_mode_was_active = bool(tracker is not None and tracker.safe_mode_active)
+
+    if channel_name:
+        if manager is None or manager.get(channel_name) is None:
+            raise KeyError(f"Channel not found: {channel_name}")
+        start = getattr(manager, "start_channel", None) or manager.restart_channel
+        await start(channel_name)
+        return {
+            "status": "started",
+            "channel": channel_name,
+            "safe_mode": tracker.snapshot() if tracker is not None else {"active": False},
+        }
+
+    results: dict[str, bool] = {}
+    if safe_mode_was_active and tracker is not None:
+        # The resume hook starts the channels (and cron + heartbeat).
+        await tracker.exit_safe_mode(reason="channels.start")
+        if manager is not None:
+            errors_fn = getattr(manager, "start_errors", None)
+            errors = errors_fn() if callable(errors_fn) else {}
+            results = {name: name not in errors for name, _adapter in manager.items()}
+    elif manager is not None:
+        start_stopped = getattr(manager, "start_stopped", None)
+        results = await start_stopped() if callable(start_stopped) else {}
+    return {
+        "status": "started",
+        "channels": results,
+        "safe_mode_cleared": safe_mode_was_active,
+        "safe_mode": tracker.snapshot() if tracker is not None else {"active": False},
+    }
 
 
 @_d.method("channels.restart")

@@ -43,6 +43,8 @@ from agentos.scheduler.types import (
     ReplyTargetSnapshot,
     ScheduleKind,
     SessionTarget,
+    job_health,
+    normalize_concurrency,
     preview_summary,
 )
 from agentos.tools.policy_config import normalize_tool_profile
@@ -146,6 +148,10 @@ def _job_to_wire(j: Any, config: Any = None) -> dict[str, Any]:
         "timeout_seconds": d.get("timeout_seconds", 600),
         "wakeMode": wake_mode_str,
         "consecutive_errors": d.get("consecutive_errors", 0),
+        # Contract shared with the console's schedule view: the failure
+        # streak, the last finished run's error, and the degraded flag.
+        "health": job_health(d.get("consecutive_errors", 0), d.get("last_error")),
+        "concurrency": _concurrency_to_wire(d.get("concurrency")),
         "delivery": _delivery_to_wire(delivery),
         "toolPolicy": _tool_policy_to_wire(d.get("tool_policy")),
         # Elevation lives inside tool_policy on the job, but it is toggled
@@ -153,6 +159,18 @@ def _job_to_wire(j: Any, config: Any = None) -> dict[str, Any]:
         "elevated": cron_tool_policy_elevated(d.get("tool_policy")),
         "effectiveElevated": effective_elevated,
     }
+
+
+def _concurrency_to_wire(value: Any) -> str:
+    try:
+        return normalize_concurrency(value).value
+    except ValueError:
+        return "forbid"
+
+
+def _concurrency_from_params(params: dict[str, Any]) -> str:
+    """Validated ``concurrency`` param; a bad value is a clear ValueError."""
+    return normalize_concurrency(params.get("concurrency")).value
 
 
 def _failure_destination_to_wire(fd: Any) -> dict[str, Any] | None:
@@ -774,6 +792,8 @@ async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, An
     if not isinstance(params, dict):
         raise ValueError("params required: schedule (object) or expression (string)")
     schedule_kind, schedule_value, schedule_tz = _schedule_from_params(params)
+    if "concurrency" in params:
+        _concurrency_from_params(params)
     session_target = _resolve_session_target(params)
     payload_kind_name, payload = _build_payload(params, session_target, require_text=True)
     text = payload_text(payload, session_target)
@@ -902,6 +922,9 @@ async def _finalize_cron_add(
             jitter_seconds = float(raw_jitter)
     elif params.get("exact") is True:
         jitter_seconds = 0.0
+    extra: dict[str, Any] = {}
+    if "concurrency" in params:
+        extra["concurrency"] = _concurrency_from_params(params)
     job = await scheduler.add_job(
         name=params.get("name") or text,
         handler_key=_handler_key_for_payload_kind(payload_kind_name),
@@ -918,6 +941,7 @@ async def _finalize_cron_add(
         schedule_kind=schedule_kind,
         schedule_value=schedule_value,
         schedule_tz=tz_value,
+        **extra,
     )
     # Populate ws_topic
     if job.delivery and not job.delivery.ws_topic:
@@ -942,6 +966,8 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
     patch = {}
     if "name" in params:
         patch["name"] = params["name"]
+    if "concurrency" in params:
+        patch["concurrency"] = _concurrency_from_params(params)
 
     tz_was_supplied = "tz" in params or "timezone" in params
     if "schedule" in params or "expression" in params:

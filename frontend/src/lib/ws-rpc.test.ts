@@ -274,3 +274,70 @@ describe('keepalive and reconnect', () => {
     expect(gap).toHaveBeenCalledWith(expect.objectContaining({ reason: 'tick_timeout' }))
   })
 })
+
+describe('supervisor contract', () => {
+  function refuseStartup(ws: FakeWebSocket, retryAfterMs = 1000) {
+    ws.serverSend({ type: 'event', event: 'connect.challenge' })
+    const req = JSON.parse(ws.sent.at(-1)!)
+    ws.serverSend({
+      type: 'res',
+      id: req.id,
+      ok: false,
+      error: {
+        code: 'UNAVAILABLE',
+        message: 'Gateway is starting; retry shortly',
+        retryable: true,
+        details: { code: 'STARTUP_SIDECARS', retry_after_ms: retryAfterMs },
+      },
+    })
+  }
+
+  it('retries a handshake refused while the gateway starts, staying connecting', () => {
+    const { client, ws } = newClient()
+    const states: unknown[] = []
+    client.on('_state', (s) => states.push(s))
+    const count = FakeWebSocket.instances.length
+    refuseStartup(ws, 1200)
+    expect(client.state).toBe('connecting')
+    expect(states).not.toContain('disconnected')
+    vi.advanceTimersByTime(1199)
+    expect(FakeWebSocket.instances.length).toBe(count)
+    vi.advanceTimersByTime(1)
+    expect(FakeWebSocket.instances.length).toBe(count + 1)
+    const next = FakeWebSocket.instances.at(-1)!
+    next.serverOpen()
+    handshake(next)
+    expect(client.state).toBe('connected')
+  })
+
+  it('reconnects when an in-place restart said it would be back', () => {
+    const { client, ws } = newClient()
+    handshake(ws)
+    const count = FakeWebSocket.instances.length
+    ws.serverSend({
+      type: 'event',
+      event: 'shutdown',
+      payload: { reason: 'restart:safe', restart_expected_ms: 4000 },
+    })
+    ws.close()
+    expect(client.state).toBe('disconnected')
+    vi.advanceTimersByTime(3999)
+    expect(FakeWebSocket.instances.length).toBe(count)
+    vi.advanceTimersByTime(1)
+    expect(FakeWebSocket.instances.length).toBe(count + 1)
+  })
+
+  it('keeps the normal backoff after a terminal stop', () => {
+    const { ws } = newClient()
+    handshake(ws)
+    const count = FakeWebSocket.instances.length
+    ws.serverSend({
+      type: 'event',
+      event: 'shutdown',
+      payload: { reason: 'shutdown', restart_expected_ms: null },
+    })
+    ws.close()
+    vi.advanceTimersByTime(800)
+    expect(FakeWebSocket.instances.length).toBe(count + 1)
+  })
+})

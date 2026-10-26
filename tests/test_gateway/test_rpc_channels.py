@@ -66,8 +66,17 @@ async def test_channels_status_includes_configured_channels_without_manager():
             "capability_profile": None,
             "platform_manifest": None,
             "diagnostics": {"network_probe": "not_run"},
+            # No channel manager: no runtime view for the health sweep.
+            "state": None,
+            "last_event_at": None,
+            "terminal_reason": None,
+            "start_error": None,
         }
     ]
+    policy = rpc_res.payload["health_policy"]
+    assert policy["active"] is False
+    assert policy["policy"]["sweep_interval_s"] == 300.0
+    assert policy["safe_mode"] == {"active": False}
 
 
 @pytest.mark.asyncio

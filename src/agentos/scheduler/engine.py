@@ -14,6 +14,7 @@ from .persistence import JobStore
 from .reaper import SessionReaper
 from .timer import SchedulerTimer
 from .types import (
+    ConcurrencyPolicy,
     CronJob,
     CronWakeMode,
     DeliveryConfig,
@@ -27,6 +28,9 @@ from .types import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Default for ``[scheduler] startup_agent_delay_seconds``.
+DEFAULT_STARTUP_AGENT_DELAY_SECONDS = 120.0
 
 
 def _next_run(expr: CronExpression, after: datetime, jitter: float = 0.0) -> datetime:
@@ -86,6 +90,11 @@ class SchedulerEngine:
             max_concurrent=cfg.get("max_concurrent_runs", 3),
             max_catchup=cfg.get("max_catchup_jobs", 5),
             reaper=self._reaper,
+            # Missed agent jobs wait this long after boot so they do not
+            # compete with channel start-up ([scheduler] in config.toml).
+            startup_agent_delay_seconds=float(
+                cfg.get("startup_agent_delay_seconds", DEFAULT_STARTUP_AGENT_DELAY_SECONDS)
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -130,6 +139,7 @@ class SchedulerEngine:
         jitter_seconds: float | None = None,
         creator_session_key: str = "",
         creator_sender_id: str = "",
+        concurrency: ConcurrencyPolicy | str = ConcurrencyPolicy.FORBID,
     ) -> CronJob:
         """Create and persist a new job; compute initial next_run_at.
 
@@ -156,6 +166,7 @@ class SchedulerEngine:
             schedule_kind=schedule_kind,
             schedule_value=schedule_value,
             schedule_tz=schedule_tz,
+            concurrency=concurrency,
         )
         self._timer.nudge()
         return job
@@ -170,6 +181,10 @@ class SchedulerEngine:
         if result is not None:
             self._timer.nudge()
         return result
+
+    def nudge(self) -> None:
+        """Wake the timer loop now, e.g. after the gateway noticed a thaw."""
+        self._timer.nudge()
 
     async def pause_job(self, job_id: str) -> CronJob | None:
         """Pause a job."""

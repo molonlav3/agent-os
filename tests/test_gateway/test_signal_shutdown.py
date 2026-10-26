@@ -124,7 +124,11 @@ def test_sigterm_drains_broadcasts_shutdown_and_exits_zero(tmp_path: Path) -> No
 
     assert proc.returncode == 0, output
     shutdown = [frame for frame in frames if frame.get("event") == "shutdown"]
-    assert shutdown and shutdown[0]["payload"] == {"reason": "signal:SIGTERM"}
+    # A signal is a terminal stop: no restart estimate (supervisor contract).
+    assert shutdown and shutdown[0]["payload"] == {
+        "reason": "signal:SIGTERM",
+        "restart_expected_ms": None,
+    }
     assert close_code == 1012
     assert "gateway.shutdown_signal" in output
     assert "gateway.mcp_clients_closed" in output

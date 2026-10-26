@@ -18,6 +18,7 @@ from agentos.cli.gateway_auth_prompt import (
     provision_public_bind_auth,
 )
 from agentos.cli.gateway_lifecycle import (
+    UNMANAGED_GATEWAY_RUNNING,
     GatewayLifecycleManager,
     GatewayLifecycleResult,
     remote_gateway_status,
@@ -25,8 +26,14 @@ from agentos.cli.gateway_lifecycle import (
 from agentos.cli.ui import ACCENT_MARKUP, console
 from agentos.cli_quoting import config_cli_arg
 from agentos.gateway.boot import start_gateway_server
-from agentos.gateway.config import GatewayConfig, is_public_bind, resolve_listen_address
+from agentos.gateway.config import (
+    GatewayConfig,
+    GatewayConfigError,
+    is_public_bind,
+    resolve_listen_address,
+)
 from agentos.gateway.config_persist import read_raw_bind_overrides, set_runtime_overrides
+from agentos.gateway.readiness import EX_CONFIG
 from agentos.paths import default_agentos_home
 
 
@@ -35,8 +42,11 @@ def _stdin_isatty() -> bool:
     return sys.stdin.isatty()
 
 
-def _load_config_or_exit(config_path: str | None) -> GatewayConfig:
-    """Load the gateway config, or exit 2 with one line naming the bad setting.
+def _load_config_or_exit(config_path: str | None, *, exit_code: int = 2) -> GatewayConfig:
+    """Load the gateway config, or exit ``exit_code`` with one line naming the bad setting.
+
+    ``gateway run`` passes ``EX_CONFIG`` (78), the supervisor contract's
+    "repair the config, then retry"; every other command keeps ``2``.
 
     A value that fails validation -- from the config file or from an
     ``AGENTOS_GATEWAY_*`` override, which is what ``agentos config set``
@@ -45,10 +55,19 @@ def _load_config_or_exit(config_path: str | None) -> GatewayConfig:
     with the environment variable named when one is set for that key, since
     that is the setting the operator has to fix or unset.
     """
+    import tomllib
+
     from pydantic import ValidationError
 
     try:
         return GatewayConfig.load(config_path or os.environ.get("AGENTOS_GATEWAY_CONFIG_PATH"))
+    except tomllib.TOMLDecodeError as exc:
+        console.print(
+            "[red]AgentOS config error:[/red] the config file is not valid TOML: "
+            + escape(str(exc)),
+            soft_wrap=True,
+        )
+        raise typer.Exit(exit_code) from exc
     except ValidationError as exc:
         console.print("[red]AgentOS config error:[/red] the gateway configuration is invalid")
         for error in exc.errors():
@@ -58,7 +77,7 @@ def _load_config_or_exit(config_path: str | None) -> GatewayConfig:
             source = f" (set by {env_key})" if env_key in os.environ else ""
             # soft_wrap keeps the variable name on one line so it stays copy-pasteable.
             console.print(f"  {escape(loc)}: {escape(reason)}{escape(source)}", soft_wrap=True)
-        raise typer.Exit(2) from exc
+        raise typer.Exit(exit_code) from exc
 
 
 def gateway_startup_guidance(host: str, port: int, scheme: str = "http") -> tuple[str, ...]:
@@ -92,8 +111,14 @@ def run_gateway(
     matching what the field name promises.
     """
     # Load config FIRST so its ``host`` field can act as the final
-    # fallback below ``AGENTOS_GATEWAY_HOST``.
-    config = _load_config_or_exit(config_path)
+    # fallback below ``AGENTOS_GATEWAY_HOST``. A config that does not load is
+    # EX_CONFIG (78): a supervisor repairs it before trying again.
+    try:
+        config = _load_config_or_exit(config_path, exit_code=EX_CONFIG)
+    except typer.Exit as exc:
+        if exc.exit_code == EX_CONFIG:
+            _service_config_backoff()
+        raise
     if config_path and not config.config_path:
         config.config_path = str(config_path)
     # Treat the CLI ``--bind`` default as "not explicitly supplied" so the
@@ -149,11 +174,16 @@ def run_gateway(
         # build_services() inside start_gateway_server handles:
         # session_manager, provider_selector, tool_registry, usage_tracker,
         # memory, skills, scheduler, search, MCP discovery.
-        server = await start_gateway_server(
-            config=config,
-            subscription_manager=subscription_mgr,
-            run=True,
-        )
+        try:
+            server = await start_gateway_server(
+                config=config,
+                subscription_manager=subscription_mgr,
+                run=True,
+            )
+        except BaseException as exc:
+            _record_startup_failure(exc)
+            raise
+        _clear_service_config_failures()
         assert server._task is not None
         try:
             await server._task
@@ -183,6 +213,14 @@ def run_gateway(
         asyncio.run(_run())
         _exec_pending_restart()
         console.print("[yellow]Gateway stopped.[/yellow]")
+    except GatewayConfigError as exc:
+        # Refused public bind, failed schema migration: only a config change
+        # fixes these, so a supervisor must not just restart (systemd's
+        # RestartPreventExitStatus=78; the desktop runs doctor, then retries).
+        console.print(f"[red]Gateway could not start:[/red] {exc}")
+        console.print("Inspect: agentos doctor")
+        _service_config_backoff()
+        raise typer.Exit(code=EX_CONFIG) from exc
     except ValueError as exc:
         from agentos.onboarding.next_steps import env_recovery_commands
         from agentos.onboarding.status import get_onboarding_status
@@ -224,6 +262,57 @@ def run_gateway(
         raise typer.Exit(code=1) from exc
     except KeyboardInterrupt:
         console.print("\n[yellow]Gateway stopped.[/yellow]")
+
+
+def _service_config_failures_path() -> Path:
+    from agentos.paths import state_dir
+
+    return state_dir("gateway", "service-config-failures.json")
+
+
+def _service_config_backoff() -> None:
+    """Under launchd, slow an exit-78 respawn loop down (see gateway_service)."""
+    from agentos.cli.gateway_service import config_failure_backoff
+
+    config_failure_backoff(
+        counter_path=_service_config_failures_path(),
+        emit=lambda message: console.print(f"[yellow]{escape(message)}[/yellow]", soft_wrap=True),
+    )
+
+
+def _clear_service_config_failures() -> None:
+    from agentos.cli.gateway_service import clear_config_failures
+
+    clear_config_failures(_service_config_failures_path())
+
+
+def _with_service_hint(result: GatewayLifecycleResult) -> GatewayLifecycleResult:
+    """Say so when the gateway that answers belongs to the installed service."""
+    if result.code != UNMANAGED_GATEWAY_RUNNING:
+        return result
+    try:
+        from agentos.cli.gateway_service import service_stop_hint
+
+        service = _deep_service_status()
+        port = service.get("port")
+        if port is not None and port != result.port:
+            return result
+        hint = service_stop_hint(service)
+    except Exception:  # noqa: BLE001 - the hint is a courtesy
+        return result
+    if hint:
+        result.message = f"{result.message} {hint}"
+        result.details = {**result.details, "service": service}
+    return result
+
+
+def _record_startup_failure(exc: BaseException) -> None:
+    """A boot that raised before serving is not a crash loop safe mode can stop."""
+    from agentos.gateway.boot_lifecycle import get_boot_tracker
+
+    tracker = get_boot_tracker()
+    if tracker is not None:
+        tracker.mark_startup_failed(f"{type(exc).__name__}: {exc}")
 
 
 def _exec_pending_restart() -> None:
@@ -295,7 +384,7 @@ def start_gateway(
         config_path=config_path,
         health_timeout=health_timeout,
     )
-    _emit_lifecycle_result(manager.start(), json_output=json_output)
+    _emit_lifecycle_result(_with_service_hint(manager.start()), json_output=json_output)
 
 
 def gateway_handshake_version(
@@ -333,11 +422,95 @@ def gateway_handshake_version(
         return None
 
 
+def gateway_runtime_probe(
+    *,
+    http_base: str,
+    gateway_url: str | None = None,
+    config_path: str | None = None,
+) -> dict[str, Any] | None:
+    """The running gateway's supervisor-contract numbers, or ``None``.
+
+    ``gateway.status`` over one handshake (no startup wait) for the
+    authenticated fields (``active_turns``); the public ``/ready`` when the
+    RPC is unavailable (a booting or older gateway). Never raises.
+    """
+    from agentos.cli import gateway_client as gcm
+    from agentos.cli.gateway_rpc import _target_gateway_url, default_gateway_token
+
+    async def _go() -> dict[str, Any] | None:
+        client = gcm.GatewayClient()
+        try:
+            url = _target_gateway_url(gateway_url=gateway_url, config_path=config_path)
+            await client.connect(url, token=default_gateway_token(config_path), startup_wait_s=0)
+            payload = await client.call("gateway.status", {})
+            return payload if isinstance(payload, dict) else None
+        except (gcm.GatewayRPCError, SystemExit, ConnectionError, OSError):
+            return None
+        finally:
+            await client.close()
+
+    try:
+        runtime = asyncio.run(_go())
+    except Exception:  # noqa: BLE001 - status must never crash on a probe
+        runtime = None
+    return runtime if runtime is not None else _ready_probe(http_base)
+
+
+def _ready_probe(http_base: str) -> dict[str, Any] | None:
+    """``GET /ready`` (public): state/failing/safe_mode, no active turn count."""
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    request = Request(f"{http_base.rstrip('/')}/ready", method="GET")
+    try:
+        with urlopen(request, timeout=1.0) as response:  # noqa: S310 - operator's own gateway
+            body = response.read()
+    except HTTPError as exc:
+        body = exc.read() if exc.code == 503 else b""
+    except (OSError, URLError, TimeoutError):
+        return None
+    try:
+        payload = json.loads(body or b"null")
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or "ready" not in payload:
+        return None
+    payload.setdefault("active_turns", None)
+    return payload
+
+
+def _runtime_fields(runtime: dict[str, Any] | None) -> dict[str, Any]:
+    """``drain_budget_ms`` / ``active_turns`` / ``runtime`` for ``status --json``.
+
+    The lifecycle ``state`` (running, unmanaged, not_started, ...) keeps the
+    top-level ``state`` key; the gateway's own readiness state is
+    ``runtime.state`` (starting, ready, draining, safe_mode).
+    """
+    from agentos.gateway.readiness import drain_budget_ms
+
+    if runtime is None:
+        return {"drain_budget_ms": drain_budget_ms(), "active_turns": None, "runtime": None}
+    budget = runtime.get("drain_budget_ms")
+    return {
+        "drain_budget_ms": int(budget) if isinstance(budget, int) else drain_budget_ms(),
+        "active_turns": runtime.get("active_turns"),
+        "runtime": {
+            "state": runtime.get("state"),
+            "ready": runtime.get("ready"),
+            "failing": runtime.get("failing") or [],
+            "safe_mode": runtime.get("safe_mode") or {"active": False},
+            "startup": runtime.get("startup"),
+        },
+    }
+
+
 def _emit_status_with_versions(
     result: GatewayLifecycleResult,
     *,
     gateway_version: str | None,
     json_output: bool,
+    runtime: dict[str, Any] | None = None,
+    service: dict[str, Any] | None = None,
 ) -> None:
     """Emit a status result annotated with BOTH versions + a skew diagnostic."""
 
@@ -345,12 +518,16 @@ def _emit_status_with_versions(
 
     cli_version = __version__
     mismatch = bool(gateway_version and gateway_version != cli_version)
+    runtime_fields = _runtime_fields(runtime)
 
     if json_output:
         payload = result.to_payload()
         payload["cliVersion"] = cli_version
         payload["gatewayVersion"] = gateway_version
         payload["versionMismatch"] = mismatch
+        payload.update(runtime_fields)
+        if service is not None:
+            payload["service"] = service
         typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
     else:
         if result.ok:
@@ -359,6 +536,23 @@ def _emit_status_with_versions(
             typer.echo(f"Error: {result.message or result.code or result.state}", err=True)
         typer.echo(f"CLI version:     {cli_version}")
         typer.echo(f"Gateway version: {gateway_version or 'unknown (not running / unreachable)'}")
+        live = runtime_fields["runtime"]
+        if live is not None:
+            turns = runtime_fields["active_turns"]
+            typer.echo(
+                f"Gateway state:   {live.get('state')}"
+                + (f" (active turns: {turns})" if turns is not None else "")
+                + f", drain budget {runtime_fields['drain_budget_ms'] // 1000}s"
+            )
+            safe_mode = live.get("safe_mode") or {}
+            if safe_mode.get("active"):
+                typer.echo(
+                    f"Safe mode:       {safe_mode.get('reason')}; clears at "
+                    f"{safe_mode.get('clears_at')} (override: agentos channels start --yes)",
+                    err=True,
+                )
+        if service is not None:
+            _echo_service_status(service)
         if mismatch:
             typer.echo(
                 "⚠ Version mismatch — the running gateway does not match the installed "
@@ -370,6 +564,23 @@ def _emit_status_with_versions(
         raise typer.Exit(code=result.exit_code)
 
 
+def _echo_service_status(service: dict[str, Any]) -> None:
+    if not service.get("supported"):
+        typer.echo(f"Service:         {service.get('message')}")
+        return
+    loaded = service.get("loaded", service.get("active"))
+    state = "installed" if service.get("installed") else "not installed"
+    if service.get("installed") or loaded:
+        state += ", loaded" if loaded else ", not loaded"
+    typer.echo(f"Service:         {service.get('label')} ({state}) {service.get('path')}")
+
+
+def _deep_service_status() -> dict[str, Any]:
+    from agentos.cli.gateway_service import detect_platform, service_status
+
+    return service_status(detect_platform(), home=Path.home())
+
+
 def status_gateway(
     port: int | None = typer.Option(18791, "--port", "-p", help="Port to inspect"),
     bind: str | None = typer.Option("127.0.0.1", "--bind", "-b", help="Host to inspect"),
@@ -377,25 +588,54 @@ def status_gateway(
     config_path: str | None = typer.Option(None, "--config", help="Override config path"),
     gateway_url: str | None = typer.Option(None, "--gateway", help="Remote gateway URL"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    deep: bool = False,
 ) -> None:
     """Inspect the managed gateway process without mutating state.
 
     Reports BOTH the installed CLI version and the running gateway's
-    RPC-reported version; a mismatch appends a restart diagnostic.
+    RPC-reported version; a mismatch appends a restart diagnostic. A live
+    gateway also reports its readiness state, active turns and drain budget;
+    ``deep`` adds the installed launchd/systemd service, if any.
     """
 
+    service = _deep_service_status() if deep else None
     if gateway_url:
         result = remote_gateway_status(gateway_url)
         version = gateway_handshake_version(gateway_url=gateway_url) if result.ok else None
-        _emit_status_with_versions(result, gateway_version=version, json_output=json_output)
+        runtime = (
+            gateway_runtime_probe(http_base=result.url, gateway_url=gateway_url)
+            if result.ok
+            else None
+        )
+        _emit_status_with_versions(
+            result,
+            gateway_version=version,
+            json_output=json_output,
+            runtime=runtime,
+            service=service,
+        )
         return
 
     manager = _lifecycle_manager(port=port, bind=bind, listen=listen, config_path=config_path)
     result = manager.status()
     version = None
+    runtime = None
     if result.ok and result.state in ("running", "unmanaged"):
-        version = gateway_handshake_version(config_path=config_path)
-    _emit_status_with_versions(result, gateway_version=version, json_output=json_output)
+        # Probe the gateway this command inspects (``--port``/``--listen``),
+        # not the one the config file points at.
+        http_base = result.health_url.rsplit("/health", 1)[0]
+        ws_url = "ws" + http_base[len("http") :] + "/ws"
+        version = gateway_handshake_version(gateway_url=ws_url, config_path=config_path)
+        runtime = gateway_runtime_probe(
+            http_base=http_base, gateway_url=ws_url, config_path=config_path
+        )
+    _emit_status_with_versions(
+        result,
+        gateway_version=version,
+        json_output=json_output,
+        runtime=runtime,
+        service=service,
+    )
 
 
 def stop_gateway(
@@ -415,7 +655,7 @@ def stop_gateway(
         config_path=config_path,
         shutdown_timeout=shutdown_timeout,
     )
-    _emit_lifecycle_result(manager.stop(), json_output=json_output)
+    _emit_lifecycle_result(_with_service_hint(manager.stop()), json_output=json_output)
 
 
 class _RestartRpcRefusedError(Exception):

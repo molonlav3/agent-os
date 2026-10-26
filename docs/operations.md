@@ -112,6 +112,41 @@ understand actual runtime behavior.
 
 For cost investigation workflow, see [`usage-and-cost.md`](usage-and-cost.md).
 
+## Always-On Gateway
+
+For a gateway that should keep running unattended (a home server, a laptop
+that sleeps), install it as a user service and let it watch itself:
+
+```sh
+agentos gateway install --port 18791
+agentos gateway status --deep --json
+curl -s http://127.0.0.1:18791/ready
+agentos channels status --json
+```
+
+- **Restarts.** launchd (macOS) or systemd (Linux) restarts the gateway when it
+  dies; a configuration error (exit `78`) is not restarted into a loop by
+  systemd. See [Run as a service](gateway.md#run-as-a-service).
+- **Crash loops.** Three unclean boots in five minutes start the gateway in
+  safe mode: channels, cron and heartbeat are held back, `/ready` reports
+  `state: "safe_mode"`, and `agentos doctor` names the way out. Fix the cause,
+  then `agentos channels start --yes`, or let it clear by itself after five
+  quiet minutes.
+- **Sleep.** After the machine wakes, the gateway restarts idle channels
+  (`gateway.thaw` in the log; a restart that fails while the network comes
+  back is retried with backoff) and runs each overdue cron job once. A
+  5-minute health sweep restarts channels that are `disconnected`, `stuck`,
+  `start_failed` or `stale-socket`; one stopped on bad credentials
+  (`terminal`) waits for you — doctor shows the fix.
+- **Missed jobs.** Agent jobs missed while the gateway was down run
+  `[scheduler] startup_agent_delay_seconds` (default 120) after boot; see
+  [`scheduling.md`](scheduling.md).
+- **Stopping.** A stop drains active turns for up to 30 s, then cancels the
+  rest (`drain_budget_ms` in `agentos gateway status --json`); the service
+  units allow 54 s (the worst-case stop plus a margin) before they kill. Stop a service-run gateway through the
+  service (`agentos gateway stop` tells you how) or remove it with
+  `agentos gateway uninstall`.
+
 ## Diagnostics
 
 Diagnostics help explain runtime behavior without changing the core task.
@@ -247,6 +282,7 @@ For a confusing install or runtime:
 ```sh
 agentos doctor
 agentos gateway status
+agentos gateway status --deep --json
 agentos providers list
 agentos search list
 agentos channels types

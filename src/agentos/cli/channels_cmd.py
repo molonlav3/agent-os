@@ -112,6 +112,8 @@ def _render_status_table(payload: dict[str, Any], *, name: str | None = None) ->
     table.add_column("Enabled")
     table.add_column("Configured")
     table.add_column("Restart attempts", justify="right")
+    table.add_column("State")
+    table.add_column("Reason")
     for row in rows:
         table.add_row(
             str(row.get("name") or ""),
@@ -121,8 +123,22 @@ def _render_status_table(payload: dict[str, Any], *, name: str | None = None) ->
             str(row.get("enabled") or False),
             str(row.get("configured") or False),
             str(row.get("restart_attempts") or 0),
+            str(row.get("state") or "-"),
+            str(row.get("terminal_reason") or row.get("start_error") or ""),
         )
-    Console(width=180, force_terminal=False).print(table)
+    console = Console(width=180, force_terminal=False)
+    console.print(table)
+    policy = payload.get("health_policy") if isinstance(payload, dict) else None
+    safe_mode = policy.get("safe_mode") if isinstance(policy, dict) else None
+    if isinstance(safe_mode, dict) and safe_mode.get("active"):
+        console.print(
+            f"Safe mode: on ({safe_mode.get('reason') or 'repeated unclean boots'}); "
+            f"channels are held back until {safe_mode.get('clears_at') or 'it clears'}. "
+            "Start them now: agentos channels start --yes",
+            soft_wrap=True,
+        )
+    elif isinstance(safe_mode, dict):
+        console.print("Safe mode: off")
 
 
 def _filter_status_rows(payload: dict[str, Any], name: str | None) -> list[dict[str, Any]]:
@@ -310,6 +326,49 @@ def channels_status(
         print_json(payload)
         return
     _render_status_table(payload)
+
+
+@channels_app.command("start")
+def channels_start(
+    name: str | None = typer.Argument(
+        None, help="Channel to start; omit to start every channel and leave safe mode"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    config_path: Path | None = typer.Option(None, "--config", help="Override config path."),
+) -> None:
+    """Start channels on the running gateway; the override for its safe mode.
+
+    Without a name every stopped channel starts, and a gateway in safe mode
+    (repeated unclean boots) leaves it: cron and heartbeat resume too. With a
+    name only that channel starts, to find which one crashes the gateway.
+    """
+
+    prompt = (
+        f"Start channel {name!r}?"
+        if name
+        else "Start every channel (and leave safe mode if the gateway is in it)?"
+    )
+    confirm_or_exit(prompt, yes=yes, json_output=json_output)
+
+    async def _run(client):
+        return await client.call("channels.start", {"name": name} if name else {})
+
+    payload = run_gateway_sync(_run, json_output=json_output, config_path=config_path)
+    if json_output:
+        print_json(payload)
+        return
+    if name:
+        typer.echo(f"Channel started: {payload.get('channel', name)}")
+        return
+    results = payload.get("channels") or {}
+    started = sorted(n for n, ok in results.items() if ok)
+    failed = sorted(n for n, ok in results.items() if not ok)
+    if payload.get("safe_mode_cleared"):
+        typer.echo("Safe mode cleared; channels, cron and heartbeat resumed.")
+    typer.echo(f"Channels started: {', '.join(started) if started else 'none'}")
+    if failed:
+        typer.echo(f"Channels failed: {', '.join(failed)}", err=True)
 
 
 @channels_app.command("restart")

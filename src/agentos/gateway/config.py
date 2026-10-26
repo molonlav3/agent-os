@@ -2229,6 +2229,20 @@ class GatewayControlConfig(BaseModel):
     chat_restart: bool = False
 
 
+class SchedulerConfig(BaseModel):
+    """Cron scheduler behaviour that is not per-job (``[scheduler]``).
+
+    ``startup_agent_delay_seconds`` holds back the agent jobs a boot finds
+    overdue (missed while the gateway was down or the machine slept), so
+    they do not compete with channel start-up for the model budget. Jobs
+    that do not run a model turn are caught up at once, as before.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    startup_agent_delay_seconds: float = Field(default=120.0, ge=0)
+
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -2530,6 +2544,7 @@ class GatewayConfig(BaseSettings):
 
     updates: UpdatesConfig = Field(default_factory=UpdatesConfig)
     gateway_control: GatewayControlConfig = Field(default_factory=GatewayControlConfig)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     trading: TradingConfig = Field(default_factory=TradingConfig)
 
     # Component enable flags
@@ -3025,6 +3040,16 @@ def _mode_protects_public_bind(auth: AuthConfig) -> bool:
     return auth.mode in ("token", "trusted-proxy")
 
 
+class GatewayConfigError(ValueError):
+    """A startup failure only a configuration change can fix.
+
+    ``agentos gateway run`` exits ``78`` (``EX_CONFIG``) on it instead of
+    ``1``, so a supervisor can tell "repair the config, then retry" from
+    "this crashed, restarting may help": the refused public bind, a schema
+    migration that cannot apply, a config file that does not parse.
+    """
+
+
 def enforce_public_bind_auth_guard(config: GatewayConfig) -> None:
     """Refuse every unauthenticated non-loopback listener."""
 
@@ -3034,7 +3059,7 @@ def enforce_public_bind_auth_guard(config: GatewayConfig) -> None:
         return
     if is_loopback_bind(config.host):
         return
-    raise ValueError(
+    raise GatewayConfigError(
         f"Refusing to serve: auth.mode={config.auth.mode!r} does not enforce "
         f"credentials on a non-loopback bind {config.host!r}. "
         "Anyone who can reach this port would get full access to chat, sessions, "

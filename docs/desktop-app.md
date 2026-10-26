@@ -216,6 +216,17 @@ The full list is in Settings › Shortcuts.
 - **"The gateway is not running."** Start it from the sidebar, or open
   Settings › Gateway for Start, Stop and Restart and the endpoint. See
   [Gateway](gateway.md).
+- **"Gateway exited with a configuration error (exit 78)."** The gateway the
+  app started refused its configuration (a config file that does not parse
+  or validate, a migration that cannot apply). The app does not change your
+  configuration: `agentos doctor` has no automatic fix, so the app runs
+  `agentos doctor --json` once to name the problem (the first error finding
+  and its fix command appear in Settings › Gateway and the sidebar tooltip),
+  retries the start once in case it was already fixed, and then shows the
+  error. Fix what doctor names, then press Start.
+- **Gateway shows "starting" for a few seconds.** The app reports the
+  gateway running once its `/ready` probe answers, after the channels have
+  started; until then the chat keeps connecting on its own.
 - **Install failed.** The failure screen offers Retry, Copy output and Show
   log in Finder; the log is in `~/.agentos/logs/bootstrap-<timestamp>.log`.
 - **Copy diagnostics** in Settings › Advanced copies a report with the

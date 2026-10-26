@@ -112,7 +112,8 @@ def test_gateway_run_reports_a_bad_env_override_in_one_line(
 
     result = runner.invoke(app, ["gateway", "run", "--port", "18999"])
 
-    assert result.exit_code == 2, result.output
+    # 78 = EX_CONFIG: the supervisor contract's "repair the config, then retry".
+    assert result.exit_code == 78, result.output
     assert "AgentOS config error" in result.output
     assert "tools.profile:" in result.output
     assert "(set by AGENTOS_GATEWAY_TOOLS__PROFILE)" in result.output
@@ -126,7 +127,7 @@ def test_gateway_run_reports_a_bad_value_in_the_config_file(tmp_path: Path) -> N
 
     result = runner.invoke(app, ["gateway", "run", "--config", str(config_file)])
 
-    assert result.exit_code == 2, result.output
+    assert result.exit_code == 78, result.output
     assert "tools.profile:" in result.output
     assert "(set by" not in result.output, "no env var is involved; do not blame one"
     assert "Traceback" not in result.output
@@ -149,6 +150,6 @@ def test_every_error_is_listed_not_just_the_first(monkeypatch: pytest.MonkeyPatc
 
     result = runner.invoke(app, ["gateway", "run", "--port", "18999"])
 
-    assert result.exit_code == 2
+    assert result.exit_code == 78
     assert "tools.profile:" in result.output
     assert "permissions.default_mode:" in result.output

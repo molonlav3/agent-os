@@ -78,7 +78,7 @@ lockout_seconds = 300
 exempt_loopback = true
 ```
 
-`/health` and `/ready` never require a token. Cross-origin browser requests are
+`/health`, `/ready` and `/startupz` never require a token. Cross-origin browser requests are
 governed by CORS configuration regardless of auth mode.
 
 ## Liveness and Readiness
@@ -86,9 +86,12 @@ governed by CORS configuration regardless of auth mode.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health`, `/healthz` | Liveness probe — `{"ok": true, "status": "live"}`. |
-| `GET` | `/ready`, `/readyz` | Readiness probe — `503` until the gateway is ready. |
+| `GET` | `/ready`, `/readyz` | Readiness probe — `{ready, state, failing, startup, safe_mode, drain_budget_ms, uptime_ms}`; `state` is `starting`, `ready`, `draining` or `safe_mode`. `503` while starting or draining, `200` when ready and in safe mode. `failing` also lists down channels as `channel:<name>` without making the gateway unready. The older `status` field mirrors `state`. |
+| `GET` | `/startupz` | Startup probe — `200` once every boot sidecar settled (channels started, router preloaded), `503` with the `pending` list before. |
 
 These require no auth and are safe for load balancers and container probes.
+The full supervisor contract (WebSocket refusal during boot, the `shutdown`
+event, exit code `78`) is in [`gateway.md`](gateway.md#supervisor-contract).
 
 ## Core Endpoints
 
@@ -202,10 +205,13 @@ uses this transport.
    current protocol is `3`; send `minProtocol = maxProtocol = 3`. `client` is
    informational, `{id, version, platform, mode}`, every field optional.
    `auth.token` carries the gateway token.
+   While the gateway is still booting, `connect` is answered with a retryable
+   `UNAVAILABLE` (`details.code: "STARTUP_SIDECARS"`, `retry_after_ms`) and the
+   socket closes `1013`; retry after `retry_after_ms`.
 3. The server answers with a bare `hello-ok` frame (not a `res`) carrying
    `features.methods`, `features.events`, `features.capabilities` (additive
    feature names such as `typed-errors`, `challenge-ts`, `auth-rate-limit`,
-   `rpc-http`; treat an unknown one as absent), `policy` and
+   `rpc-http`, `supervisor-contract`; treat an unknown one as absent), `policy` and
    `auth.nonce` (the challenge nonce, so a client can check it answered its
    own challenge).
 

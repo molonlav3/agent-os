@@ -1334,6 +1334,22 @@ which chat restarts are accepted. Environment override:
 `AGENTOS_GATEWAY_GATEWAY_CONTROL__CHAT_RESTART=true`. In-place restart is not
 available on Windows.
 
+## Scheduler
+
+```toml
+[scheduler]
+startup_agent_delay_seconds = 120   # 0 = run missed agent jobs at boot
+```
+
+Cron jobs missed while the gateway was down are caught up at boot (at most 5,
+staggered over 10 seconds). Missed agent jobs — an agent turn, or a main-session
+system event — wait `startup_agent_delay_seconds` first so they do not compete
+with channel start-up for the model; reminders and script jobs run at once. The
+wait is stored as the job's next run time, so `agentos cron list` shows it.
+Restart the gateway after changing it. Environment override:
+`AGENTOS_GATEWAY_SCHEDULER__STARTUP_AGENT_DELAY_SECONDS=300`. See
+[Scheduling](scheduling.md#sleep-restarts-and-clock-changes).
+
 ## Update Notifications
 
 On commands that connect to the gateway, the CLI checks PyPI at most once every

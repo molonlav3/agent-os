@@ -26,7 +26,7 @@ log = structlog.get_logger(__name__)
 # Endpoints that carry no credentials and expose no Control surface; exempt from
 # both token auth and the cross-origin guard. Kept module-level so the origin
 # guard (defined before AuthMiddleware) and AuthMiddleware share one source.
-_PUBLIC_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz"})
+_PUBLIC_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/startupz"})
 
 # The RPC/API surface the cross-origin guard exists to protect. A UI base_path
 # that overlaps this must NOT be trusted as an exemption prefix.

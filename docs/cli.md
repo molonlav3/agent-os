@@ -61,15 +61,48 @@ Web UI and gateway:
 agentos gateway run
 agentos gateway start --json
 agentos gateway status
+agentos gateway status --deep --json
 agentos gateway restart
 agentos gateway stop
+agentos gateway install --port 18791
+agentos gateway uninstall
 ```
 
 `agentos gateway status` (and `--json`) reports **both** the installed CLI
 version (`cliVersion`) and the running gateway's version (`gatewayVersion`);
 when they differ it sets `versionMismatch` and prints a diagnostic advising a
 restart — the normal state right after a package upgrade with `--no-restart`,
-or after a manual upgrade.
+or after a manual upgrade. `--json` also carries `drain_budget_ms` (32000:
+30 s to drain turns plus 2 s to cancel), `active_turns` (turns running now;
+`null` when the gateway is not reachable) and `runtime` — the gateway's
+readiness `state` (`starting`, `ready`, `draining`, `safe_mode`), `failing`
+and `safe_mode`. The top-level `state` stays the process state (`running`,
+`unmanaged`, `not_started`, `stale`, ...). `--deep` adds `service`: whether
+`agentos gateway install` put a unit in place and whether it is loaded.
+
+`agentos gateway run` exits `78` (`EX_CONFIG`) when only a configuration
+change can fix the start — a config file that does not parse or validate, a
+schema migration that cannot apply, a public bind without auth — and `1` for
+other failures. See [Supervisor contract](gateway.md#supervisor-contract).
+
+`agentos gateway install [--port N] [--config PATH] [--no-start] [--json]`
+runs the gateway as a user service that restarts it when it dies: a
+LaunchAgent (`dev.useagentos.gateway`) on macOS, a systemd user unit
+(`agentos-gateway.service`) on Linux; not supported on Windows (exit 1). Both
+units allow a stop 54 s (`ExitTimeOut` / `TimeoutStopSec`): the gateway's
+worst-case drain and teardown plus a 10 s margin. It
+refuses when a different unit with the same name exists (run
+`agentos gateway uninstall` first) and is a no-op for the same unit.
+`--no-start` writes the unit without loading it. `agentos gateway uninstall
+[--json]` stops and removes it, and succeeds when nothing is installed.
+`agentos gateway stop` cannot stop a service-run gateway (the service would
+start it again): it exits 3 and names the `launchctl bootout` /
+`systemctl --user stop` command and `gateway uninstall`. Under launchd a
+config error (exit 78) waits 5 s, doubling up to 5 minutes, before exiting,
+so the LaunchAgent does not respawn a broken config every 10 s. A
+gateway that crashes three times in five minutes starts in safe mode
+(channels, cron and heartbeat held back); see
+[Run as a service](gateway.md#run-as-a-service).
 
 `agentos gateway stop` sends SIGTERM, which runs the gateway's orderly
 shutdown (turns in flight get up to 30 seconds, then channels stop and
@@ -638,8 +671,25 @@ agentos channels logout personal -y
 agentos channels enable personal
 agentos channels disable personal
 agentos channels restart personal
+agentos channels start --yes
+agentos channels start personal --yes
 agentos channels remove personal
 ```
+
+`agentos channels start [NAME] [--yes] [--json]` starts channels on the
+running gateway. Without a name it starts every channel that is not running
+and, when the gateway is in safe mode (three unclean boots in five minutes),
+leaves it: cron and heartbeat resume too, and the recorded crashes stop
+counting. With a name it starts only that channel and keeps safe mode on for
+the rest. `agentos channels status` shows each channel's runtime `state`
+(`connected`, `disconnected`, `stale-socket`, `stuck`, `retrying`,
+`start_failed`, `stopped`, `terminal`, `blocked`), why it is down, and
+whether safe mode is on; `--json` adds `last_event_at`, `terminal_reason`,
+`start_error`, and the gateway's automatic restart policy with its last
+health sweep and sleep/thaw under `health_policy`. A failed automatic restart
+is retried with backoff (`retrying`) and later by the sweep; only a
+`terminal` channel (bad credentials) or a `blocked` one is never restarted
+automatically — fix it with `channels edit`, then `channels restart`.
 
 `native-commands` prints the native platform payload derived from the same
 channel command registry used for text `/command` dispatch. Telegram and
@@ -1604,6 +1654,26 @@ Practical shape: one skill and one narrow task per elevated job, a tight
 `--timeout`, `--session-target isolated`, delivery and a failure destination
 configured, and if the skill has a dry-run/confirm handshake, keep cron on the
 read half and leave broadcasts to an interactive session.
+
+### Overlapping runs, job health, and missed runs
+
+```sh
+agentos cron add --every 5m --job-kind agent_turn --text "Check the queue" --concurrency replace
+agentos cron update <job-id> --concurrency forbid
+agentos config set scheduler.startup_agent_delay_seconds 120
+```
+
+`--concurrency` (on `add` and `update`) says what happens when a run comes due
+while the previous one is still going: `forbid` (default) skips it, `replace`
+cancels the running run and starts the new one, `allow` runs both.
+`agentos cron list --json` reports each job's `concurrency` and a `health`
+block — `consecutive_failures`, `last_error` (the last finished run's error),
+and `degraded` (true from 3 failures in a row).
+
+After a laptop sleep each overdue job runs once, however many runs it missed.
+After a gateway restart up to 5 missed jobs are caught up, staggered over 10
+seconds; missed agent jobs wait `scheduler.startup_agent_delay_seconds`
+(default `120`, `0` = no wait) so they do not compete with channel start-up.
 
 Read:
 

@@ -160,6 +160,8 @@ _CONNECTION_LOST = (
 )
 #: How long the CLI client keeps reconnecting after a drop before giving up.
 CLI_RECONNECT_BUDGET_S = 60.0
+#: How long ``GatewayClient.connect`` keeps retrying a gateway that is booting.
+STARTUP_WAIT_S = 30.0
 
 
 class GatewayClient:
@@ -206,8 +208,14 @@ class GatewayClient:
         url: str = "ws://localhost:18791/ws",
         *,
         token: str | None = None,
+        startup_wait_s: float = STARTUP_WAIT_S,
     ) -> None:
-        """Connect to gateway. Raises SystemExit with friendly message on failure."""
+        """Connect to gateway. Raises SystemExit with friendly message on failure.
+
+        A gateway that is still booting refuses the handshake with a retryable
+        ``UNAVAILABLE`` / ``STARTUP_SIDECARS``; the first connect retries it for
+        up to ``startup_wait_s`` (``0`` fails at once, which status probes want).
+        """
         has_existing_connection = (
             self._ws is not None
             or self._listener_task is not None
@@ -241,7 +249,7 @@ class GatewayClient:
         self.reconnects = 0
 
         try:
-            await self._open()
+            await self._open_waiting_for_startup(url, startup_wait_s)
         except _SocketOpenError as exc:
             raise SystemExit(
                 f"Cannot connect to AgentOS gateway at {url}\n"
@@ -252,6 +260,28 @@ class GatewayClient:
             raise SystemExit(f"Handshake failed: {exc.frame}") from None
         except _UnexpectedFrameError as exc:
             raise SystemExit(f"Unexpected handshake frame: {exc.frame}") from None
+
+    async def _open_waiting_for_startup(self, url: str, startup_wait_s: float) -> None:
+        """:meth:`_open`, retried while the gateway answers ``STARTUP_SIDECARS``."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, startup_wait_s)
+        while True:
+            try:
+                await self._open()
+                return
+            except GatewayHandshakeError as exc:
+                if exc.detail_code != "STARTUP_SIDECARS":
+                    raise
+                raw = exc.details.get("retry_after_ms") or 1000
+                try:
+                    delay = min(max(int(raw), 100), 2000) / 1000
+                except (TypeError, ValueError):
+                    delay = 1.0
+                if loop.time() + delay > deadline:
+                    raise SystemExit(
+                        f"The AgentOS gateway at {url} is still starting; retry in a moment."
+                    ) from None
+                await asyncio.sleep(delay)
 
     async def _open(self) -> None:
         """One connection attempt: socket, handshake, listener, heartbeat."""

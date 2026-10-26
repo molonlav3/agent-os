@@ -43,6 +43,58 @@ class JobStatus(StrEnum):
     DELETED = "deleted"
 
 
+class ConcurrencyPolicy(StrEnum):
+    """What the timer does when a job's next slot comes due while it still runs.
+
+    ``forbid`` (default) skips that slot; the next one is computed from when
+    the running run finishes. ``replace`` cancels the running run (when the
+    scheduler's own loop started it) and starts the new one. ``allow`` starts
+    the new run alongside; the newest run owns the job's schedule state and
+    the earlier one is kept in run history only.
+    """
+
+    FORBID = "forbid"
+    REPLACE = "replace"
+    ALLOW = "allow"
+
+
+CONCURRENCY_POLICIES: tuple[str, ...] = tuple(policy.value for policy in ConcurrencyPolicy)
+
+
+def normalize_concurrency(value: object) -> ConcurrencyPolicy:
+    """Coerce a wire/CLI value to a policy; ``None``/empty is the default ``forbid``."""
+    if isinstance(value, ConcurrencyPolicy):
+        return value
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ConcurrencyPolicy.FORBID
+    raw = str(value).strip().lower()
+    try:
+        return ConcurrencyPolicy(raw)
+    except ValueError:
+        raise ValueError(
+            f"concurrency must be one of {', '.join(CONCURRENCY_POLICIES)}; got {value!r}"
+        ) from None
+
+
+#: A job is reported ``degraded`` from this many failures in a row.
+DEGRADED_FAILURE_THRESHOLD = 3
+
+
+def job_health(consecutive_errors: object, last_error: object) -> dict[str, Any]:
+    """The ``health`` block of a job's wire payload.
+
+    ``consecutive_failures`` is the job's run-to-run failure streak (reset by
+    a success). ``last_error`` is the error of the most recent *finished* run,
+    ``None`` after a success; an in-progress run does not clear it.
+    """
+    failures = max(0, consecutive_errors) if isinstance(consecutive_errors, int) else 0
+    return {
+        "consecutive_failures": failures,
+        "last_error": str(last_error) if last_error else None,
+        "degraded": failures >= DEGRADED_FAILURE_THRESHOLD,
+    }
+
+
 class ReservationRejectionReason(StrEnum):
     NOT_FOUND = "not_found"
     BUSY = "busy"
@@ -182,6 +234,7 @@ class CronJob:
     reservation_source: str = ""
     scheduled_run_at: datetime | None = None
     tool_policy: dict[str, Any] = field(default_factory=dict)
+    concurrency: ConcurrencyPolicy = ConcurrencyPolicy.FORBID
 
 
 @dataclass

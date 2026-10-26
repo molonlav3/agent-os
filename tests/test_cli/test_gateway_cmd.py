@@ -147,7 +147,8 @@ def test_gateway_run_refuses_wildcard_bind_without_auth(tmp_path, monkeypatch) -
         app, ["gateway", "run", "--config", str(target), "--listen", "0.0.0.0"]
     )
 
-    assert result.exit_code == 1
+    # A refused public bind is config-class: EX_CONFIG, not a crash.
+    assert result.exit_code == 78
     output = result.stdout + (result.stderr or "")
     assert "Gateway could not start" in output
     assert "wildcard address 0.0.0.0" in output

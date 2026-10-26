@@ -554,6 +554,59 @@ async def _evaluate_collection(
         return [_collection_error(surface, exc)]
 
 
+def _gateway_log_hint() -> str:
+    from agentos.paths import default_agentos_home
+
+    return str(default_agentos_home() / "logs" / "debug.log")
+
+
+def _safe_mode_findings() -> list[HealthFinding]:
+    """The crash-loop breaker, when it holds: what is paused and the way out."""
+    from agentos.gateway.boot_lifecycle import get_boot_tracker
+
+    tracker = get_boot_tracker()
+    if tracker is None or not tracker.safe_mode_active:
+        return []
+    snapshot = tracker.snapshot()
+    clears_at = snapshot.get("clears_at")
+    return [
+        HealthFinding(
+            id="gateway.safe_mode",
+            severity="warn",
+            readiness_impact="degrades",
+            surface="gateway",
+            title="Gateway is in safe mode",
+            detail=(
+                f"{snapshot.get('reason') or 'Repeated unclean boots'}. Channels, scheduled "
+                "jobs and heartbeats are held back so a crash at startup cannot loop; the "
+                "control plane works as usual. Safe mode clears by itself"
+                + (f" at {clears_at}" if clears_at else "")
+                + " if no further unclean boot happens."
+            ),
+            evidence=snapshot,
+            fix_steps=[
+                FixStep(
+                    label="Find the crash in the gateway log",
+                    detail=(
+                        f"The last lines of the crashed runs are in {_gateway_log_hint()}"
+                        " (the desktop app and the installed service also write to"
+                        " ~/Library/Logs/AgentOS/ on macOS)."
+                    ),
+                ),
+                FixStep(
+                    label="Start one channel to test it",
+                    command="agentos channels start NAME --yes",
+                    detail="Starts just that channel; safe mode stays on for the rest.",
+                ),
+                FixStep(
+                    label="Leave safe mode now",
+                    command="agentos channels start --yes",
+                ),
+            ],
+        )
+    ]
+
+
 @_d.method("doctor.status")
 async def _handle_doctor_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if params is not None and not isinstance(params, dict):
@@ -570,7 +623,8 @@ async def _handle_doctor_status(params: dict | None, ctx: RpcContext) -> dict[st
             title="Gateway RPC ready",
             detail="The gateway accepted and handled doctor.status.",
             evidence={"connId": ctx.conn_id},
-        )
+        ),
+        *_safe_mode_findings(),
     ]
 
     collectors: list[tuple[str, Collector, Evaluator]] = [

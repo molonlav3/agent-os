@@ -38,6 +38,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   a wrong token or a protocol mismatch. The CLI gives up after 60 s without a
   gateway, so `agentos chat` prints "reconnecting…" during an outage and the
   old "Gateway connection lost" error when the gateway does not come back.
+- Gateway supervisor contract (#3682): `/ready` now returns
+  `{ready, state, failing, ...}` with `state` one of `starting`, `ready`,
+  `draining`, `safe_mode` (`503` while starting or draining), and a new
+  public `/startupz` answers `200` once channels and the router preload have
+  settled. A WebSocket `connect` during boot gets a retryable `UNAVAILABLE`
+  (`details.code: "STARTUP_SIDECARS"`, `retry_after_ms`) and close `1013`
+  instead of a half-started gateway; the CLI, the web console and the desktop
+  app retry it. The `shutdown` event carries `restart_expected_ms` (an
+  estimate for an in-place restart, `null` for a terminal stop) and the
+  console reconnects when the gateway said it would be back.
+  `agentos gateway status --json` adds `drain_budget_ms`, `active_turns` and
+  the gateway's `runtime.state` (new `gateway.status` RPC). `hello-ok`
+  advertises it as the `supervisor-contract` capability.
+- `agentos gateway install` / `uninstall` / `status --deep` (#3690): run the
+  gateway as a macOS LaunchAgent (`dev.useagentos.gateway`: `KeepAlive`,
+  `ThrottleInterval 10`, `ExitTimeOut` 54 s = the worst-case stop + 10 s) or a Linux
+  systemd user unit (`agentos-gateway.service`: `Restart=always`,
+  `RestartSec=5`, `RestartPreventExitStatus=78`, `KillMode=mixed`,
+  `TimeoutStopSec=54`). Installing
+  the same unit twice is a no-op (also from a shell with another `PATH`; the
+  unit carries the installing shell's `PATH` after the standard dirs); a
+  different unit under the same name is refused. `agentos gateway stop` on a
+  service-run gateway names the service and how to stop or uninstall it.
+  Under launchd an exit-78 boot waits 5 s, doubling up to 5 minutes, before
+  exiting, so a broken config is not respawned every 10 s. Not supported on
+  Windows.
+- Crash-loop breaker (#3690): every boot is recorded in the gateway database
+  with a 30 s heartbeat, and three unclean boots that ended within five
+  minutes start the gateway in safe mode —
+  control plane up, channels, cron and heartbeat held back, `/ready` and
+  `agentos doctor` say so. It clears by itself once the window drains;
+  `agentos channels start` (new, and the `channels.start` RPC) leaves it at
+  once, or starts a single channel to find the one that crashes the gateway.
+- Sleep/thaw detection and a channel health sweep (#3691): a 30 s maintenance
+  tick notices a machine that slept, restarts idle channels, wakes the
+  scheduler and logs `gateway.thaw`; every 5 minutes it restarts channels that
+  are `disconnected`, `stuck`, `start_failed` or `stale-socket` (no inbound
+  event for 30 minutes), at most once per two sweeps, and never one stopped
+  on bad credentials or blocked. A restart whose start fails (no network yet
+  after a wake) is retried with backoff instead of leaving the channel
+  stopped. `channels.status` reports each channel's `state`, `last_event_at`,
+  `terminal_reason` and `start_error` plus the policy and the last sweep/thaw;
+  `agentos channels status` shows the state, the reason and safe mode;
+  `/ready` names down channels in `failing`; doctor flags a terminal channel
+  with the fix.
+- Cron jobs take a `concurrency` policy (`forbid` default, `replace`, `allow`)
+  for a run that comes due while the previous one still runs
+  (`agentos cron add|update --concurrency`, `cron.add`/`cron.update`), and
+  `cron.list` rows carry `concurrency` and `health`
+  (`consecutive_failures`, `last_error`, `degraded` at 3 failures in a row).
+  A run in progress no longer clears the job's last error. (#3699)
+- Desktop app: when the gateway it starts exits with code 78 (configuration
+  error) it runs `agentos doctor --json` once, retries the start once, and
+  otherwise shows the exit code with doctor's top finding and fix. A spawned
+  gateway counts as running once `/ready` answers `200` (`/health` on older
+  engines), and the gateway status carries `detail` and `exitCode`. (#3682)
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up
@@ -64,6 +120,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   nonce.
 - `agentos gateway stop` and the desktop app send a second SIGTERM (cancel
   the turns still running) before falling back to SIGKILL.
+- `agentos gateway run` exits `78` (`EX_CONFIG`) instead of `2`/`1` when only a
+  configuration change can fix the start: a config file that is not valid
+  TOML (previously a traceback) or does not validate, a schema migration that
+  cannot apply, a public bind without auth. Other startup failures still exit
+  `1`; other commands keep exit `2` for a bad config. (#3682)
 
 ### Fixed
 - Gateway: SIGTERM — what `agentos gateway stop`, the desktop app, launchd
@@ -89,6 +150,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `client: {name}` shape is still accepted.
 - The web console reconnects when the socket drops in the middle of the
   handshake instead of staying disconnected.
+- Gateway: the cron scheduler's startup catch-up no longer runs before its
+  handlers are registered, which could fail the first missed reminder or
+  script job with "No handler registered" and leave it with no next run.
+- Scheduler: the next wake is planned on both the wall and the monotonic
+  clock, so after a laptop sleep each overdue job runs once (missed runs
+  coalesce) and a clock set back never fires a job early or twice. Sleep
+  gaps, backward clock jumps and late wakes are logged. Agent jobs missed
+  while the gateway was down wait `[scheduler] startup_agent_delay_seconds`
+  (default 120) after boot instead of competing with channel start-up; the
+  catch-up cap (5) and the 10 s stagger are unchanged. (#3683)
 
 ### Security
 - Gateway: wrong tokens are rate limited per client address across HTTP and

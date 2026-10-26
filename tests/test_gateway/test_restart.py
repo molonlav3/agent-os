@@ -22,6 +22,7 @@ from agentos import __version__
 from agentos.channels.types import OutgoingMessage
 from agentos.gateway import restart as restart_mod
 from agentos.gateway.agent_surface import OPERATOR_SECRET_FILE_ENV
+from agentos.gateway.readiness import MIN_RESTART_EXPECTED_MS
 from agentos.gateway.restart import (
     FORCE_DRAIN_TIMEOUT_S,
     SAFE_DRAIN_TIMEOUT_S,
@@ -178,8 +179,14 @@ async def test_safe_restart_runs_the_sequence_in_order(tmp_path: Path) -> None:
 
     assert events == [f"sleep:{restart_mod.ACK_GRACE_S}", "stop_admission", "close"]
     assert server.app.state.gateway_ready is False
+    # The fake server has no readiness object, so the estimate is the floor.
     assert server.close_calls == [
-        {"reason": "restart:safe", "drain_timeout": SAFE_DRAIN_TIMEOUT_S, "cancel_in_flight": False}
+        {
+            "reason": "restart:safe",
+            "drain_timeout": SAFE_DRAIN_TIMEOUT_S,
+            "cancel_in_flight": False,
+            "restart_expected_ms": MIN_RESTART_EXPECTED_MS,
+        }
     ]
     plan = restarter.exec_plan
     assert plan is not None
@@ -207,6 +214,7 @@ async def test_force_restart_cancels_in_flight(tmp_path: Path) -> None:
             "reason": "restart:force",
             "drain_timeout": FORCE_DRAIN_TIMEOUT_S,
             "cancel_in_flight": True,
+            "restart_expected_ms": MIN_RESTART_EXPECTED_MS,
         }
     ]
 
