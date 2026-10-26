@@ -620,6 +620,21 @@ describe('app shell chrome', () => {
     expect(pill).toHaveAttribute('data-variant', 'warn')
   })
 
+  it('announces only the state word, not the per-second freshness', () => {
+    stubMatchMedia(false)
+    useRuntimeSignals.setState({ everConnected: true, lastFrameAt: Date.now() - 25_000 })
+    useConnection.getState().setState('disconnected')
+    renderShellAt('/cron')
+    const live = screen.getByRole('status')
+    expect(live).toHaveAttribute('aria-live', 'polite')
+    expect(live.textContent).toBe('Offline')
+    // The freshness is visible but outside any live region.
+    const pill = document.getElementById('conn-pill')!
+    expect(pill).not.toHaveAttribute('aria-live')
+    expect(pill).toHaveTextContent(/Snapshot · \d+ s/)
+    expect(pill.querySelector('[aria-live]')).toBe(live)
+  })
+
   it('opens the truth panel with the reason and exactly one recovery action', async () => {
     stubMatchMedia(false)
     const retry = vi.fn()
@@ -999,6 +1014,40 @@ describe('navigation shortcuts in AppShell', () => {
   function press(init: KeyboardEventInit) {
     return fireEvent.keyDown(document, { bubbles: true, ...init })
   }
+
+  it('lets a pending approval step aside so the inbox chord and badge stay reachable', async () => {
+    stubMatchMedia(false)
+    useConnection.getState().setState('disconnected')
+    useApprovals.setState({
+      pending: [{ id: 'a1', namespace: 'exec', command: 'ls', toolName: 'bash' }],
+      count: 1,
+      mode: 'prompt',
+    })
+    try {
+      const { router } = renderShellAt('/cron')
+      const prompt = await screen.findByRole('alertdialog')
+      // Offline: the answers are disabled with the reason, not silently live.
+      expect(within(prompt).getByRole('button', { name: /^deny$/i })).toBeDisabled()
+      expect(within(prompt).getByText(/The gateway is offline/)).toBeInTheDocument()
+      // While the modal is up, chords are held back.
+      press({ key: 'g', code: 'KeyG' })
+      press({ key: 'i', code: 'KeyI' })
+      expect(router.state.location.pathname).toBe('/cron')
+
+      fireEvent.click(within(prompt).getByRole('button', { name: /answer later/i }))
+      expect(screen.queryByRole('alertdialog')).toBeNull()
+      expect(screen.getByTestId('approval-dock')).toHaveTextContent('1 approval waiting')
+      // The status bar's recovery action is reachable again.
+      fireEvent.click(screen.getByTestId('truth-badge'))
+      expect(await screen.findByTestId('truth-panel')).toBeInTheDocument()
+      fireEvent.keyDown(document, { key: 'Escape' })
+      press({ key: 'g', code: 'KeyG' })
+      press({ key: 'i', code: 'KeyI' })
+      await waitFor(() => expect(router.state.location.pathname).toBe('/inbox'))
+    } finally {
+      useApprovals.setState({ pending: [], count: 0, mode: 'prompt' })
+    }
+  })
 
   it('navigates to sidebar views via g-prefixed chords', async () => {
     stubMatchMedia(false)

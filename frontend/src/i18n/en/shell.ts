@@ -119,6 +119,14 @@ export const shell = defineNamespace('shell', {
     'Enable approval bypass in this browser session and approve this pending tool call',
   approvalBypass: 'Bypass Approvals',
   approvalDeny: 'Deny',
+  approvalLater: 'Answer later',
+  approvalLaterTitle:
+    'Step this prompt aside; the approval keeps waiting in the dock and the attention inbox',
+  approvalDockLandmark: 'Approvals waiting',
+  approvalDock_one: '{count} approval waiting',
+  approvalDock_other: '{count} approvals waiting',
+  approvalDockAnswer: 'Answer now',
+  approvalDockInbox: 'Open inbox',
 
   // Command line with copy action.
   commandCopyLabel: 'Copy command',

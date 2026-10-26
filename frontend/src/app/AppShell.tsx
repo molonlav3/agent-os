@@ -715,7 +715,7 @@ export function AppShell() {
           stays out of its way there (it would cover the very list). */}
       {hasPendingApprovals && activePath !== 'inbox' ? (
         <Suspense fallback={null}>
-          <ApprovalPrompt />
+          <ApprovalPrompt onOpenInbox={() => navigateTo('inbox')} />
         </Suspense>
       ) : null}
       <Toaster />

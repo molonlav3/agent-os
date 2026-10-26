@@ -62,8 +62,6 @@ export function TruthBadge({ version }: { version: string }) {
   return (
     <div
       id="conn-pill"
-      role="status"
-      aria-live="polite"
       className="shell-sidebar__connection t-data"
       data-testid="nav-foot"
       data-variant={VARIANT[tone]}
@@ -71,6 +69,11 @@ export function TruthBadge({ version }: { version: string }) {
       data-source={truth.source}
       title={title}
     >
+      {/* Announce the state only, when it changes: the freshness next to it
+          ages every second and would be re-read just as often. */}
+      <span className="sr-only" role="status" aria-live="polite">
+        {stateLabel}
+      </span>
       <button
         ref={buttonRef}
         type="button"
@@ -94,18 +97,20 @@ export function TruthBadge({ version }: { version: string }) {
           })
         }}
       >
-        <span
-          aria-hidden="true"
-          className={`shell-sidebar__status-dot size-1.5 shrink-0 rounded-full ${DOT[tone]}`}
-        />
-        <span className="truth-badge__text">
+        {/* Row one: light, state, version. Row two: the freshness, given the
+            full width of the bar so "Snapshot · 25 s" is never clipped. */}
+        <span className="truth-badge__row">
+          <span
+            aria-hidden="true"
+            className={`shell-sidebar__status-dot size-1.5 shrink-0 rounded-full ${DOT[tone]}`}
+          />
           <span className={`shell-sidebar__status-label ${TEXT[tone]}`}>
             {stateLabel.toUpperCase()}
           </span>
-          <span className="shell-sidebar__status-label truth-badge__fresh">{freshness}</span>
+          {version ? <span className="shell-sidebar__version ml-auto">v{version}</span> : null}
         </span>
+        <span className="shell-sidebar__status-label truth-badge__fresh">{freshness}</span>
       </button>
-      {version ? <span className="shell-sidebar__version ml-auto">v{version}</span> : null}
       {open ? (
         <TruthPanel
           id={panelId}

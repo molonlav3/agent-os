@@ -7,8 +7,9 @@
   display: flex;
   min-width: 0;
   flex: 1 1 auto;
-  align-items: center;
-  gap: 0.5rem;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
   margin: -0.25rem -0.375rem;
   padding: 0.25rem 0.375rem;
   border: 0;
@@ -29,26 +30,26 @@
   outline-offset: 2px;
 }
 
-/* State over freshness: the footer row is too narrow for both side by side
-   next to the version label. */
-.truth-badge__text {
+/* Row one: light, state and version. Row two: the freshness, which gets the
+   whole width of the bar (it is the longest label and must not clip). */
+.truth-badge__row {
   display: flex;
   min-width: 0;
-  flex-direction: column;
-  gap: 1px;
+  align-items: center;
+  gap: 0.5rem;
   line-height: 1.2;
 }
 
 .truth-badge__fresh {
-  overflow: hidden;
+  padding-left: calc(0.375rem + 0.5rem); /* under the state, past the light */
   color: var(--dim);
-  text-overflow: ellipsis;
+  line-height: 1.2;
   white-space: nowrap;
 }
 
 .shell-sidebar[data-collapsed='true'] .truth-badge {
   flex: none;
-  justify-content: center;
+  align-items: center;
 }
 
 .truth-panel {
