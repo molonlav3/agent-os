@@ -14,7 +14,9 @@ The renderer imports the console's non-visual layer straight from
 `frontend/src` through the `@/` alias — the WebSocket RPC client, the chat
 hooks (`useTranscript`, `useAttachments`, `useSlashCommands`, `useRoutePin`,
 `usePendingQueue`), the approvals monitor, the imperative transcript
-renderer, and the session/chat pure logic. One protocol implementation, one
+renderer, the session/chat pure logic, and the runtime honesty layer
+(`useRuntimeTruth`, `useAttentionInbox`, runtime issues, the
+disabled-with-reason checks and `useUpdatePreflight`). One protocol implementation, one
 place to fix a gateway change.
 
 What it does **not** take is the console's appearance. `frontend`'s
@@ -73,11 +75,14 @@ desktop/
             │                 #   shortcuts, advanced, about), parts.tsx, logic.ts, channels-logic.ts
             ├── components/   #   Sidebar (+ resizer, project folders, session list with
             │                 #   its row menu and view menu), Toolbar, menu/ (PopMenu,
-            │                 #   Menu, items, submenus), pet/, composer/
+            │                 #   Menu, items, submenus), pet/, composer/, TruthBadge (the
+            │                 #   toolbar's runtime status) and AttentionPanel ("Needs you")
             ├── theme/        #   theme system (see below)
             ├── stores/       #   zustand: gateway, sessions, projects, live, settings, ui,
             │                 #   session-marks (pin/archive/unread), session-view
-            ├── lib/          #   desktop-api bridge, motion curves, relative time
+            ├── lib/          #   desktop-api bridge, motion curves, relative time,
+            │                 #   use-runtime-host (process facts for the shared truth hook),
+            │                 #   required-methods (RPCs the desktop adds; contract-tested)
             ├── i18n/         #   t() catalog for desktop-only copy
             └── assets/fonts/ #   Bricolage Grotesque (wordmark) + JetBrains Mono
 ```

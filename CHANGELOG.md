@@ -186,6 +186,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `[hooks.routes.<name>]` agent / session / message template mapping (#3697).
 - `hello-ok.features.capabilities` advertises `artifact-tickets`,
   `config-reload`, `tools-invoke` and `web-push`.
+- Web UI and desktop app: a truth badge for the runtime. The Web UI's
+  sidebar status bar and the desktop's toolbar now say Ready, Degraded,
+  Connecting, Blocked, Offline or Unknown, how fresh the view is
+  ("Live · 12 s", "Snapshot · 3 min", "Unavailable"), and offer exactly one
+  recovery action (Retry connection, Start gateway on the desktop, the
+  attention inbox, or Health). It is derived from the connection's own
+  frames, a refused handshake, `doctor.status` and `/ready`, refreshed on
+  connect and the gateway's tick, with no polling timer of its own.
+- Web UI: an attention inbox (`g i`, with a nav count) listing approvals of
+  every namespace, pending agent questions (`ask_user`) and typed runtime
+  issues in one place, each answerable in place, with duplicates grouped
+  ("Seen in N sessions") and deep links into the owning session. The
+  desktop app has the same list as a "Needs you" panel in the toolbar,
+  where runtime issues can also restart the gateway after a confirmation.
+- Web UI and desktop app: typed runtime issues from `doctor.status`
+  findings and the connection state (`gateway_unreachable`, `auth_failed`,
+  `protocol_mismatch`, `model_auth_required`, `rate_limited`,
+  `channel_terminal`, `safe_mode`, `update_failed`, `doctor_warning`) with
+  fix steps in place and a per-session dismiss.
+- Web UI: cron job cards show the run health the gateway reports
+  (Degraded badge, failure streak, last error) and an overlap policy picker
+  (`forbid`, `replace`, `allow`) when the job carries one. The desktop's job
+  detail shows the Degraded chip too.
+- A contract test (`tests/test_console_required_methods.py`) fails CI when
+  the Web UI or the desktop app calls an RPC method the gateway does not
+  advertise in `features.methods`.
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up
@@ -246,6 +272,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   session's last chat). A paired sender could previously approve any request
   whose session key named no channel, a web console or desktop prompt
   included (#3694).
+- Web UI and desktop app: updating AgentOS now goes through a preflight
+  that lists running sessions, scheduled jobs due in the next 10 minutes and
+  pending approvals; a pending approval blocks the update with the reason,
+  and the update only starts once confirmed.
+- Web UI: controls that cannot be used right now stay visible, disabled,
+  with the reason (approval answers and cron Run/Pause while the gateway is
+  offline or the scheduler is not running), instead of failing silently.
 
 ### Deprecated
 - `GET /api/v1/artifacts/{id}?sessionKey=` and
