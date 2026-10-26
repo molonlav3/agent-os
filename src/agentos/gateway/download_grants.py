@@ -247,7 +247,7 @@ async def _handle_artifacts_download(params: dict | None, ctx: RpcContext) -> di
         except ArtifactIntegrityError as exc:
             raise RpcHandlerError("INTEGRITY_ERROR", str(exc)) from exc
         except ArtifactNotFoundError as exc:
-            raise KeyError("artifact not found") from exc
+            raise RpcHandlerError("NOT_FOUND", "artifact not found") from exc
         grant = grants.mint(conn_id, "artifact", ref.id, session_key, name=ref.name, mime=ref.mime)
         size = ref.size
     else:
@@ -256,7 +256,7 @@ async def _handle_artifacts_download(params: dict | None, ctx: RpcContext) -> di
         except AttachmentIntegrityError as exc:
             raise RpcHandlerError("INTEGRITY_ERROR", str(exc)) from exc
         except AttachmentNotFoundError as exc:
-            raise KeyError("attachment not found") from exc
+            raise RpcHandlerError("NOT_FOUND", "attachment not found") from exc
         grant = grants.mint(
             conn_id,
             "attachment",
@@ -413,10 +413,30 @@ def register_download_routes(
         headers["Content-Disposition"] = content_disposition(name)
         return _SingleRangeFileResponse(path, media_type=mime, headers=headers)
 
+    async def contained(request: Request) -> Response:
+        # Reachable without a token: an unexpected failure is logged by type
+        # and redacted message, never as a traceback whose frames print the
+        # config (and its secrets).
+        try:
+            return await download_handler(request)
+        except Exception as exc:  # noqa: BLE001 - see comment
+            from agentos.redact import redact_sensitive_text
+
+            log.warning(
+                "gateway.download_failed",
+                error_type=type(exc).__name__,
+                error=(redact_sensitive_text(str(exc)) or "")[:300],
+            )
+            return JSONResponse(
+                {"error": "Download failed", "code": "INTERNAL_ERROR"},
+                status_code=500,
+                headers={"Cache-Control": "no-store"},
+            )
+
     app.router.routes.append(
         Route(
             f"{DOWNLOAD_PATH_PREFIX}/{{conn_id}}/{{ticket}}",
-            download_handler,
+            contained,
             methods=["GET", "HEAD"],
         )
     )

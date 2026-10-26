@@ -206,6 +206,7 @@ class TestRpc:
             config, {"session_key": "agent:main:webchat:other", "artifact_id": ref.id}
         )
         assert other_session.error.code == "NOT_FOUND"
+        assert other_session.error.message == "artifact not found"  # no stray quotes
         missing = await _mint(config, {"session_key": SESSION_KEY, "artifact_id": "art-nope"})
         assert missing.error.code == "NOT_FOUND"
         assert get_download_grants().live_count() == 0
@@ -453,3 +454,59 @@ def test_legacy_route_logs_a_deprecation_once(tmp_path: Path) -> None:
         and entry["log_level"] == "warning"
     ]
     assert len(warnings) == 1
+
+
+class TestVerificationIsCached:
+    """A ticket's HEAD / ranges / thumbnail must not re-hash the file each time."""
+
+    @pytest.mark.asyncio
+    async def test_attachment_is_hashed_once_while_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agentos.gateway import download_verify
+
+        download_verify.clear()
+        hashed: list[Path] = []
+        real = download_verify._sha256
+
+        def counting(path: Path) -> str:
+            hashed.append(path)
+            return real(path)
+
+        monkeypatch.setattr(download_verify, "_sha256", counting)
+        config = _config(tmp_path)
+        sha, path, _ = write_transcript_material(
+            media_root=tmp_path, session_id="session-1", payload=b"x" * 4096
+        )
+        res = await _mint(config, {"session_key": SESSION_KEY, "attachment_sha256": sha})
+        client = TestClient(_route_app(config))
+        for _ in range(3):
+            assert client.get(res.payload["url"], headers={"Range": "bytes=0-9"}).status_code == 206
+        assert len(hashed) == 1
+        # A changed file is verified again (and here fails the integrity check).
+        Path(path).write_bytes(b"y" * 4096)
+        assert client.get(res.payload["url"]).status_code == 409
+        assert len(hashed) == 2
+
+    @pytest.mark.asyncio
+    async def test_artifact_is_resolved_once_while_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agentos.gateway import artifacts as gateway_artifacts
+
+        gateway_artifacts._RESOLVED.clear()
+        calls: list[str] = []
+        real = ArtifactStore.resolve_for_download
+
+        def counting(self: ArtifactStore, artifact_id: str, *, session_id: str) -> Any:
+            calls.append(artifact_id)
+            return real(self, artifact_id, session_id=session_id)
+
+        monkeypatch.setattr(ArtifactStore, "resolve_for_download", counting)
+        config = _config(tmp_path)
+        url = await _artifact_url(tmp_path, config)
+        client = TestClient(_route_app(config))
+        client.head(url)
+        client.get(url)
+        client.get(url, headers={"Range": "bytes=0-1"})
+        assert len(calls) == 1

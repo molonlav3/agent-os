@@ -137,7 +137,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `Content-Disposition: attachment`, `Cache-Control: no-store` and
   `X-Content-Type-Options: nosniff`. The web console and the desktop app load
   previews, audio, cards and downloads through it, so no token appears in a
-  page URL any more and image previews work on token-auth gateways (#3693).
+  page URL any more and image previews work on token-auth gateways. A file is
+  verified once per change of size, mtime or inode, off the event loop
+  (#3693).
 - Web Push for approvals: Settings → *Push notifications for approvals* in the
   web console subscribes the browser (RPCs `push.web.vapid_public_key`,
   `push.web.subscribe`, `push.web.unsubscribe`). Each approval is pushed with a

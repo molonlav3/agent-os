@@ -10,9 +10,11 @@ mint a ticketed URL with the ``artifacts.download`` RPC instead
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+import anyio
 import structlog
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -88,12 +90,59 @@ async def resolve_artifact_download(
     if not session_id:
         raise ArtifactNotFoundError("artifact not found")
     store = ArtifactStore(_media_root_from_config(config))
+    key = (str(store.media_root), session_id, str(artifact_id))
+    cached = _resolved_cache_get(key)
+    if cached is not None:
+        return cached
     try:
-        return store.resolve_for_download(str(artifact_id), session_id=session_id)
+        # Reads the metadata and hashes the material: off the event loop.
+        ref, path = await anyio.to_thread.run_sync(
+            lambda: store.resolve_for_download(str(artifact_id), session_id=session_id)
+        )
     except ArtifactIntegrityError:
         raise
     except (ArtifactNotFoundError, ValueError) as exc:
         raise ArtifactNotFoundError("artifact not found") from exc
+    _resolved_cache_put(key, ref, path)
+    return ref, path
+
+
+#: Verified artifacts, kept while the material's size, mtime and inode are
+#: unchanged: a ticket's HEAD, ranges and thumbnail must not each re-hash it.
+_RESOLVED: OrderedDict[tuple[str, str, str], tuple[ArtifactRef, Path, tuple[int, int, int]]] = (
+    OrderedDict()
+)
+_RESOLVED_MAX = 1024
+
+
+def _file_stamp(path: Path) -> tuple[int, int, int] | None:
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return (info.st_size, info.st_mtime_ns, info.st_ino)
+
+
+def _resolved_cache_get(key: tuple[str, str, str]) -> tuple[ArtifactRef, Path] | None:
+    entry = _RESOLVED.get(key)
+    if entry is None:
+        return None
+    ref, path, stamp = entry
+    if _file_stamp(path) != stamp:
+        _RESOLVED.pop(key, None)
+        return None
+    _RESOLVED.move_to_end(key)
+    return ref, path
+
+
+def _resolved_cache_put(key: tuple[str, str, str], ref: ArtifactRef, path: Path) -> None:
+    stamp = _file_stamp(path)
+    if stamp is None:
+        return
+    _RESOLVED[key] = (ref, path, stamp)
+    _RESOLVED.move_to_end(key)
+    while len(_RESOLVED) > _RESOLVED_MAX:
+        _RESOLVED.popitem(last=False)
 
 
 def register_artifact_routes(

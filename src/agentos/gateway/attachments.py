@@ -7,7 +7,6 @@ deprecated like its artifact sibling (see ``gateway.artifacts``); the
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -90,8 +89,10 @@ async def resolve_attachment_download(
             break
     if path is None:
         raise AttachmentNotFoundError(sha)
+    from agentos.gateway.download_verify import file_digest
+
     try:
-        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        actual_sha = await file_digest(path)
     except OSError as exc:
         raise AttachmentNotFoundError(sha) from exc
     if actual_sha != sha:
