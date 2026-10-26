@@ -26,6 +26,12 @@
 // this module re-exports it from there so there is one definition (DRY).
 
 import { apiOrigin, urlBase } from '@/lib/api-origin'
+import {
+  TICKET_SRC_ATTR,
+  TICKET_VARIANT_ATTR,
+  THUMBNAIL_VARIANT,
+  type TicketOptions,
+} from '@/lib/artifact-tickets'
 import { t, type MessageKey } from '@/i18n'
 import '@/i18n/en/chat'
 
@@ -325,6 +331,15 @@ export function isAudioArtifact(artifact: Artifact | null | undefined): boolean 
   return artifactCategory(artifact) === 'audio'
 }
 
+// The still formats the gateway makes a PNG preview of (`?variant=thumbnail`);
+// an animated or vector image previews as itself.
+const THUMBNAIL_MIMES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/webp'])
+
+/** Whether an image artifact's inline preview can load the ticket's thumbnail. */
+export function artifactHasThumbnail(artifact: Artifact | null | undefined): boolean {
+  return THUMBNAIL_MIMES.has(artifactMime(artifact))
+}
+
 /**
  * Serialize a resolved artifact URL for the host. On the gateway-served
  * console it stays relative (legacy parity: `/api/v1/artifacts/...`). Off
@@ -433,6 +448,14 @@ export interface ArtifactRendererDeps {
    * a controller that never composes a mounter simply renders inert cards.
    */
   mountCharts?: (container: HTMLElement) => void
+  /**
+   * Trade a gateway file URL for a ticketed one (lib/artifact-tickets.ts);
+   * null when none can be had, and the legacy URL + header apply. When it is
+   * composed in, image and audio sources render as `data-ticket-src` for the
+   * `mountCharts` pass to fill, downloads go through a ticket, and no URL on
+   * the page carries the auth token. Default: absent (legacy URLs).
+   */
+  resolveTicket?: (url: string, options?: TicketOptions) => Promise<string | null>
 }
 
 /* ── Factory ────────────────────────────────────────────────────────────── */
@@ -463,7 +486,12 @@ export function createArtifactRenderer(deps: ArtifactRendererDeps) {
     if (!Array.isArray(artifacts) || artifacts.length === 0) return ''
     let html = '<div class="msg-artifacts">'
     let openGroup = ''
-    const { sessionKey, token } = urlContext()
+    const ticketed = Boolean(deps.resolveTicket)
+    const context = urlContext()
+    const sessionKey = context.sessionKey
+    // With tickets nothing on the page needs the token: media loads through a
+    // ticket and every download click is intercepted. Keep it out of the DOM.
+    const token = ticketed ? '' : context.token
     const closeGroup = (): void => {
       if (!openGroup) return
       html += '</div>'
@@ -589,8 +617,14 @@ export function createArtifactRenderer(deps: ArtifactRendererDeps) {
         </div>`
       } else if (isImageArtifact(artifact)) {
         const previewUrl = artifactPreviewUrl(artifact || {}, { sessionKey, token })
+        // A ticketed preview waits for the mount pass to fill its source; a
+        // still image loads the gateway's PNG thumbnail, the file stays the
+        // download.
+        const previewSource = ticketed
+          ? `${TICKET_SRC_ATTR}="${escAttr(previewUrl)}"${artifactHasThumbnail(artifact) ? ` ${TICKET_VARIANT_ATTR}="${THUMBNAIL_VARIANT}"` : ''}`
+          : `src="${esc(previewUrl)}"`
         html += `<a class="msg-artifact-card msg-artifact-card--image" href="${escAttr(downloadHref)}" download="${escAttr(name)}" data-artifact-category="${escAttr(category)}" data-artifact-download="${escAttr(downloadUrl)}" data-artifact-id="${escAttr(artifact?.id || '')}" data-artifact-name="${escAttr(name)}" title="${escAttr(t('chat.artifactDownloadTitle', { name }))}">
-          ${previewUrl ? `<img class="msg-artifact-preview" src="${esc(previewUrl)}" alt="${esc(name)}" loading="lazy">` : '<span class="msg-artifact-preview msg-artifact-preview--empty" aria-hidden="true"></span>'}
+          ${previewUrl ? `<img class="msg-artifact-preview" ${previewSource} alt="${esc(name)}" loading="lazy">` : '<span class="msg-artifact-preview msg-artifact-preview--empty" aria-hidden="true"></span>'}
           <span class="msg-artifact-card__body">
             <span class="msg-artifact-card__name">${esc(name)}</span>
             <span class="msg-artifact-card__meta">${esc(meta)}</span>
@@ -599,7 +633,7 @@ export function createArtifactRenderer(deps: ArtifactRendererDeps) {
         </a>`
       } else if (isAudioArtifact(artifact)) {
         html += `<div class="msg-artifact-card msg-artifact-card--audio" data-artifact-category="${escAttr(category)}" data-artifact-id="${escAttr(artifact?.id || '')}" data-artifact-name="${escAttr(name)}">
-          <audio class="msg-artifact-audio" controls preload="metadata" src="${escAttr(downloadHref)}"></audio>
+          <audio class="msg-artifact-audio" controls preload="metadata" ${ticketed ? TICKET_SRC_ATTR : 'src'}="${escAttr(downloadHref)}"></audio>
           <span class="msg-artifact-card__body">
             <span class="msg-artifact-card__name">${esc(name)}</span>
             <span class="msg-artifact-card__meta">${esc(meta)}</span>
@@ -657,15 +691,47 @@ export function createArtifactRenderer(deps: ArtifactRendererDeps) {
 
   /* ── download an artifact via authenticated fetch (chat.js:7653-7679) ──── */
 
+  // A same-document link: the only way a script hands the browser a download.
+  function clickDownloadLink(href: string, name: string): void {
+    const a = document.createElement('a')
+    a.href = href
+    a.download = name
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  }
+
   async function downloadArtifact(artifact: Artifact): Promise<void> {
     let downloadUrl = artifactDownloadUrl(artifact)
     if (!downloadUrl) return
-    const headers: Record<string, string> = {}
+    const name = artifact.name || 'artifact'
     const sessionKey = deps.getSessionKey() || ''
-    const token = deps.getAuthToken() || ''
-    if (token) headers['Authorization'] = `Bearer ${token}`
-    if (sessionKey) headers['x-agentos-session-key'] = sessionKey
-    downloadUrl = artifactAuthenticatedDownloadUrl(downloadUrl, { sessionKey, token })
+    let ticketUrl: string | null = null
+    if (deps.resolveTicket) {
+      try {
+        ticketUrl = await deps.resolveTicket(downloadUrl, { sessionKey })
+      } catch (err) {
+        toast(`Download failed: ${err instanceof Error ? err.message : String(err)}`, 'warn', 3500)
+        return
+      }
+    }
+    // On the gateway-served console a ticket is same-origin and needs no
+    // header, so the browser downloads it itself, straight to disk. Off gateway
+    // it is cross-origin, where Chromium ignores `download` and navigates: it
+    // takes the fetch below, without a header.
+    if (ticketUrl && !apiOrigin()) {
+      clickDownloadLink(ticketUrl, name)
+      return
+    }
+    const headers: Record<string, string> = {}
+    if (ticketUrl) {
+      downloadUrl = ticketUrl
+    } else {
+      const token = deps.getAuthToken() || ''
+      if (token) headers['Authorization'] = `Bearer ${token}`
+      if (sessionKey) headers['x-agentos-session-key'] = sessionKey
+      downloadUrl = artifactAuthenticatedDownloadUrl(downloadUrl, { sessionKey, token })
+    }
     let response: Response
     try {
       response = await fetch(downloadUrl, {
@@ -686,12 +752,7 @@ export function createArtifactRenderer(deps: ArtifactRendererDeps) {
     }
     const blob = await response.blob()
     const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = artifact.name || 'artifact'
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
+    clickDownloadLink(url, name)
     URL.revokeObjectURL(url)
   }
 

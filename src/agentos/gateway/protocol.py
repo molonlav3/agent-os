@@ -52,6 +52,7 @@ WS_CLOSE_SEQ_GAP = 4000
 CAPABILITIES: frozenset[str] = frozenset(
     {
         "approval-events",
+        "artifact-tickets",
         "auth-rate-limit",
         "challenge-ts",
         "idempotency-keys",

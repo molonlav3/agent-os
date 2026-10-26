@@ -712,6 +712,12 @@ cron_default_mode = "bypass"            # off | bypass | full
 # ...) never receive thinking regardless of this flag. Default: true.
 # show_thinking = true
 
+# [artifacts]
+# Keep the deprecated /api/v1/artifacts/{id}?sessionKey= and
+# /api/v1/attachments/{sha256}?sessionKey= URLs this release. Clients use
+# ticketed URLs from the artifacts.download RPC.
+# legacy_session_key_urls = true
+
 # [channels]
 # [[channels.channels]]
 # name = "my-slack"

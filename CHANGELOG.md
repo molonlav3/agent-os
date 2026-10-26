@@ -126,6 +126,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   opened at. The gateway refuses to start the Control UI on a specific public
   address without it (or `control_ui.allowed_origins`), with the fix in the
   error (#3692).
+- Ticketed downloads: the `artifacts.download` RPC mints
+  `/api/v1/artifacts/download/<conn_id>/<ticket>` for an artifact or an
+  attached file — 32 random bytes, five minutes, bound to the WebSocket
+  connection that asked and revoked when it closes, at most 128 live per
+  connection. The URL needs no `Authorization` header, answers `HEAD`, one byte
+  range and `?variant=thumbnail` (PNG up to 1200 px for still images), and is
+  served with `Content-Security-Policy: default-src 'none'; sandbox`,
+  `Content-Disposition: attachment`, `Cache-Control: no-store` and
+  `X-Content-Type-Options: nosniff`. The web console and the desktop app load
+  previews, audio, cards and downloads through it, so no token appears in a
+  page URL any more and image previews work on token-auth gateways (#3693).
+- `hello-ok.features.capabilities` advertises `artifact-tickets`.
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up
@@ -178,6 +190,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Off loopback the `Host` guard answers to IP addresses, `.local` / `.ts.net`
   names and the hostnames of declared origins instead of any name; another
   name gets `400` naming `[gateway] public_origin` (#3692).
+### Deprecated
+- `GET /api/v1/artifacts/{id}?sessionKey=` and
+  `GET /api/v1/attachments/{sha256}?sessionKey=`: they keep working for this
+  release, log a deprecation warning on first use, and can be turned off now
+  with `[artifacts] legacy_session_key_urls = false` (#3693).
 
 ### Fixed
 - Gateway: SIGTERM — what `agentos gateway stop`, the desktop app, launchd

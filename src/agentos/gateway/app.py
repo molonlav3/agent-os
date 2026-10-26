@@ -704,6 +704,9 @@ def create_gateway_app(
         config=config,
         session_manager=session_manager,
     )
+    from agentos.gateway.download_grants import register_download_routes  # noqa: PLC0415
+
+    register_download_routes(app, config=config, session_manager=session_manager)
     register_audio_transcription_routes(app, config=config)
 
     return app

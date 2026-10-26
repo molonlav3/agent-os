@@ -2294,6 +2294,21 @@ class GatewayServeConfig(BaseModel):
         return cleaned
 
 
+class ArtifactsConfig(BaseModel):
+    """Download URLs for artifacts and attachments (``[artifacts]``).
+
+    ``legacy_session_key_urls`` keeps the pre-ticket
+    ``/api/v1/artifacts/{id}?sessionKey=`` and
+    ``/api/v1/attachments/{sha256}?sessionKey=`` routes answering for one
+    release, each use logged as deprecated. Clients mint a ticketed URL with
+    the ``artifacts.download`` RPC instead.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    legacy_session_key_urls: bool = True
+
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -2598,6 +2613,7 @@ class GatewayConfig(BaseSettings):
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     trading: TradingConfig = Field(default_factory=TradingConfig)
     gateway: GatewayServeConfig = Field(default_factory=GatewayServeConfig)
+    artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
 
     # Component enable flags
     control_ui: ControlUiConfig = Field(default_factory=ControlUiConfig)
@@ -3205,6 +3221,7 @@ def redact_public_config(value: Any) -> Any:
 #: install that never touched them still loads on the release before it.
 _OMIT_WHEN_DEFAULT_SECTIONS: tuple[tuple[str, type[BaseModel]], ...] = (
     ("gateway", GatewayServeConfig),
+    ("artifacts", ArtifactsConfig),
 )
 
 

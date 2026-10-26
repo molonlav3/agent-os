@@ -277,7 +277,9 @@ cards for:
 - exported data files;
 - PDFs, slide decks, images, and other generated outputs.
 
-Images and audio play inline in the card. An artifact published as
+Images and audio play inline in the card. The console loads them, and every
+download, through short-lived ticketed URLs bound to its connection, so no
+token ever appears in a page URL. An artifact published as
 `application/vnd.agentos.chart+json` renders as an interactive candlestick
 chart instead of a download chip — the `gmgn-market` and `gmgn-token` skills use
 this for token price charts.

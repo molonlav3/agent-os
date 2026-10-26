@@ -962,6 +962,9 @@ async def handle_ws_connection(
     except Exception as exc:
         log.error("ws.error", conn_id=conn_id, error=str(exc))
     finally:
+        # Download tickets are bound to this socket and die with it. Revoked
+        # before the first await below so a cancelled handler cannot skip it.
+        _revoke_download_grants(conn_id)
         # Stop the writer FIRST, before tick_task.cancel() and before
         # registry.unregister. Otherwise an EventBridge.emit on another
         # coroutine could still hold a reference to this connection while
@@ -1016,6 +1019,12 @@ async def _refuse_while_starting(conn: WsConnection, req_id: str) -> bool:
     except Exception:  # noqa: BLE001 - the client may already be gone
         pass
     return True
+
+
+def _revoke_download_grants(conn_id: str) -> None:
+    from agentos.gateway.download_grants import get_download_grants
+
+    get_download_grants().revoke_connection(conn_id)
 
 
 async def _handshake(

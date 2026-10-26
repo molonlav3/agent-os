@@ -33,6 +33,11 @@ log = structlog.get_logger(__name__)
 # guard (defined before AuthMiddleware) and AuthMiddleware share one source.
 _PUBLIC_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/startupz"})
 
+# Routes that authenticate themselves with a credential other than the gateway
+# token, so AuthMiddleware lets them through to their own check: a ticketed
+# download carries a short-lived, connection-bound grant in its path.
+_SELF_AUTHENTICATED_PREFIXES: tuple[str, ...] = ("/api/v1/artifacts/download/",)
+
 # The RPC/API surface the cross-origin guard exists to protect. A UI base_path
 # that overlaps this must NOT be trusted as an exemption prefix.
 _API_PREFIX = "/api"
@@ -282,6 +287,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)  # type: ignore[no-any-return]
 
         if request.headers.get("upgrade", "").lower() == "websocket":
+            return await call_next(request)  # type: ignore[no-any-return]
+
+        if request.url.path.startswith(_SELF_AUTHENTICATED_PREFIXES):
             return await call_next(request)  # type: ignore[no-any-return]
 
         auth_mode = self._config.auth.mode

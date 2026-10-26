@@ -1,4 +1,9 @@
-"""HTTP download route for transcript attachment material."""
+"""HTTP download route for transcript attachment material.
+
+``GET /api/v1/attachments/{sha256}?sessionKey=`` is the pre-ticket route and is
+deprecated like its artifact sibling (see ``gateway.artifacts``); the
+``artifacts.download`` RPC mints a ticketed URL for an attachment too.
+"""
 
 from __future__ import annotations
 
@@ -57,9 +62,54 @@ def _media_root_from_config(config: GatewayConfig) -> Path:
     return media_root_from_config(config)
 
 
+class AttachmentNotFoundError(LookupError):
+    """No material with that hash is stored for that session."""
+
+
+class AttachmentIntegrityError(ValueError):
+    """The stored material no longer hashes to its name."""
+
+
+async def resolve_attachment_download(
+    config: GatewayConfig,
+    session_manager: Any,
+    session_key: str,
+    sha256: str,
+) -> Path:
+    """Find ``sha256``'s material for ``session_key`` and verify it."""
+    sha = str(sha256 or "").lower()
+    media_root = _media_root_from_config(config)
+    path: Path | None = None
+    for scope in await _material_scopes_for_download(session_manager, session_key):
+        try:
+            candidate = transcript_material_path(media_root, scope, sha)
+        except ValueError:
+            continue
+        if candidate.is_file():
+            path = candidate
+            break
+    if path is None:
+        raise AttachmentNotFoundError(sha)
+    try:
+        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise AttachmentNotFoundError(sha) from exc
+    if actual_sha != sha:
+        raise AttachmentIntegrityError("Attachment integrity check failed")
+    return path
+
+
 #: Bound on the ``Content-Disposition`` filename. Trimmed from the stem so a
 #: long name still downloads as something the OS can open.
 _MAX_DOWNLOAD_NAME = 160
+
+
+def safe_download_name(value: object) -> str:
+    return _safe_download_name(value)
+
+
+def safe_media_type(value: object) -> str:
+    return _safe_media_type(value)
 
 
 def _safe_download_name(value: object) -> str:
@@ -84,6 +134,20 @@ def register_attachment_routes(
     """Register GET /api/v1/attachments/{sha256} on the given Starlette app."""
 
     async def download_handler(request: Request) -> FileResponse | JSONResponse:
+        from agentos.gateway.artifacts import (
+            legacy_session_key_urls_enabled,
+            note_legacy_download_route,
+        )
+
+        if not legacy_session_key_urls_enabled(config):
+            return JSONResponse(
+                {
+                    "error": "Session-key download URLs are disabled; use artifacts.download",
+                    "code": "NOT_FOUND",
+                },
+                status_code=404,
+            )
+        note_legacy_download_route("attachment")
         sha = str(request.path_params.get("sha256", "")).lower()
         session_key = (
             request.query_params.get("sessionKey")
@@ -91,30 +155,14 @@ def register_attachment_routes(
             or request.headers.get("x-agentos-session-key")
             or ""
         )
-        media_root = _media_root_from_config(config)
-        path: Path | None = None
-        for scope in await _material_scopes_for_download(session_manager, session_key):
-            try:
-                candidate = transcript_material_path(media_root, scope, sha)
-            except ValueError:
-                continue
-            if candidate.is_file():
-                path = candidate
-                break
-        if path is None:
-            return JSONResponse(
-                {"error": "Attachment not found", "code": "NOT_FOUND"},
-                status_code=404,
-            )
-
         try:
-            actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
+            path = await resolve_attachment_download(config, session_manager, session_key, sha)
+        except AttachmentNotFoundError:
             return JSONResponse(
                 {"error": "Attachment not found", "code": "NOT_FOUND"},
                 status_code=404,
             )
-        if actual_sha != sha:
+        except AttachmentIntegrityError:
             return JSONResponse(
                 {"error": "Attachment integrity check failed", "code": "INTEGRITY_ERROR"},
                 status_code=409,

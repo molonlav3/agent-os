@@ -1011,9 +1011,11 @@ describe('ChatPage', () => {
     clickSpy.mockRestore()
   })
 
-  it('leaves an anchor artifact chip to the browser on the gateway-served console', () => {
+  it('leaves an anchor artifact chip to the browser on a gateway without tickets', () => {
     mockRpc = makeRpc()
     renderPage()
+    // An older gateway's handshake lists no `artifacts.download`.
+    act(() => mockRpc.emit('_hello', { protocol: 3, features: { methods: ['chat.send'] } }))
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
     const thread = document.querySelector('.chat-thread') as HTMLElement
@@ -1069,6 +1071,140 @@ describe('ChatPage', () => {
         ),
       )
       // The blob then goes out through a same-document download link.
+      expect(clickSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      clickSpy.mockRestore()
+      delete window.__AGENTOS_ENV__
+      sessionStorage.removeItem('agentos.wsToken')
+    }
+  })
+
+  function answerTickets(url: string) {
+    mockRpc.call.mockImplementation((...args: unknown[]) => {
+      if (args[0] === 'artifacts.download') {
+        return Promise.resolve({ url, expiresAt: Date.now() + 300_000, ttlSeconds: 300 })
+      }
+      return Promise.resolve({})
+    })
+  }
+
+  it('loads history image and audio previews through tickets', async () => {
+    mockRpc = makeRpc()
+    mockRpc.call.mockImplementation((...args: unknown[]) => {
+      const params = (args[1] ?? {}) as Record<string, unknown>
+      if (args[0] === 'artifacts.download') {
+        return Promise.resolve({
+          url: `/api/v1/artifacts/download/conn-1/${String(params.artifact_id)}`,
+          expiresAt: Date.now() + 300_000,
+          ttlSeconds: 300,
+        })
+      }
+      if (args[0] === 'chat.history') {
+        return Promise.resolve({
+          messages: [
+            {
+              role: 'assistant',
+              text: 'Here you go',
+              timestamp: 200,
+              artifacts: [
+                { id: 'img-1', name: 'plot.png', mime: 'image/png' },
+                { id: 'snd-1', name: 'note.wav', mime: 'audio/wav' },
+              ],
+            },
+          ],
+          history_scope: 'complete',
+        })
+      }
+      return Promise.resolve({})
+    })
+    renderPage()
+
+    await waitFor(() => {
+      expect(document.querySelector('.msg-artifact-preview')).toHaveAttribute(
+        'src',
+        '/api/v1/artifacts/download/conn-1/img-1?variant=thumbnail',
+      )
+      expect(document.querySelector('.msg-artifact-audio')).toHaveAttribute(
+        'src',
+        '/api/v1/artifacts/download/conn-1/snd-1',
+      )
+    })
+    expect(document.querySelector('.chat-thread')?.innerHTML).not.toContain('token=')
+  })
+
+  it('downloads an anchor artifact chip through a ticket on the gateway-served console', async () => {
+    // With token auth the chip's own href 401s (it carries no header), so the
+    // click mints a ticket and the browser downloads that natively.
+    mockRpc = makeRpc()
+    renderPage()
+    answerTickets('/api/v1/artifacts/download/conn-1/tkt-1')
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const hrefs: string[] = []
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      hrefs.push(`${this.getAttribute('href')} ${this.download}`)
+    })
+    const thread = document.querySelector('.chat-thread') as HTMLElement
+    thread.insertAdjacentHTML(
+      'beforeend',
+      '<a class="msg-artifact-chip" href="/api/v1/artifacts/x-1?sessionKey=k" download="report.xlsx" data-artifact-id="x-1" data-artifact-name="report.xlsx" data-artifact-download="/api/v1/artifacts/x-1"><span>report.xlsx</span></a>',
+    )
+
+    try {
+      expect(fireEvent.click(screen.getByText('report.xlsx'))).toBe(false)
+      await waitFor(() =>
+        expect(hrefs).toEqual(['/api/v1/artifacts/download/conn-1/tkt-1 report.xlsx']),
+      )
+      expect(mockRpc.call).toHaveBeenCalledWith('artifacts.download', {
+        session_key: 'agent:main:webchat:default',
+        artifact_id: 'x-1',
+        transport: 'http',
+      })
+      expect(fetchMock).not.toHaveBeenCalled()
+    } finally {
+      clickSpy.mockRestore()
+    }
+  })
+
+  it('fetches a ticket without a header off gateway', async () => {
+    window.__AGENTOS_ENV__ = { apiOrigin: 'http://127.0.0.1:18791' }
+    sessionStorage.setItem('agentos.wsToken', 'tok-1')
+    mockRpc = makeRpc()
+    renderPage()
+    answerTickets('/api/v1/artifacts/download/conn-1/tkt-2')
+    const blob = new Blob(['%PDF'], { type: 'application/pdf' })
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, blob: async () => blob })
+    vi.stubGlobal('fetch', fetchMock)
+    ;(URL as unknown as { createObjectURL: unknown }).createObjectURL = vi
+      .fn()
+      .mockReturnValue('blob:attachment')
+    ;(URL as unknown as { revokeObjectURL: unknown }).revokeObjectURL = vi.fn()
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    const sha = 'cd'.repeat(32)
+    const thread = document.querySelector('.chat-thread') as HTMLElement
+    // A user message's attachment chip, as history renders it.
+    thread.insertAdjacentHTML(
+      'beforeend',
+      `<a class="msg-file-chip msg-file-chip--download" href="/api/v1/attachments/${sha}?sessionKey=k&amp;name=brief.pdf&amp;mime=application%2Fpdf" download="brief.pdf" data-artifact-download="/api/v1/attachments/${sha}?sessionKey=k&amp;name=brief.pdf&amp;mime=application%2Fpdf"><span>brief.pdf</span></a>`,
+    )
+
+    try {
+      expect(fireEvent.click(screen.getByText('brief.pdf'))).toBe(false)
+      await waitFor(() =>
+        expect(fetchMock).toHaveBeenCalledWith(
+          'http://127.0.0.1:18791/api/v1/artifacts/download/conn-1/tkt-2',
+          { method: 'GET', headers: {}, credentials: 'same-origin' },
+        ),
+      )
+      expect(mockRpc.call).toHaveBeenCalledWith('artifacts.download', {
+        session_key: 'agent:main:webchat:default',
+        attachment_sha256: sha,
+        name: 'brief.pdf',
+        mime: 'application/pdf',
+        transport: 'http',
+      })
       expect(clickSpy).toHaveBeenCalledTimes(1)
     } finally {
       clickSpy.mockRestore()

@@ -1415,6 +1415,19 @@ log_retention_sweep_interval_s = 3600.0
 - **OTLP Trace Export**: `otlp_enabled` (default `false`) sends trace events as OTLP spans over HTTP to `otlp_endpoint` (e.g. OpenTelemetry Collector).
 - **Log Retention**: `log_retention_days` (TTL) and `log_retention_max_total_mb` (total size cap) bound disk growth in `~/.agentos/logs`. Background sweeps run every `log_retention_sweep_interval_s`.
 
+## Downloads
+
+```toml
+[artifacts]
+legacy_session_key_urls = true    # keep the deprecated ?sessionKey= download URLs this release
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `artifacts.legacy_session_key_urls` | `true` | `false` makes `/api/v1/artifacts/{id}?sessionKey=` and `/api/v1/attachments/{sha256}?sessionKey=` answer `404`. Clients use ticketed URLs from `artifacts.download`; see [HTTP API](http-api.md#ticketed-downloads). |
+
+Read per request: no restart.
+
 ## Raw Config Editing
 
 For advanced settings, inspect `agentos.toml.example` and edit the active

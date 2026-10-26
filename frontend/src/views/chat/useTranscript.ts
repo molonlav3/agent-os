@@ -7,10 +7,17 @@ import { toast } from 'sonner'
 import { useRpc } from '@/app/providers'
 import { apiOrigin } from '@/lib/api-origin'
 import { callIdempotent } from '@/lib/ws-rpc'
+import {
+  bindTicketResolver,
+  createTicketResolver,
+  hydrateTicketSources,
+  type TicketResolver,
+} from '@/lib/artifact-tickets'
 import { useApprovals } from '@/services/approval-monitor'
 import { useTheme } from '@/stores/theme'
 import { chatMarkdown } from './markdown'
 import { createAcpMounter, type AcpMounter, type AcpOpenSession } from './transcript/acp'
+import { artifactAuthenticatedDownloadUrl } from './transcript/artifacts'
 import { createCardsMounter, type CardsMounter } from './transcript/cards'
 import { createChartMounter, type ChartMounter } from './transcript/chart'
 import { createDcaMounter, type DcaActions, type DcaMounter } from './transcript/dca'
@@ -91,19 +98,29 @@ function getAuthToken(): string {
 }
 
 /**
- * Fetch a chart artifact body for the chart mounter (chart.ts).
+ * Fetch an inline artifact body for the card mounters (chart.ts, cards.ts, …).
  *
- * The URL already carries `sessionKey` + `token` query params (the artifact
- * renderer builds it through `artifactPreviewUrl`); the Authorization header
- * mirrors `downloadArtifact` so both auth paths are accepted.
+ * The URL carries the session (the artifact renderer builds it through
+ * `artifactPreviewUrl`). A ticket for it needs no header; without one (an
+ * older gateway) the Authorization header mirrors `downloadArtifact`.
  */
-async function fetchChartPayload(url: string): Promise<unknown> {
-  const token = getAuthToken()
+async function fetchChartPayload(url: string, tickets: TicketResolver): Promise<unknown> {
+  const ticketUrl = await tickets.resolveUrl(url)
   const headers: Record<string, string> = {}
+  const token = ticketUrl ? '' : getAuthToken()
   if (token) headers['Authorization'] = `Bearer ${token}`
-  const response = await fetch(url, { method: 'GET', headers, credentials: 'same-origin' })
+  const response = await fetch(ticketUrl || url, {
+    method: 'GET',
+    headers,
+    credentials: 'same-origin',
+  })
   if (!response.ok) throw new Error(`chart artifact request failed: HTTP ${response.status}`)
   return response.json()
+}
+
+/** The legacy source of a ticketed preview: its URL with the token appended. */
+function legacyMediaUrl(raw: string): string {
+  return artifactAuthenticatedDownloadUrl(raw, { sessionKey: '', token: getAuthToken() })
 }
 
 /**
@@ -537,21 +554,35 @@ export function useTranscript(opts: {
     [stampRowMeta],
   )
 
+  // Ticketed file URLs (lib/artifact-tickets.ts). Previews, card payloads and
+  // downloads trade the header-authenticated gateway URLs for tickets bound to
+  // this socket, which an <img>, an <audio> or a link can load. Every
+  // connection change drops them; an older gateway answers with none, and the
+  // legacy URLs apply.
+  // eslint-disable-next-line react-hooks/refs -- the getter reads .current only when a ticket is minted, never during render
+  const [ticketResolver] = useState<TicketResolver>(() =>
+    createTicketResolver({
+      call: (method, params) => rpc.call(method, params),
+      getSessionKey: () => sessionKeyRef.current,
+    }),
+  )
+  useEffect(() => bindTicketResolver(rpc, ticketResolver), [rpc, ticketResolver])
+  // Read once, by the mounter factories below.
+  const fetchPayload = (url: string): Promise<unknown> => fetchChartPayload(url, ticketResolver)
+
   // Chart artifacts (chart.ts). The mounter owns every live chart on this
   // transcript so a theme toggle can re-color them in place and a route unmount
   // can dispose the canvases.
   const [chartMounter] = useState<ChartMounter>(() =>
     createChartMounter({
-      fetchPayload: fetchChartPayload,
+      fetchPayload,
       getTheme: () => useTheme.getState().mode,
     }),
   )
   // Card-grid artifacts (cards.ts). Plain DOM, so unlike charts there is no
   // canvas or library handle to dispose and no theme callback — the mounter only
   // tracks which placeholders it has already filled.
-  const [cardsMounter] = useState<CardsMounter>(() =>
-    createCardsMounter({ fetchPayload: fetchChartPayload }),
-  )
+  const [cardsMounter] = useState<CardsMounter>(() => createCardsMounter({ fetchPayload }))
   // Uniswap V4 liquidity cards (lp.ts). Owns a once-a-minute clock for the
   // "2m ago" stamps and the copy-button resets, both cleared on unmount. ↻
   // re-runs a card's read over this connection (the reads are agent-callable);
@@ -563,7 +594,7 @@ export function useTranscript(opts: {
   // eslint-disable-next-line react-hooks/refs -- the factory stores the getters and reads .current only later, inside click handlers and renders outside React's render
   const [lpMounter] = useState<LpMounter>(() =>
     createLpMounter({
-      fetchPayload: fetchChartPayload,
+      fetchPayload,
       call: (method, params) => rpc.call(method, params),
       actions: () => lpActionsRef.current,
     }),
@@ -579,7 +610,7 @@ export function useTranscript(opts: {
   // eslint-disable-next-line react-hooks/refs -- the factory stores the getter and reads .current only later, inside click handlers and renders outside React's render
   const [marketsMounter] = useState<MarketsMounter>(() =>
     createMarketsMounter({
-      fetchPayload: fetchChartPayload,
+      fetchPayload,
       call: (method, params) => rpc.call(method, params),
       getOnSwap: () => onMarketsSwapRef.current,
     }),
@@ -596,7 +627,7 @@ export function useTranscript(opts: {
   // eslint-disable-next-line react-hooks/refs -- the factory stores the getters and reads .current only later, inside click handlers and renders outside React's render
   const [dcaMounter] = useState<DcaMounter>(() =>
     createDcaMounter({
-      fetchPayload: fetchChartPayload,
+      fetchPayload,
       call: (method, params) => rpc.call(method, params),
       actions: () => dcaActionsRef.current,
     }),
@@ -613,7 +644,7 @@ export function useTranscript(opts: {
   // eslint-disable-next-line react-hooks/refs -- the factory stores the getters and reads .current only later, inside click handlers and renders outside React's render
   const [triggerMounter] = useState<TriggerMounter>(() =>
     createTriggerMounter({
-      fetchPayload: fetchChartPayload,
+      fetchPayload,
       call: (method, params) => rpc.call(method, params),
       actions: () => triggerActionsRef.current,
     }),
@@ -693,6 +724,10 @@ export function useTranscript(opts: {
   // threaded through every one of them.
   const mountCharts = useCallback(
     (container: HTMLElement) => {
+      hydrateTicketSources(container, {
+        resolveUrl: ticketResolver.resolveUrl,
+        fallbackUrl: legacyMediaUrl,
+      })
       chartMounter.mountCharts(container)
       cardsMounter.mountCards(container)
       lpMounter.mountLp(container)
@@ -700,7 +735,15 @@ export function useTranscript(opts: {
       dcaMounter.mountDca(container)
       triggerMounter.mountTrigger(container)
     },
-    [chartMounter, cardsMounter, lpMounter, marketsMounter, dcaMounter, triggerMounter],
+    [
+      ticketResolver,
+      chartMounter,
+      cardsMounter,
+      lpMounter,
+      marketsMounter,
+      dcaMounter,
+      triggerMounter,
+    ],
   )
 
   useEffect(() => {
@@ -745,8 +788,9 @@ export function useTranscript(opts: {
       approvePlan: () => approvePlanRef.current?.() ?? false,
       harnessCard: (spec, options) => acpMounter.harnessCard(spec, options),
       // Artifact preview/download URLs + download Authorization header
-      // (chat.js:7575/7657 `App.getAuthToken()`).
+      // (chat.js:7575/7657 `App.getAuthToken()`), for a gateway without tickets.
       getAuthToken,
+      resolveTicket: (url, options) => ticketResolver.resolveUrl(url, options),
       applySessionRunState: (state) => {
         applySessionRunState(state)
         seamsRef.current.applySessionRunState?.(state)
@@ -976,34 +1020,37 @@ export function useTranscript(opts: {
     }
   }, [controller, syncPinnedToTail])
 
-  // chat.js:916-932 `_bindHoverActions` — on the gateway-served console an
-  // anchor artifact target keeps the browser's native download; any non-anchor
-  // target delegates to the authenticated fetch path so token/session headers
-  // and failure toasts work.
+  // chat.js:916-932 `_bindHoverActions` — every artifact (and gateway-stored
+  // attachment) target downloads through `downloadArtifact`: a ticket when the
+  // gateway mints them, else the authenticated fetch, so token/session headers
+  // and failure toasts work. A chip's own href carries no credential.
   //
-  // Off gateway (the desktop renderer, loaded from disk) the native path cannot
-  // work: the chip's href points at the gateway, which is another origin, and
-  // Chromium ignores a cross-origin `download` attribute and navigates instead
-  // — a top-frame navigation the shell refuses. Every artifact target takes the
-  // fetch path there; the blob then leaves through a same-document link.
+  // The one exception is an anchor on the gateway-served console once the
+  // gateway is known to have no tickets: there the browser's native download
+  // keeps the legacy behavior. Off gateway (the desktop renderer, loaded from
+  // disk) the native path cannot work at all: the chip's href points at the
+  // gateway, which is another origin, and Chromium ignores a cross-origin
+  // `download` attribute and navigates instead — a top-frame navigation the
+  // shell refuses.
   useEffect(() => {
     const thread = containerRef.current
     if (!thread) return
     const onArtifactClick = (event: MouseEvent): void => {
       if (!(event.target instanceof Element)) return
       const artifact = event.target.closest<HTMLElement>('[data-artifact-download]')
-      if (!artifact || (artifact.tagName === 'A' && !apiOrigin())) return
+      if (!artifact) return
+      if (artifact.tagName === 'A' && !apiOrigin() && !ticketResolver.available()) return
       event.preventDefault()
       event.stopPropagation()
       void controller.downloadArtifact({
         id: artifact.dataset.artifactId || '',
-        name: artifact.dataset.artifactName || 'artifact',
+        name: artifact.dataset.artifactName || artifact.getAttribute('download') || 'artifact',
         download_url: artifact.dataset.artifactDownload || '',
       })
     }
     thread.addEventListener('click', onArtifactClick)
     return () => thread.removeEventListener('click', onArtifactClick)
-  }, [controller])
+  }, [controller, ticketResolver])
 
   // Mirror the pin into the ref the router-fx renderer reads live.
   useEffect(() => {

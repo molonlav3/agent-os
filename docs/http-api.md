@@ -78,8 +78,14 @@ lockout_seconds = 300
 exempt_loopback = true
 ```
 
-`/health`, `/ready` and `/startupz` never require a token. Cross-origin browser requests are
-governed by CORS configuration regardless of auth mode.
+`/health`, `/ready` and `/startupz` never require a token. Browser requests
+that carry an `Origin` header follow the gateway's origin policy on every bind
+— declared origins, a private address opened as itself, or a loopback origin
+on this machine — and CORS reflects only those origins, never `*`; see
+[Gateway → Browser origins](gateway.md#browser-origins).
+
+Ticketed downloads (`/api/v1/artifacts/download/...`) authenticate themselves
+instead of with the gateway token: the ticket is the credential.
 
 ## Liveness and Readiness
 
@@ -154,9 +160,41 @@ catch up on what happened while the socket was down.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/api/v1/files/upload` | Upload a file; returns an opaque id for `chat.send`. |
-| `GET` | `/api/v1/attachments/{sha256}` | Fetch an attachment by content hash. |
-| `GET` | `/api/v1/artifacts/{artifact_id}` | Fetch a generated artifact. |
+| `GET`, `HEAD` | `/api/v1/artifacts/download/{conn_id}/{ticket}` | Fetch an artifact or attachment through a ticket minted with the `artifacts.download` RPC. No `Authorization` header. |
+| `GET` | `/api/v1/attachments/{sha256}?sessionKey=` | Deprecated: fetch an attachment by content hash. |
+| `GET` | `/api/v1/artifacts/{artifact_id}?sessionKey=` | Deprecated: fetch a generated artifact. |
 | `POST` | `/api/audio/transcribe` | Transcribe audio to text. |
+
+### Ticketed downloads
+
+Over the WebSocket, ask for a download URL:
+
+```json
+{"type": "req", "id": "1", "method": "artifacts.download",
+ "params": {"session_key": "agent:main:webchat:default",
+            "artifact_id": "art-…", "transport": "http"}}
+```
+
+Use `attachment_sha256` (plus the display `name` and `mime`) instead of
+`artifact_id` for a file a user attached. The answer carries `url`
+(`/api/v1/artifacts/download/<conn_id>/<ticket>`), `expiresAt` (epoch ms),
+`ttlSeconds`, `name`, `mime` and `size`. The ticket is 32 random bytes, lives
+five minutes, is bound to the WebSocket connection that minted it and dies
+when that connection closes; a connection holds at most 128 live tickets (the
+oldest goes first). The URL works for `<img>`, `<audio>`, `fetch()` and plain
+links without a header.
+
+The route answers `HEAD`, one byte range (`Range: bytes=0-1023` → `206`;
+several ranges get the whole file), and `?variant=thumbnail` for a PNG, JPEG or
+WebP still image: a PNG no larger than 1200 px on its longest side (`415` for
+anything else). Every response carries `Content-Security-Policy: default-src
+'none'; sandbox`, `Content-Disposition: attachment`, `Cache-Control: no-store`
+and `X-Content-Type-Options: nosniff`, so an HTML or SVG file opened directly
+cannot run script. An unknown, expired, revoked or foreign ticket is `404`.
+
+The `?sessionKey=` routes keep working for this release, with a deprecation
+line in the log the first time each is used, and go away in the next. Turn
+them off now with `[artifacts] legacy_session_key_urls = false`.
 
 ## RPC over HTTP
 
@@ -394,7 +432,8 @@ The full route table is defined in `create_gateway_app`:
 [`src/agentos/gateway/app.py`](../src/agentos/gateway/app.py) (the `routes`
 list). File-and-media routes are registered just below it via
 `register_upload_routes`, `register_attachment_routes`,
-`register_artifact_routes`, and `register_audio_transcription_routes`.
+`register_artifact_routes`, `register_download_routes` and
+`register_audio_transcription_routes`.
 
 Read next:
 
