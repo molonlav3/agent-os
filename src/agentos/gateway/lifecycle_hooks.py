@@ -156,6 +156,19 @@ async def _run_callable(hook: LifecycleHook, event: LifecycleEvent) -> None:
         await result
 
 
+#: Of each event's budget, kept back to kill and reap what is still running,
+#: so the event as a whole ends inside its budget.
+_KILL_GRACE_SECONDS = 0.2
+_TEARDOWN_RESERVE_SECONDS = 0.3
+
+
+def _kill_group(pid: int) -> None:
+    import signal
+
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, signal.SIGKILL)
+
+
 async def _run_command(command: str, event: LifecycleEvent) -> None:
     process = await asyncio.create_subprocess_exec(
         "/bin/sh",
@@ -170,10 +183,12 @@ async def _run_command(command: str, event: LifecycleEvent) -> None:
     try:
         output, _ = await process.communicate()
     except asyncio.CancelledError:
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
+        # The command runs in its own session (start_new_session), so its
+        # process group is everything it started: kill all of it, not just
+        # the shell, or a ``sleep`` it spawned outlives the gateway.
+        _kill_group(process.pid)
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(process.wait(), timeout=1.0)
+            await asyncio.wait_for(process.wait(), timeout=_KILL_GRACE_SECONDS)
         raise
     if process.returncode != 0:
         tail = output.decode("utf-8", "replace")[-400:] if output else ""
@@ -206,7 +221,9 @@ async def run_lifecycle_hooks(
     started = time.monotonic()
     tasks = {asyncio.ensure_future(job): label for label, job in jobs}
     limit = budget if budget is not None else BUDGETS[event]
-    done, pending = await asyncio.wait(tasks, timeout=limit)
+    done, pending = await asyncio.wait(
+        tasks, timeout=max(0.0, limit - min(_TEARDOWN_RESERVE_SECONDS, limit / 2))
+    )
     for task in pending:
         task.cancel()
         report.timed_out.append(tasks[task])

@@ -1474,11 +1474,6 @@ class GatewayServer:
 
             if get_maintenance() is self._maintenance:
                 set_maintenance(None)
-        # Skills and operator commands get to flush first, while everything
-        # still works (bounded: 5 s total, never raises).
-        from agentos.gateway.lifecycle_hooks import run_shutdown_hooks_once
-
-        await run_shutdown_hooks_once(getattr(self, "config", None), reason)
         if self._config_watcher is not None:
             try:
                 await self._config_watcher.stop()
@@ -1505,6 +1500,20 @@ class GatewayServer:
                             graceful.cancel()
             except Exception:
                 pass
+
+        # Lifecycle hooks run once the turns have drained -- nothing is still
+        # writing the state they flush -- and while channels and services are
+        # still up (bounded: 10 s pre-restart, 5 s shutdown; never raises).
+        from agentos.gateway.lifecycle_hooks import (
+            PRE_RESTART,
+            run_lifecycle_hooks,
+            run_shutdown_hooks_once,
+        )
+
+        config = getattr(self, "config", None)
+        if reason.startswith("restart"):
+            await run_lifecycle_hooks(PRE_RESTART, config=config, reason=reason)
+        await run_shutdown_hooks_once(config, reason)
 
         if self._background_completion_manager is not None:
             try:

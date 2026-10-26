@@ -541,7 +541,8 @@ curl -X POST -H "Authorization: Bearer $AGENTOS_HOOKS_TOKEN" \
 They use their own `[hooks] token`, never the gateway token. Retried
 deliveries are deduplicated by `idempotency_key` (or the `Idempotency-Key`
 header) for five minutes; each hook is limited to `rate_limit_per_minute` calls
-and `max_sessions_per_hook` sessions. Setup: [Configuration → Inbound
+and `max_sessions_per_hook` sessions per hour; reusing an idempotency key for a
+different body is `409`. Setup: [Configuration → Inbound
 webhooks](configuration.md#inbound-webhooks); responses: [HTTP API → Inbound
 webhooks](http-api.md#inbound-webhooks).
 

@@ -1444,7 +1444,7 @@ All three are read per request: no restart.
 [hooks]
 token = "<long random secret, not the gateway token>"
 rate_limit_per_minute = 60        # per hook name; 429 beyond it
-max_sessions_per_hook = 1         # distinct sessions one hook may deliver into
+max_sessions_per_hook = 1         # distinct sessions one hook may deliver into per hour
 
 [hooks.routes.github]             # POST /api/v1/hooks/github
 agent = "main"
@@ -1498,7 +1498,8 @@ event listing `hot` and `restartRequired` paths. Restart to apply those.
 An edit that does not parse or validate never replaces the running config: the
 gateway keeps its last good settings, logs `config.reload_skipped`, sends
 `config.changed` with `status: "invalid"`, and `agentos doctor` reports
-`gateway.config.reload_skipped` until a good save. `--listen` / `--port`
+`gateway.config.reload_skipped` until a good save (fixing the file back to
+the running settings sends `config.changed` with `status: "recovered"`). `--listen` / `--port`
 overrides and runtime-only secrets (an auto-generated token, keys from the
 environment) carry over a reload. The gateway's own writes are recognized and
 cause no reload.

@@ -624,9 +624,10 @@ def _config_reload_findings(ctx: RpcContext) -> list[HealthFinding]:
                 surface="gateway",
                 title="Config changes wait for a gateway restart",
                 detail=(
-                    "Saved changes to "
+                    "Changes to "
                     + ", ".join(reasons)
-                    + " are on disk but the running gateway still uses the old values."
+                    + " are saved, but parts of the gateway read them only at startup; "
+                    "they take full effect after a restart."
                 ),
                 evidence={"reasons": reasons, "paths": list(status.restart_paths)},
                 fix_steps=[FixStep(label="Restart the gateway", command="agentos gateway restart")],

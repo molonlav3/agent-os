@@ -171,10 +171,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Lifecycle hooks `gateway:startup`, `gateway:shutdown` (5 s budget) and
   `gateway:pre-restart` (10 s) for in-process code
   (`lifecycle_hooks.register_lifecycle_hook`) and for file-only shell commands
-  in `[hooks.lifecycle]` (#3697).
+  in `[hooks.lifecycle]`, run after in-flight turns drain; a command that runs
+  past the budget is killed with its whole process group (#3697).
 - Inbound webhooks `POST /api/v1/hooks/agent`, `/wake` and `/<name>` with their
   own `[hooks] token` (the gateway token is refused), five-minute
-  `idempotency_key` dedupe, a per-hook rate limit (`429`) and fan-out cap, and
+  `idempotency_key` dedupe (`409` for a reused key with another body), a
+  per-hook rate limit (`429`), a fan-out cap per rolling hour, and
   `[hooks.routes.<name>]` agent / session / message template mapping (#3697).
 - `hello-ok.features.capabilities` advertises `artifact-tickets`,
   `config-reload`, `tools-invoke` and `web-push`.

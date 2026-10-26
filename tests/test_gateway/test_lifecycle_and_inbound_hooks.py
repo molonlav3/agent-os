@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +118,34 @@ class TestLifecycleHooks:
         report = await run_lifecycle_hooks(SHUTDOWN, config=config, reason="stop")
         assert report.failed == [] and len(report.ran) == 1
         assert out.read_text() == "gateway:shutdown|stop|none"
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_the_whole_process_group_within_budget(
+        self, tmp_path: Path
+    ) -> None:
+        import time
+
+        pidfile = tmp_path / "child.pid"
+        config = GatewayConfig(
+            hooks=HooksConfig(
+                lifecycle=LifecycleHooksConfig(shutdown=[f"sleep 30 & echo $! > {pidfile}; wait"])
+            )
+        )
+        started = time.monotonic()
+        report = await run_lifecycle_hooks(SHUTDOWN, config=config, budget=1.0)
+        elapsed = time.monotonic() - started
+        assert report.timed_out == [f"command:sleep 30 & echo $! > {pidfile}; wait"]
+        assert elapsed < 1.0
+        child = int(pidfile.read_text().strip())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.02)
+        else:  # pragma: no cover - the orphan survived
+            os.kill(child, 9)
+            pytest.fail("the command's child process outlived the budget")
 
     @pytest.mark.asyncio
     async def test_failing_or_hanging_command_is_contained(self, tmp_path: Path) -> None:
@@ -416,3 +445,101 @@ def test_hooks_routes_bypass_the_gateway_token_gate_only_for_their_own_check() -
     assert client.post("/api/v1/hooks/agent", json={"message": "x"}).status_code == 401
     # The gateway token still guards the rest of the API.
     assert client.get("/api/sessions", headers=_auth()).status_code == 401
+
+
+class TestHookAuthHardening:
+    """#3697 follow-up: a hostile bearer must never produce a traceback."""
+
+    @pytest.mark.parametrize(
+        "raw", [b"Bearer \xc3\xa9", b"Bearer \xff\xfe", b"Bearer " + b"x" * 5000]
+    )
+    def test_non_ascii_or_huge_token_is_a_plain_401(self, raw: bytes) -> None:
+        from structlog.testing import capture_logs
+
+        client, recorder = _hooks_client()
+        with capture_logs() as logs:
+            resp = client.post(
+                "/api/v1/hooks/agent",
+                json={"message": "x"},
+                headers={"authorization": raw},  # raw bytes, as curl sends them
+            )
+        assert resp.status_code == 401
+        assert recorder.messages == []
+        dumped = repr(logs)
+        assert HOOK_TOKEN not in dumped and GATEWAY_TOKEN not in dumped
+
+    def test_non_ascii_header_token(self) -> None:
+        client, _ = _hooks_client()
+        resp = client.post(
+            "/api/v1/hooks/agent",
+            json={"message": "x"},
+            headers={"x-agentos-hook-token": b"\xc3\xa9"},
+        )
+        assert resp.status_code == 401
+
+    def test_unexpected_failure_is_contained_without_secrets(self) -> None:
+        from structlog.testing import capture_logs
+
+        class _Exploding(_Recorder):
+            async def dispatch(self, *_a: Any) -> Any:
+                raise RuntimeError(f"boom with {HOOK_TOKEN}")
+
+        client, _ = _hooks_client(recorder=_Exploding())
+        with capture_logs() as logs:
+            resp = client.post("/api/v1/hooks/agent", json={"message": "x"}, headers=_auth())
+        assert resp.status_code == 500
+        assert resp.json()["code"] == "INTERNAL_ERROR"
+        failures = [e for e in logs if e["event"] == "gateway.hook_failed"]
+        assert failures and "exc_info" not in failures[0]
+
+    def test_idempotency_key_reused_for_another_body_conflicts(self) -> None:
+        client, recorder = _hooks_client()
+        first = client.post(
+            "/api/v1/hooks/agent", json={"message": "a", "idempotency_key": "k"}, headers=_auth()
+        )
+        second = client.post(
+            "/api/v1/hooks/agent", json={"message": "b", "idempotency_key": "k"}, headers=_auth()
+        )
+        assert (first.status_code, second.status_code) == (202, 409)
+        assert second.json()["code"] == "REQUEST_CONFLICT"
+        assert len(recorder.messages) == 1
+
+    def test_fan_out_cap_is_a_rolling_window(self) -> None:
+        from agentos.gateway.inbound_hooks import FANOUT_WINDOW_SECONDS
+
+        now = [0.0]
+        guards = HookGuards(clock=lambda: now[0])
+        client, _ = _hooks_client(guards=guards)
+
+        def post(key: str) -> int:
+            return client.post(
+                "/api/v1/hooks/agent",
+                json={"message": "x", "session_key": key},
+                headers=_auth(),
+            ).status_code
+
+        assert post("agent:main:hook:a") == 202
+        assert post("agent:main:hook:b") == 409
+        now[0] = FANOUT_WINDOW_SECONDS + 1
+        assert post("agent:main:hook:b") == 202
+
+
+class TestHookOrderingOnRestart:
+    @pytest.mark.asyncio
+    async def test_pre_restart_runs_after_the_drain_then_shutdown(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from agentos.gateway.boot import GatewayServer
+
+        order: list[str] = []
+        runtime = MagicMock()
+        runtime.shutdown = AsyncMock(side_effect=lambda **_k: order.append("drain"))
+        services = MagicMock()
+        services.task_runtime = runtime
+        services.close = AsyncMock()
+        register_lifecycle_hook(PRE_RESTART, lambda _e: order.append("pre-restart"))
+        register_lifecycle_hook(SHUTDOWN, lambda _e: order.append("shutdown"))
+        server = GatewayServer(app=Starlette(), config=GatewayConfig())
+        server._services = services
+        await server.close("restart:safe")
+        assert order == ["drain", "pre-restart", "shutdown"]

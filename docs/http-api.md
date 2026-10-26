@@ -302,8 +302,10 @@ token they answer `404`.
 Delivery answers `202` with `sessionKey`. Per hook name: `429` past
 `rate_limit_per_minute` (default 60, with `Retry-After`); an `idempotency_key`
 in the body or an `Idempotency-Key` header replays the first answer for five
-minutes (`duplicate: true`); and `409 FANOUT_LIMIT` once the hook has
-delivered into `max_sessions_per_hook` (default 1) distinct sessions. See
+minutes (`duplicate: true`), and the same key with a different body is `409
+REQUEST_CONFLICT`; and `409 FANOUT_LIMIT` once the hook has delivered into
+`max_sessions_per_hook` (default 1) distinct sessions within the last hour. A
+malformed or wrong token is `401`, never an error page. See
 [Configuration → Inbound webhooks](configuration.md#inbound-webhooks) and
 [Scheduling → Automation](scheduling.md#automation-from-outside).
 

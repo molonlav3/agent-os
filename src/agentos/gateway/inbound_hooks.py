@@ -19,14 +19,15 @@ Guard rails, per hook name: ``rate_limit_per_minute`` (default 60) answered
 with ``429``; ``idempotency_key`` (body) or an ``Idempotency-Key`` header
 replays the first response for five minutes; and a fan-out cap,
 ``max_sessions_per_hook`` (default 1), on the distinct sessions a hook may
-deliver into. A caller-chosen ``session_key`` must stay in the hook namespace
-``agent:<agent>:hook:...``; only a route's own ``session_key`` (written by the
-operator) can point a hook at an existing conversation.
+deliver into within any rolling hour. Reusing an idempotency key for a
+different body is ``409 REQUEST_CONFLICT``. A caller-chosen ``session_key``
+must stay in the hook namespace ``agent:<agent>:hook:...``; only a route's
+own ``session_key`` (written by the operator) can point a hook at an existing
+conversation.
 """
 
 from __future__ import annotations
 
-import hmac
 import json
 import re
 import time
@@ -49,6 +50,8 @@ HOOKS_PREFIX = "/api/v1/hooks"
 IDEMPOTENCY_TTL_SECONDS = 300.0
 IDEMPOTENCY_MAX_ENTRIES = 2048
 RATE_WINDOW_SECONDS = 60.0
+#: The fan-out cap counts distinct sessions delivered into within this window.
+FANOUT_WINDOW_SECONDS = 3600.0
 MAX_MESSAGE_CHARS = 32_000
 MAX_BODY_BYTES = 256 * 1024
 _TEMPLATE_FIELD = re.compile(r"\{\{\s*([A-Za-z0-9_.\-]+)\s*\}\}")
@@ -101,6 +104,7 @@ class _Replay:
     created_at: float
     status: int
     body: dict[str, Any]
+    fingerprint: str = ""
 
 
 class HookGuards:
@@ -110,7 +114,8 @@ class HookGuards:
         self._clock = clock
         self._windows: dict[str, deque[float]] = {}
         self._replays: OrderedDict[tuple[str, str], _Replay] = OrderedDict()
-        self._sessions: dict[str, set[str]] = {}
+        # hook -> {session key -> last delivery}, pruned to the fan-out window.
+        self._sessions: dict[str, dict[str, float]] = {}
 
     def throttled(self, hook: str, limit: int) -> float | None:
         """Seconds until ``hook`` may be called again, or None to admit (and count) it."""
@@ -131,19 +136,34 @@ class HookGuards:
             self._replays.pop(stale, None)
         return self._replays.get((hook, key))
 
-    def remember(self, hook: str, key: str, status: int, body: dict[str, Any]) -> None:
-        self._replays[(hook, key)] = _Replay(self._clock(), status, body)
+    def remember(
+        self, hook: str, key: str, status: int, body: dict[str, Any], fingerprint: str = ""
+    ) -> None:
+        self._replays[(hook, key)] = _Replay(self._clock(), status, body, fingerprint)
         while len(self._replays) > IDEMPOTENCY_MAX_ENTRIES:
             self._replays.popitem(last=False)
 
     def admit_session(self, hook: str, session_key: str, cap: int) -> bool:
-        seen = self._sessions.setdefault(hook, set())
-        if session_key in seen:
-            return True
-        if len(seen) >= cap:
+        """At most ``cap`` distinct sessions per hook within any rolling window."""
+        now = self._clock()
+        seen = self._sessions.setdefault(hook, {})
+        for stale in [k for k, at in seen.items() if now - at >= FANOUT_WINDOW_SECONDS]:
+            seen.pop(stale, None)
+        if session_key not in seen and len(seen) >= cap:
             return False
-        seen.add(session_key)
+        seen[session_key] = now
         return True
+
+
+def _body_fingerprint(body: Any) -> str:
+    """Stable digest of a hook body, its own ``idempotency_key`` left out."""
+    import hashlib
+
+    material = body
+    if isinstance(body, dict):
+        material = {k: v for k, v in body.items() if k != "idempotency_key"}
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _presented_token(request: Request) -> str:
@@ -155,6 +175,57 @@ def _presented_token(request: Request) -> str:
 
 def _hooks_config(config: Any) -> Any:
     return getattr(config, "hooks", None)
+
+
+def _check_hook_token(config: Any, presented: str) -> JSONResponse | None:
+    """``None`` when ``presented`` is the hooks token, else the refusal to send."""
+    from agentos.gateway.auth import token_matches
+
+    hooks = _hooks_config(config)
+    expected = getattr(hooks, "token", "") or ""
+    if not isinstance(expected, str) or not expected:
+        return _not_found()
+    gateway_token = getattr(getattr(config, "auth", None), "token", "") or ""
+    if isinstance(gateway_token, str) and gateway_token and token_matches(expected, gateway_token):
+        log.error(
+            "gateway.hooks_token_reuses_gateway_token",
+            hint="set a [hooks] token different from the gateway token",
+        )
+        return _not_found()
+    if isinstance(gateway_token, str) and gateway_token and token_matches(presented, gateway_token):
+        return _json_error(
+            401, "UNAUTHORIZED", "The gateway token is not accepted here; use the hooks token"
+        )
+    if not token_matches(presented, expected):
+        return _json_error(401, "UNAUTHORIZED", "Unauthorized")
+    return None
+
+
+def _contained(handler: Callable[[Request], Any]) -> Callable[[Request], Any]:
+    """Answer a generic 500 for anything a hook handler did not expect.
+
+    The default error path logs a full traceback, and the console renderer
+    prints each frame's locals -- the gateway config and its tokens among
+    them. A hook route is reachable by anyone who can reach the port, so its
+    failures are logged by type and redacted message only.
+    """
+
+    async def wrapped(request: Request) -> JSONResponse:
+        try:
+            response: JSONResponse = await handler(request)
+            return response
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            from agentos.redact import redact_sensitive_text
+
+            log.warning(
+                "gateway.hook_failed",
+                path=request.url.path,
+                error_type=type(exc).__name__,
+                error=(redact_sensitive_text(str(exc)) or "")[:300],
+            )
+            return _json_error(500, "INTERNAL_ERROR", "The hook could not be handled")
+
+    return wrapped
 
 
 def default_hook_session(agent_id: str, name: str) -> str:
@@ -188,25 +259,10 @@ def register_inbound_hook_routes(
     state = guards or HookGuards()
 
     def authenticate(request: Request) -> JSONResponse | None:
-        hooks = _hooks_config(config)
-        expected = str(getattr(hooks, "token", "") or "")
-        if not expected:
-            return _not_found()
-        gateway_token = str(getattr(getattr(config, "auth", None), "token", "") or "")
-        if gateway_token and hmac.compare_digest(expected, gateway_token):
-            log.error(
-                "gateway.hooks_token_reuses_gateway_token",
-                hint="set a [hooks] token different from the gateway token",
-            )
-            return _not_found()
-        presented = _presented_token(request)
-        if gateway_token and presented and hmac.compare_digest(presented, gateway_token):
-            return _json_error(
-                401, "UNAUTHORIZED", "The gateway token is not accepted here; use the hooks token"
-            )
-        if not presented or not hmac.compare_digest(presented, expected):
-            return _json_error(401, "UNAUTHORIZED", "Unauthorized")
-        return None
+        # ``token_matches`` compares UTF-8 bytes in constant time and never
+        # raises: a header the client controls (any bytes, any length) must
+        # not turn into an exception whose traceback carries the secrets.
+        return _check_hook_token(config, _presented_token(request))
 
     async def read_body(request: Request) -> tuple[Any, JSONResponse | None]:
         raw = await request.body()
@@ -277,13 +333,20 @@ def register_inbound_hook_routes(
         if error is not None:
             return error
         key = idempotency_key(request, body)
+        fingerprint = _body_fingerprint(body)
         if key is not None:
             replay = state.replay(hook, key)
             if replay is not None:
+                if replay.fingerprint != fingerprint:
+                    return _json_error(
+                        409,
+                        "REQUEST_CONFLICT",
+                        "idempotency_key was already used for a different request",
+                    )
                 return JSONResponse({**replay.body, "duplicate": True}, status_code=replay.status)
         status, payload = await handler(body)
         if key is not None and status < 500:
-            state.remember(hook, key, status, payload)
+            state.remember(hook, key, status, payload, fingerprint)
         return JSONResponse(payload, status_code=status)
 
     async def agent_hook(request: Request) -> JSONResponse:
@@ -367,9 +430,9 @@ def register_inbound_hook_routes(
 
     app.router.routes.extend(
         [
-            Route(f"{HOOKS_PREFIX}/agent", agent_hook, methods=["POST"]),
-            Route(f"{HOOKS_PREFIX}/wake", wake_hook, methods=["POST"]),
-            Route(f"{HOOKS_PREFIX}/{{name}}", named_hook, methods=["POST"]),
+            Route(f"{HOOKS_PREFIX}/agent", _contained(agent_hook), methods=["POST"]),
+            Route(f"{HOOKS_PREFIX}/wake", _contained(wake_hook), methods=["POST"]),
+            Route(f"{HOOKS_PREFIX}/{{name}}", _contained(named_hook), methods=["POST"]),
         ]
     )
 

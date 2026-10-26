@@ -445,11 +445,6 @@ class GatewayRestarter:
             self._abort_before_close(req)
             return
 
-        # Skills flush state before the process image is replaced (10 s total).
-        from agentos.gateway.lifecycle_hooks import PRE_RESTART, run_lifecycle_hooks
-
-        await run_lifecycle_hooks(PRE_RESTART, config=self._config, reason=req.mode)
-
         timeout = drain_timeout_for(req.mode)
         log.info(
             "gateway.restart_draining",

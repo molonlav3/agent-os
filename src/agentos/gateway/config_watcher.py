@@ -9,7 +9,8 @@ pending. A ``config.changed`` event tells connected consoles what happened.
 
 A file that does not parse or validate never replaces the running config: the
 last good snapshot stays, ``config.reload_skipped`` is logged, and the event
-carries ``status: "invalid"``. A write the gateway made itself (a config RPC)
+carries ``status: "invalid"``; fixing it back to the running settings sends
+``status: "recovered"``. A write the gateway made itself (a config RPC)
 is recognized by content and does nothing. ``[gateway] config_reload =
 false`` turns the watcher off without a restart.
 """
@@ -166,8 +167,26 @@ class ConfigWatcher:
             )
             return
         if not result.changed:
+            previous = _last_status.status
             _last_status = ReloadStatus(status="unchanged", at=time.time())
             log.debug("config.reload_unchanged", path=str(result.path))
+            if previous == "invalid":
+                # The broken file was fixed back to what is running: say so,
+                # or a console showing the error would keep showing it.
+                await self._send(
+                    {
+                        "source": "file",
+                        "status": "recovered",
+                        "path": str(result.path),
+                        "revision": result.revision,
+                        "changed": [],
+                        "hot": [],
+                        "restartRequired": [],
+                        "restartReasons": [],
+                        "pendingRestart": False,
+                        "appliedNow": True,
+                    }
+                )
             return
         _last_status = ReloadStatus(
             status="applied",

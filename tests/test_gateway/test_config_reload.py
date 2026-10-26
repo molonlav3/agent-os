@@ -245,3 +245,36 @@ def test_doctor_reports_pending_restart_and_skipped_reload(tmp_path: Path) -> No
         config_watcher._last_status = config_watcher.ReloadStatus()
     assert findings["gateway.config.restart_pending"].restart_required is True
     assert findings["gateway.config.reload_skipped"].detail == "x: bad"
+
+
+@pytest.mark.asyncio
+async def test_fixing_an_invalid_file_is_announced(tmp_path: Path) -> None:
+    path, running = _running(tmp_path)
+    good = path.read_text(encoding="utf-8")
+    events: list[dict[str, Any]] = []
+
+    async def emit(_event: str, payload: dict[str, Any]) -> None:
+        events.append(payload)
+
+    watcher = ConfigWatcher(lambda: _ctx(running), emit=emit, sleep=_Sleeper())
+    watcher.start()
+    await watcher.stop()
+    path.write_text("[broken", encoding="utf-8")
+    await watcher.poll_once()
+    path.write_text(good, encoding="utf-8")
+    await watcher.poll_once()
+    assert [e["status"] for e in events] == ["invalid", "recovered"]
+    assert last_reload_status().status == "unchanged"
+
+
+def test_doctor_wording_does_not_claim_old_values(tmp_path: Path) -> None:
+    from agentos.gateway.config_commit import _record_pending_restart
+    from agentos.gateway.rpc_doctor import _config_reload_findings
+
+    config = GatewayConfig()
+    _record_pending_restart(config, ["config"])
+    [finding] = [
+        f for f in _config_reload_findings(_ctx(config)) if f.id == "gateway.config.restart_pending"
+    ]  # type: ignore[arg-type]
+    assert "old values" not in finding.detail
+    assert "read them only at startup" in finding.detail
