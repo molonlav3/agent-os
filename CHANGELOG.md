@@ -111,7 +111,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   reply when a chat is reopened (#3687).
 - Gateway: `chat.history` takes a `delta_cursor` to fetch only the messages
   after the ones a client already has, and a new `chat.entry` method returns a
-  message too large to include in a history page (#3696).
+  message too large to include in a history page; the web console and desktop
+  app show such a message as "Message truncated (N KiB) · Show full" and read
+  only the new messages on reconnect (#3696).
 - Gateway: `hello-ok.features.capabilities` also lists `terminal-replay`,
   `approval-events`, `inflight-snapshot` and `idempotency-keys`.
 
@@ -190,6 +192,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   while the gateway was down wait `[scheduler] startup_agent_delay_seconds`
   (default 120) after boot instead of competing with channel start-up; the
   catch-up cap (5) and the 10 s stagger are unchanged. (#3683)
+- A follow-up turn on a finished coding-agent or subagent session now shows
+  in a view left open on it; it used to restart the session's stream
+  numbering, so the view dropped the new turn as already seen.
+- Stopping a run that waits on an approval withdraws the prompt from every
+  console, and an expired prompt goes away on its own instead of staying on
+  screen.
+- After an interrupted turn (a second message under the interrupt queue
+  mode) the session no longer reads "killed" while the replacement runs,
+  and the replacement's end is announced.
+- `agentos sessions abort` says which child runs it stopped and which are
+  still running.
 - A run now always ends with exactly one `done` / `error` event, including
   after a cancel or a crash, and the run's end is replayed to a client that
   reconnects late. A coding-agent child stopped together with its parent no

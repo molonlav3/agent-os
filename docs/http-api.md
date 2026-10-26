@@ -140,8 +140,10 @@ for every namespace (`exec`, `plugin`, `acp`, `acp_elicitation`):
   summary, tool, command, approval}` (fields that do not apply are omitted;
   `approval` is the item exactly as `GET /api/approvals` lists it).
 - `approval.resolved` — `{id, namespace, decision, resolved_by, resolved_at}`,
-  `decision` being `approved`, `denied` or `expired`; `resolved_by` is
-  `operator`, `policy`, `session_elevation`, `timeout` or `system`.
+  `decision` being `approved`, `denied`, `expired` or `cancelled` (its run was
+  aborted); `resolved_by` is `operator`, `policy`, `session_elevation`,
+  `timeout`, `abort` or `system`. The gateway sweeps the queue every 30 s, so
+  an expiry is announced even when nothing waits on the prompt.
 
 A row an `auto-approve` / `auto-deny` policy settles in the same call that
 queued it is not announced at all. Use the REST list once per (re)connect to
@@ -319,10 +321,18 @@ before relying on it.
   the turn instead of starting another.
 
 `sessions.abort` stops the session's run and every child run it spawned
-(coding-agent and subagent sessions, any depth), waits up to 10 s for them to
-end, and answers `{aborted: [<run ids>], children_aborted: [<session keys>],
-key}`. If some are still running after that, it fails with `UNAVAILABLE` and
-`details: {code: "ABORT_INCOMPLETE", still_running: [...]}`.
+(coding-agent and subagent sessions, any depth), withdraws the approval
+prompts they were waiting on, waits up to 10 s for them to end, and answers
+`{aborted: [<run ids>], children_aborted: [<session keys>], key}`. If some are
+still running after that, it fails with `UNAVAILABLE` and
+`details: {code: "ABORT_INCOMPLETE", still_running: [...]}`. It waits in its
+session's lane, so other sessions' requests on the same socket go ahead; the
+runs it stops are the ones active when it started.
+
+A session's `stream_seq` keeps counting for as long as the session exists (a
+follow-up turn on a finished child continues it); it restarts only with the
+gateway, which a subscribe answer shows as a `current_stream_seq` below the
+client's cursor or `replay_gap_reason: "cursor_ahead_of_stream"`.
 
 `chat.history` answers stay under 6 MiB. A message over 128 KiB arrives as a
 placeholder (`placeholder: true`, `byte_size`, `entry_id`, the tool calls'
