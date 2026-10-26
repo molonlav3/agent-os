@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -265,3 +266,66 @@ async def test_shutdown_event_carries_restart_intent(expected: int | None) -> No
     assert conn.closed is True
     assert readiness.phase == "draining"
     assert readiness.state() == "draining"
+
+
+class _WireRecorder:
+    """Starlette-shaped socket: refuses ``send`` once a close has been sent."""
+
+    def __init__(self) -> None:
+        from starlette.websockets import WebSocketState
+
+        self.client_state = WebSocketState.CONNECTED
+        self.sent: list[dict[str, Any]] = []
+        self.close_codes: list[int] = []
+
+    async def send_text(self, text: str) -> None:
+        import json
+
+        if self.close_codes:
+            raise RuntimeError('Cannot call "send" once a close message has been sent.')
+        self.sent.append(json.loads(text))
+
+    async def close(self, code: int = 1000, reason: str | None = None) -> None:
+        self.close_codes.append(code)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "close() broadcasts `shutdown` into each connection's writer queue and "
+        "closes the socket 1012 before the writer has flushed it, so the frame "
+        "is dropped. The flush-before-close ordering lands with the gateway "
+        "hardening branch; drop this marker once this branch is rebased on it."
+    ),
+)
+@pytest.mark.asyncio
+async def test_shutdown_frame_reaches_a_client_through_its_writer_queue() -> None:
+    from agentos.gateway.access import ConnectionSurface
+    from agentos.gateway.auth import AccessContext
+    from agentos.gateway.websocket import WsConnection
+
+    wire = _WireRecorder()
+    conn = WsConnection(conn_id="writer-conn", ws=wire)  # type: ignore[arg-type]
+    conn.access = AccessContext(
+        surface=ConnectionSurface.CONTROL, admitted=True, credential_verified=True
+    )
+    conn._start_writer(maxsize=64, enabled=True)
+    registry = get_registry()
+    registry.register(conn)
+    readiness = GatewayReadiness(clock=_Clock())
+    readiness.mark_serving()
+    server = GatewayServer(app=create_gateway_app(GatewayConfig()), config=GatewayConfig())
+    server.readiness = readiness
+    try:
+        await server.close("restart:safe", restart_expected_ms=4500)
+        await asyncio.sleep(0.05)  # give the writer every chance to run
+    finally:
+        registry.unregister(conn.conn_id)
+        await conn._stop_writer()
+
+    assert wire.close_codes == [1012]
+    shutdown = [f for f in wire.sent if f.get("event") == "shutdown"]
+    assert shutdown and shutdown[0]["payload"] == {
+        "reason": "restart:safe",
+        "restart_expected_ms": 4500,
+    }
