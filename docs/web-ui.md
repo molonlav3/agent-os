@@ -407,8 +407,8 @@ A job that keeps failing is marked on its card: a **Degraded** badge, the
 consecutive failure count and the last error. They come from the `health`
 block on `cron.list` (the engine calls a job degraded at 3 failures in a
 row); a gateway older than that is read from the job's `consecutive_errors`
-and last error with the same threshold. When the job carries an overlap policy (`concurrency`), an
-**Overlap** picker sets it (`forbid` skips a run while one is going,
+and last error with the same threshold. When the job carries an overlap
+policy (`concurrency`), an **Overlap** picker sets it (`forbid` skips a run while one is going,
 `replace` stops the running one, `allow` runs them side by side) through
 `cron.update`; it does not appear when the job has no `concurrency`. **Run**
 and **Pause** are disabled, with the reason, while the gateway is offline or
