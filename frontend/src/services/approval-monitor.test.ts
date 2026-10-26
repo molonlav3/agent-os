@@ -883,6 +883,30 @@ describe('approval-monitor pure helpers', () => {
         created_at: 5,
       })
     })
+    it('keeps the audience of a child prompt, attached or from the summary fields', () => {
+      const audience = ['agent:main:subagent:s1', 'agent:main:webchat:abc']
+      expect(
+        approvalFromEvent({
+          id: 'a1',
+          namespace: 'exec',
+          audience_session_keys: audience,
+          approval: { id: 'a1', audienceSessionKeys: audience },
+        })?.audienceSessionKeys,
+      ).toEqual(audience)
+      expect(
+        approvalFromEvent({
+          id: 'a1',
+          namespace: 'exec',
+          session_key: audience[0],
+          audience_session_keys: [...audience, 7, ''],
+        }),
+      ).toEqual({
+        id: 'a1',
+        namespace: 'exec',
+        sessionKey: audience[0],
+        audienceSessionKeys: audience,
+      })
+    })
     it('falls back to the summary fields when the attached item has no id', () => {
       expect(approvalFromEvent({ id: 'a1', namespace: 'exec', approval: {} })).toEqual({
         id: 'a1',

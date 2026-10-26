@@ -156,13 +156,16 @@ desktop app's approval dialog. Beyond that:
 - **Web Push.** In the web console, Settings → *Push notifications for
   approvals* subscribes this browser (it asks for notification permission;
   it needs HTTPS or `localhost`). Each new approval is pushed with a link to
-  the approvals page; when it is resolved, by anyone or by timeout, a
-  replacement notice says it is no longer pending. Messages are encrypted
+  the approvals page; when it is resolved a replacement notice says how —
+  granted, denied, expired, or cancelled because its run was stopped. The
+  push goes out from the same queue write that announces `approval.resolved`
+  to consoles. Messages are encrypted
   for the subscribed browser, expire with the approval and carry only its
   title. Turn it off per gateway with `[push] web_enabled = false`.
 - **Parent sessions.** An approval records `audience_session_keys`: the
   session that asked, then the sessions that spawned it (a coding harness's
-  or subagent's parent, and that session's parent). The chat view of any of
+  or subagent's parent, and that session's parent). The `approval.requested`
+  event and `GET /api/approvals` carry it, and the chat view of any of
   those sessions shows the turn as *waiting for approval* while the child's
   prompt is pending. When the nearest such parent is delivered on Telegram,
   Discord or Slack, the prompt with *Approve* / *Deny* buttons is also sent to

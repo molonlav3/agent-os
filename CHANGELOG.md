@@ -143,14 +143,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Web Push for approvals: Settings → *Push notifications for approvals* in the
   web console subscribes the browser (RPCs `push.web.vapid_public_key`,
   `push.web.subscribe`, `push.web.unsubscribe`). Each approval is pushed with a
-  deep link and a TTL equal to its remaining lifetime, and replaced by a "no
-  longer pending" notice when it is resolved. RFC 8291/8292 with a VAPID key
+  deep link and a TTL equal to its remaining lifetime, and replaced when it is
+  resolved by a notice saying how (granted, denied, expired, or cancelled
+  because its run stopped), sent from the same queue write as
+  `approval.resolved`. RFC 8291/8292 with a VAPID key
   generated once into the state directory; endpoints must resolve to public
   addresses at subscribe time and are dialled through the connect-time SSRF
   guard; `[push] web_enabled = false` turns it off (#3694).
 - An approval raised by a subagent or coding-harness child now names its
   parent sessions as well (`audience_session_keys` in the queue, the
-  `/api/approvals` listing and `approval.list`). The parent's chat view shows
+  `approval.requested` event, the `/api/approvals` listing and
+  `approval.list`). The parent's chat view shows
   its turn as waiting for approval, and when the parent is a Telegram, Discord
   or Slack conversation the prompt with buttons is sent there too (#3694).
 - `POST /api/v1/tools/invoke` runs one tool without a model turn under the

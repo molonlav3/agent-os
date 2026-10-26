@@ -144,9 +144,12 @@ Queue changes are also pushed over the WebSocket to Control connections (never
 to channel or node connections, nor to a connection holding an agent token),
 for every namespace (`exec`, `plugin`, `acp`, `acp_elicitation`):
 
-- `approval.requested` — `{id, namespace, session_key, created_at, expires_at,
-  summary, tool, command, approval}` (fields that do not apply are omitted;
-  `approval` is the item exactly as `GET /api/approvals` lists it).
+- `approval.requested` — `{id, namespace, session_key, audience_session_keys,
+  created_at, expires_at, summary, tool, command, approval}` (fields that do
+  not apply are omitted; `approval` is the item exactly as `GET /api/approvals`
+  lists it, with the same audience as `audienceSessionKeys`).
+  `audience_session_keys` is the requesting session followed by the sessions
+  that spawned it, so a parent session's view can match a child's prompt.
 - `approval.resolved` — `{id, namespace, decision, resolved_by, resolved_at}`,
   `decision` being `approved`, `denied`, `expired` or `cancelled` (its run was
   aborted); `resolved_by` is `operator`, `policy`, `session_elevation`,
