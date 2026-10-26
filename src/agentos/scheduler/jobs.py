@@ -427,8 +427,14 @@ async def apply_reserved_result(
     reservation_token: str,
     execution: JobExecution,
     store: JobStore,
+    *,
+    now: datetime | None = None,
 ) -> bool:
-    """Apply an execution result only when the reservation token still owns the job."""
+    """Apply an execution result only when the reservation token still owns the job.
+
+    ``now`` is the wall-clock instant the result is applied at (the scheduler
+    timer passes its own clock); defaults to the current time.
+    """
     current = await store.get(job_id)
     if current is None:
         return False
@@ -439,12 +445,29 @@ async def apply_reserved_result(
         await store.save(current)
         return True
 
-    delete_job = _apply_result_state(current, execution, datetime.now(UTC))
+    delete_job = _apply_result_state(current, execution, now or datetime.now(UTC))
     if delete_job:
         await store.delete(current.id)
     else:
         await store.save(current)
     return True
+
+
+def _schedule_base(job: CronJob, now: datetime) -> datetime:
+    """The instant a finished run's next slot is computed after.
+
+    Normally ``now``. If the wall clock was set back while the run was in
+    flight, ``now`` can sit *before* the slot that just fired, and computing
+    "the next slot after now" would hand back that same slot -- the job would
+    fire twice for one schedule tick. ``reserved_at`` is when this run took
+    the job, so the next slot is never earlier than the run itself.
+    """
+    reserved = job.reserved_at
+    if reserved is None:
+        return now
+    if reserved.tzinfo is None:
+        reserved = reserved.replace(tzinfo=UTC)
+    return max(now, reserved)
 
 
 def _apply_result_state(job: CronJob, execution: JobExecution, now: datetime) -> bool:
@@ -473,7 +496,7 @@ def _apply_result_state(job: CronJob, execution: JobExecution, now: datetime) ->
                 job.enabled = False
         else:
             try:
-                job.next_run_at = _next_run(job, now)
+                job.next_run_at = _next_run(job, _schedule_base(job, now))
                 job.status = JobStatus.PENDING
             except Exception as exc:
                 _mark_schedule_compute_failed(job, exc, now, increment_error=True)
@@ -521,7 +544,7 @@ def _apply_result_state(job: CronJob, execution: JobExecution, now: datetime) ->
             else:
                 backoff_secs = compute_backoff(job.consecutive_errors)
                 try:
-                    job.next_run_at = _next_run(job, now)
+                    job.next_run_at = _next_run(job, _schedule_base(job, now))
                 except Exception as exc:
                     _mark_schedule_compute_failed(job, exc, now, increment_error=False)
                 else:

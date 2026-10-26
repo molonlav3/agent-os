@@ -38,6 +38,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   a wrong token or a protocol mismatch. The CLI gives up after 60 s without a
   gateway, so `agentos chat` prints "reconnecting…" during an outage and the
   old "Gateway connection lost" error when the gateway does not come back.
+- Cron jobs take a `concurrency` policy (`forbid` default, `replace`, `allow`)
+  for a run that comes due while the previous one still runs
+  (`agentos cron add|update --concurrency`, `cron.add`/`cron.update`), and
+  `cron.list` rows carry `concurrency` and `health`
+  (`consecutive_failures`, `last_error`, `degraded` at 3 failures in a row).
+  A run in progress no longer clears the job's last error. (#3699)
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up
@@ -89,6 +95,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `client: {name}` shape is still accepted.
 - The web console reconnects when the socket drops in the middle of the
   handshake instead of staying disconnected.
+- Scheduler: the next wake is planned on both the wall and the monotonic
+  clock, so after a laptop sleep each overdue job runs once (missed runs
+  coalesce) and a clock set back never fires a job early or twice. Sleep
+  gaps, backward clock jumps and late wakes are logged. Agent jobs missed
+  while the gateway was down wait `[scheduler] startup_agent_delay_seconds`
+  (default 120) after boot instead of competing with channel start-up; the
+  catch-up cap (5) and the 10 s stagger are unchanged. (#3683)
 
 ### Security
 - Gateway: wrong tokens are rate limited per client address across HTTP and

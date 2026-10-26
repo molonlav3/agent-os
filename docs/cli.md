@@ -1605,6 +1605,26 @@ Practical shape: one skill and one narrow task per elevated job, a tight
 configured, and if the skill has a dry-run/confirm handshake, keep cron on the
 read half and leave broadcasts to an interactive session.
 
+### Overlapping runs, job health, and missed runs
+
+```sh
+agentos cron add --every 5m --job-kind agent_turn --text "Check the queue" --concurrency replace
+agentos cron update <job-id> --concurrency forbid
+agentos config set scheduler.startup_agent_delay_seconds 120
+```
+
+`--concurrency` (on `add` and `update`) says what happens when a run comes due
+while the previous one is still going: `forbid` (default) skips it, `replace`
+cancels the running run and starts the new one, `allow` runs both.
+`agentos cron list --json` reports each job's `concurrency` and a `health`
+block — `consecutive_failures`, `last_error` (the last finished run's error),
+and `degraded` (true from 3 failures in a row).
+
+After a laptop sleep each overdue job runs once, however many runs it missed.
+After a gateway restart up to 5 missed jobs are caught up, staggered over 10
+seconds; missed agent jobs wait `scheduler.startup_agent_delay_seconds`
+(default `120`, `0` = no wait) so they do not compete with channel start-up.
+
 Read:
 
 - [`agents.md`](agents.md)

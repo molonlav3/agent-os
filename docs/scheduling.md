@@ -433,6 +433,84 @@ webhook's URL and token are never disclosed by `action="get"`: it reports the
 host plus `webhook_url_set` / `webhook_token_set`. Cloning a one-shot `at` job
 requires an explicit new schedule, and a clone always starts enabled.
 
+## Overlapping Runs
+
+A job's next run can come due while its previous run is still going — a long
+agent turn on a short interval, or a run that hangs until its timeout.
+`--concurrency` decides what happens then:
+
+| Policy | When the next run comes due during a run |
+|---|---|
+| `forbid` (default) | Skip it. The next run is scheduled from when the running one finishes. |
+| `replace` | Cancel the running run and start the new one. The cancelled run is kept in `cron runs` as `replaced by a newer run`; it is not counted as a failure. |
+| `allow` | Start the new run alongside. The newest run owns the job's schedule and counters; the earlier one is kept in run history only. Runs still count against the scheduler's concurrent-run limit. |
+
+```sh
+agentos cron add --every 5m --job-kind agent_turn \
+  --text "Check the deploy queue" --concurrency replace
+agentos cron update <job-id> --concurrency allow
+```
+
+`replace` can only cancel a run the scheduler itself started; a run started by
+`agentos cron run` is left to finish, but its result no longer updates the job.
+One-shot `--at` jobs have no next run, so the policy never applies to them.
+
+## Job Health
+
+`agentos cron list --json` (the `cron.list` RPC) and `cron status` report each
+job's `concurrency` and a `health` block:
+
+```json
+"health": {"consecutive_failures": 3, "last_error": "Timeout after 600.0s", "degraded": true}
+```
+
+`consecutive_failures` is the job's current failure streak; one successful run
+resets it to 0. `last_error` is the error of the most recent finished run and
+is `null` after a success — a run in progress does not clear it, so a degraded
+job keeps showing why. `degraded` turns on at 3 consecutive failures. A recurring
+job is marked `failed` and stops after 5, and an authentication-class error
+(401/403, invalid key) disables it on the first failure.
+
+## Sleep, Restarts, and Clock Changes
+
+The scheduler plans its next wake against both the wall clock and the system's
+monotonic clock and wakes at whichever says the time has come first, re-checking
+at least once a minute. Whether a job is due is always decided by the wall
+clock, because schedules are wall-clock times.
+
+- **Laptop sleep.** The monotonic clock stops while the machine sleeps. On the
+  first wake after the lid opens the scheduler sees that the wall clock moved
+  on and runs every job that came due in the meantime — once each, however many
+  runs were missed (a five-minute job asleep for an hour runs once, not twelve
+  times). The gateway also notices the thaw on its own maintenance tick and
+  wakes the scheduler at once.
+- **Clock set back** (an NTP correction, a manual change). Nothing fires early
+  and nothing fires twice: a run's next slot is always computed after the moment
+  that run started, so a job never repeats the slot it just ran.
+- **Gateway restart.** Jobs missed while the gateway was down are caught up at
+  boot: at most 5, staggered over 10 seconds; any further missed recurring jobs
+  skip ahead to their next slot. Missed *agent* jobs (an agent turn, or a main
+  session system event) wait 2 minutes after boot so they do not compete with
+  channel start-up for the model; reminders and script jobs run straight away.
+  The wait shows as the job's next run time, so `agentos cron list` is accurate
+  meanwhile, and a crash during the wait does not lose the job.
+
+Change the post-boot wait for agent jobs (seconds; `0` runs them at boot like
+every other job), then restart the gateway:
+
+```sh
+agentos config set scheduler.startup_agent_delay_seconds 300
+```
+
+```toml
+[scheduler]
+startup_agent_delay_seconds = 300
+```
+
+The gateway log records `scheduler_wake_gap` (a sleep or a clock moved
+forward), `scheduler_clock_back`, and `scheduler_late_wake` (the scheduler woke
+more than twice as late as planned) when they happen.
+
 ## Troubleshooting
 
 Check the gateway and job state:

@@ -22,6 +22,24 @@ _SESSION_TARGETS = {"isolated", "main", "current", "session"}
 _JOB_KINDS = {"auto", "reminder", "agent_turn", "system_event", "script"}
 _WAKE_MODES = {"now", "next-heartbeat"}
 _ELEVATED_MODES = {"bypass", "full"}
+_CONCURRENCY_POLICIES = ("forbid", "replace", "allow")
+_CONCURRENCY_HELP = (
+    "What to do when the next run comes due while the previous one is still "
+    "running: forbid (default, skip that run), replace (cancel the running one "
+    "and start the new one), or allow (run both)."
+)
+
+
+def _validate_concurrency(value: Any) -> str | None:
+    # Not a str when the command function is called directly (tests): typer's
+    # OptionInfo default is then passed through, and means "not given".
+    if not isinstance(value, str):
+        return None
+    policy = value.strip().lower()
+    if policy not in _CONCURRENCY_POLICIES:
+        raise typer.BadParameter(f"--concurrency must be one of {', '.join(_CONCURRENCY_POLICIES)}")
+    return policy
+
 
 _ELEVATED_HELP = (
     "Let this job run shell-based skills unattended. Every time it fires, with "
@@ -765,6 +783,7 @@ def cron_add(
             "Keys: profile, allow, alsoAllow, deny. Can only narrow the cron baseline."
         ),
     ),
+    concurrency: str | None = typer.Option(None, "--concurrency", help=_CONCURRENCY_HELP),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """Add a scheduled cron job."""
@@ -900,6 +919,9 @@ def cron_add(
     resolved_elevated = _resolve_elevated(elevated, elevated_mode)
     if resolved_elevated is not None:
         params["elevated"] = resolved_elevated
+    concurrency_policy = _validate_concurrency(concurrency)
+    if concurrency_policy is not None:
+        params["concurrency"] = concurrency_policy
 
     async def _run(client):
         return await client.call("cron.add", params)
@@ -1038,6 +1060,7 @@ def cron_update(
             "without touching the lists."
         ),
     ),
+    concurrency: str | None = typer.Option(None, "--concurrency", help=_CONCURRENCY_HELP),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """Update a scheduled cron job.
@@ -1119,6 +1142,9 @@ def cron_update(
     resolved_elevated = _resolve_elevated(elevated, elevated_mode)
     if resolved_elevated is not None:
         params["elevated"] = resolved_elevated
+    concurrency_policy = _validate_concurrency(concurrency)
+    if concurrency_policy is not None:
+        params["concurrency"] = concurrency_policy
 
     if len(params) == 1:
         raise typer.BadParameter("provide at least one field to update")

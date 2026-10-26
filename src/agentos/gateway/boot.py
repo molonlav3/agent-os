@@ -2180,6 +2180,11 @@ async def build_services(
                 "max_concurrent_runs": int(os.environ.get("AGENTOS_CRON_MAX_CONCURRENT", "3")),
                 "max_catchup_jobs": int(os.environ.get("AGENTOS_CRON_MAX_CATCHUP", "5")),
                 "session_retention": int(os.environ.get("AGENTOS_CRON_SESSION_RETENTION", "86400")),
+                "startup_agent_delay_seconds": float(
+                    getattr(
+                        getattr(config, "scheduler", None), "startup_agent_delay_seconds", 120.0
+                    )
+                ),
             },
         )
         await cron_scheduler.start()

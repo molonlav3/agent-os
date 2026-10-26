@@ -8,6 +8,7 @@ from .reaper import SessionReaper
 from .stagger import compute_jitter, jitter_for_minute_boundary, spread_jobs
 from .timer import SchedulerTimer
 from .types import (
+    ConcurrencyPolicy,
     CronJob,
     JobExecution,
     JobReservation,
@@ -21,6 +22,7 @@ from .types import (
 )
 
 __all__ = [
+    "ConcurrencyPolicy",
     "CronExpression",
     "CronJob",
     "CronParseError",

@@ -2229,6 +2229,20 @@ class GatewayControlConfig(BaseModel):
     chat_restart: bool = False
 
 
+class SchedulerConfig(BaseModel):
+    """Cron scheduler behaviour that is not per-job (``[scheduler]``).
+
+    ``startup_agent_delay_seconds`` holds back the agent jobs a boot finds
+    overdue (missed while the gateway was down or the machine slept), so
+    they do not compete with channel start-up for the model budget. Jobs
+    that do not run a model turn are caught up at once, as before.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    startup_agent_delay_seconds: float = Field(default=120.0, ge=0)
+
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -2530,6 +2544,7 @@ class GatewayConfig(BaseSettings):
 
     updates: UpdatesConfig = Field(default_factory=UpdatesConfig)
     gateway_control: GatewayControlConfig = Field(default_factory=GatewayControlConfig)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     trading: TradingConfig = Field(default_factory=TradingConfig)
 
     # Component enable flags

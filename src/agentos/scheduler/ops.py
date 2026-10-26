@@ -23,6 +23,7 @@ from .persistence import JobStore
 from .scripts import JOB_ID_PLACEHOLDER, substitute_job_id
 from .stagger import compute_jitter
 from .types import (
+    ConcurrencyPolicy,
     CronJob,
     CronWakeMode,
     DeliveryConfig,
@@ -31,6 +32,7 @@ from .types import (
     JobStatus,
     ScheduleKind,
     SessionTarget,
+    normalize_concurrency,
 )
 
 # Hard cap on job timeout_seconds. A single cron create/update with a huge
@@ -218,6 +220,7 @@ class SchedulerOps:
         jitter_seconds: float | None = None,
         creator_session_key: str = "",
         creator_sender_id: str = "",
+        concurrency: ConcurrencyPolicy | str = ConcurrencyPolicy.FORBID,
     ) -> CronJob:
         """Validate the structured schedule, compute jitter, persist a new CronJob.
 
@@ -232,6 +235,7 @@ class SchedulerOps:
         """
         now_local = self._now()
         kind, cron_expr = _validate_structured_schedule(schedule_kind, schedule_value)
+        concurrency_policy = normalize_concurrency(concurrency)
         schedule_raw = cron_expr
         tz = (schedule_tz or tz or "").strip()
         validate_tz(tz)
@@ -305,6 +309,7 @@ class SchedulerOps:
             tool_policy=normalized_tool_policy,
             creator_session_key=creator_session_key or "",
             creator_sender_id=creator_sender_id or "",
+            concurrency=concurrency_policy,
         )
 
         if kind == ScheduleKind.AT:
@@ -411,6 +416,8 @@ class SchedulerOps:
         if "wake_mode" in patch:
             raw_wake_mode = patch.pop("wake_mode")
             job.wake_mode = _coerce_wake_mode(raw_wake_mode)
+        if "concurrency" in patch:
+            job.concurrency = normalize_concurrency(patch.pop("concurrency"))
 
         if "session_target" in patch:
             raw_target = patch.pop("session_target")

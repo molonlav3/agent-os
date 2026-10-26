@@ -16,6 +16,7 @@ from agentos.compat import aiosqlite
 
 from .payloads import DeliveryReport, normalize_contract, normalize_origin_session_key
 from .types import (
+    ConcurrencyPolicy,
     CronJob,
     CronWakeMode,
     DeliveryConfig,
@@ -92,6 +93,7 @@ _NEW_COLUMNS: list[tuple[str, str]] = [
     ("anchor_at", "TEXT"),
     ("creator_session_key", "TEXT NOT NULL DEFAULT ''"),
     ("creator_sender_id", "TEXT NOT NULL DEFAULT ''"),
+    ("concurrency", "TEXT NOT NULL DEFAULT 'forbid'"),
 ]
 
 _DATETIME_COLUMNS: tuple[str, ...] = (
@@ -190,6 +192,7 @@ def _row_to_job(row: aiosqlite.Row) -> CronJob:
         reservation_source=_get("reservation_source", "") or "",
         scheduled_run_at=_dt(_get("scheduled_run_at")),
         tool_policy=_parse_json_object(_get("tool_policy_json", "{}")),
+        concurrency=_parse_concurrency(_get("concurrency", "forbid")),
     )
 
 
@@ -213,6 +216,14 @@ def _row_to_execution(row: aiosqlite.Row) -> JobExecution:
         session_key=_get("session_key", ""),  # type: ignore[arg-type]
         delivery_status=_get("delivery_status", ""),  # type: ignore[arg-type]
     )
+
+
+def _parse_concurrency(raw: object) -> ConcurrencyPolicy:
+    """Read the stored policy; an unknown value falls back to the safe default."""
+    try:
+        return ConcurrencyPolicy(str(raw or "forbid").strip().lower())
+    except ValueError:
+        return ConcurrencyPolicy.FORBID
 
 
 def _parse_wake_mode(raw: object) -> CronWakeMode:
@@ -436,6 +447,7 @@ _UPSERT_UPDATE_COLUMNS: tuple[str, ...] = (
     "anchor_at",
     "creator_session_key",
     "creator_sender_id",
+    "concurrency",
 )
 
 
@@ -623,8 +635,8 @@ class JobStore:
                  consecutive_errors, delivery_json, origin_session_key,
                  reservation_token, reserved_at, reserved_by, reservation_source,
                  scheduled_run_at, tool_policy_json, tz, anchor_at,
-                 creator_session_key, creator_sender_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 creator_session_key, creator_sender_id, concurrency)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """
             + _upsert_update_clause(write_reservation),
             (
@@ -665,6 +677,7 @@ class JobStore:
                 self._iso(job.anchor_at),
                 job.creator_session_key or "",
                 job.creator_sender_id or "",
+                getattr(job.concurrency, "value", str(job.concurrency or "forbid")),
             ),
         )
 
@@ -746,6 +759,89 @@ class JobStore:
             owner=owner,
         )
 
+    async def takeover_running_job(
+        self,
+        job_id: str,
+        expected_token: str,
+        now: datetime,
+        *,
+        slot: datetime,
+        source: str = "overlap",
+        owner: str = "scheduler-timer",
+    ) -> JobReservation | JobReservationRejected:
+        """Hand a running job's reservation to a new run of its next ``slot``.
+
+        Compare-and-swap on ``expected_token``: only the reservation that is
+        current right now can be rotated, so two ticks cannot both take over
+        the same run, and a run that finished in between (token cleared, job
+        back to pending) is left alone. The previous run keeps executing --
+        or is cancelled by the caller -- but its result no longer owns the
+        job: :func:`apply_reserved_result` checks this token.
+        """
+        token = str(uuid.uuid4())
+        now_iso = now.isoformat()
+        slot_iso = _storage_iso(slot)
+        async with self._write_lock:
+            cur = await self._db().execute(
+                """
+                UPDATE scheduler_jobs
+                SET reservation_token = ?,
+                    reserved_at = ?,
+                    reserved_by = ?,
+                    reservation_source = ?,
+                    scheduled_run_at = ?,
+                    next_run_at = ?,
+                    last_run_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND enabled = 1
+                  AND status = ?
+                  AND reservation_token = ?
+                  AND reservation_token != ''
+                """,
+                (
+                    token,
+                    now_iso,
+                    owner,
+                    source,
+                    slot_iso,
+                    slot_iso,
+                    now_iso,
+                    now_iso,
+                    job_id,
+                    JobStatus.RUNNING.value,
+                    expected_token,
+                ),
+            )
+            if not self._in_transaction:
+                await self._db().commit()
+
+        if cur.rowcount == 1:
+            job = await self.get(job_id)
+            if job is not None:
+                return JobReservation(
+                    job=job,
+                    token=token,
+                    reserved_at=job.reserved_at or now,
+                    reserved_by=owner,
+                    reservation_source=source,
+                    scheduled_run_at=job.scheduled_run_at,
+                )
+            return JobReservationRejected(
+                job_id=job_id,
+                reason=ReservationRejectionReason.NOT_FOUND,
+                message="Job not found after takeover",
+            )
+        current = await self.get(job_id)
+        if current is None:
+            return JobReservationRejected(job_id, ReservationRejectionReason.NOT_FOUND)
+        return JobReservationRejected(
+            job_id,
+            ReservationRejectionReason.STATUS_CONFLICT,
+            current,
+            message="The running reservation changed before it could be taken over",
+        )
+
     async def _reserve_job_for_run(
         self,
         job_id: str,
@@ -783,8 +879,7 @@ class JobStore:
                     reservation_source = ?,
                     scheduled_run_at = next_run_at,
                     last_run_at = ?,
-                    updated_at = ?,
-                    last_error = NULL
+                    updated_at = ?
                 WHERE id = ?
                   AND enabled = 1
                   AND status = ?
