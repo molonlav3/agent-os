@@ -82,18 +82,36 @@ agentos gateway uninstall
 The unit runs the absolute path of the `agentos` you installed it with
 (`~/.local/bin/agentos` keeps working after `uv tool upgrade`) as
 `agentos gateway run --port N [--config PATH]`, with a `PATH` that starts with
-`~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin` so harness CLIs are
-found. `AGENTOS_STATE_DIR` and `AGENTOS_GATEWAY_CONFIG_PATH` are carried into
-the unit when they are set in the installing shell. The stop timeout (42 s)
-is the drain budget — 30 s for turns to finish plus 2 s to cancel the rest —
-plus a 10 s margin.
+`~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, followed by the
+installing shell's own `PATH`, so harness CLIs installed with Homebrew, npm,
+nvm, volta, bun or pyenv are found. `AGENTOS_STATE_DIR` and
+`AGENTOS_GATEWAY_CONFIG_PATH` are carried into the unit when they are set in
+the installing shell, and `AGENTOS_SERVICE` (`launchd` or `systemd`) tells
+the gateway it runs under a service manager. The stop timeout (42 s) is the
+drain budget — 30 s for turns to finish plus 2 s to cancel the rest — plus a
+10 s margin.
 
-Installing the same unit again is a no-op. A different unit under the same
-name (another port or config, or a job with that label loaded from elsewhere)
-is refused: run `agentos gateway uninstall` first. `--no-start` writes the
-unit without loading it. `uninstall` with nothing installed succeeds. On
-Linux, run `loginctl enable-linger $USER` once if the gateway should keep
-running after you log out.
+Installing the same unit again is a no-op, also from a shell whose `PATH`
+differs (the installed unit is kept; uninstall and install again to refresh
+its `PATH`). A different unit under the same name (another port or config, or
+a job with that label loaded from elsewhere) is refused: run
+`agentos gateway uninstall` first. `--no-start` writes the unit without
+loading it. `uninstall` with nothing installed succeeds. On Linux, run
+`loginctl enable-linger $USER` once if the gateway should keep running after
+you log out.
+
+`agentos gateway stop` does not stop a service-run gateway: the service
+manager would start it again. It exits `3` and says how to stop it instead —
+`launchctl bootout gui/$(id -u)/dev.useagentos.gateway` until the next login
+on macOS, `systemctl --user stop agentos-gateway.service` on Linux — or remove
+the service with `agentos gateway uninstall`. `agentos gateway restart`
+restarts a service-run gateway in place.
+
+A configuration error (exit `78`) is not restarted by systemd. launchd has no
+such switch and would respawn it every 10 s, so under launchd the gateway
+waits before exiting `78`: 5 s, doubling with each consecutive config failure
+up to 5 minutes (a streak older than 15 minutes starts over, a successful
+boot resets it), and says so in `~/Library/Logs/AgentOS/gateway-service.log`.
 
 The desktop app adopts a gateway that already answers on its port, so it works
 with an installed service; do not let both start their own gateway on the same

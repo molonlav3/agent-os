@@ -204,3 +204,90 @@ def test_channels_start_cli_calls_the_rpc(monkeypatch: pytest.MonkeyPatch) -> No
     named = runner.invoke(app, ["channels", "start", "tg", "--yes", "--json"])
     assert named.exit_code == 0, named.output
     assert calls == [("channels.start", {"name": "tg"})]
+
+
+def test_gateway_stop_names_the_service_that_runs_the_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentos.cli import gateway_lifecycle
+
+    monkeypatch.setenv("AGENTOS_STATE_DIR", str(tmp_path / "home"))
+    monkeypatch.setattr(gateway_lifecycle.GatewayLifecycleManager, "_probe_health", lambda s: True)
+    monkeypatch.setattr(
+        gateway_cmd,
+        "_deep_service_status",
+        lambda: {
+            "supported": True,
+            "platform": "launchd",
+            "label": "dev.useagentos.gateway",
+            "path": "/x/dev.useagentos.gateway.plist",
+            "installed": True,
+            "loaded": True,
+            "port": 18791,
+        },
+    )
+    result = runner.invoke(app, ["gateway", "stop", "--port", "18791"])
+    assert result.exit_code == 3
+    assert "LaunchAgent" in result.output
+    assert "agentos gateway uninstall" in result.output
+    assert "launchctl bootout" in result.output
+
+    as_json = runner.invoke(app, ["gateway", "stop", "--port", "18791", "--json"])
+    assert json.loads(as_json.output)["details"]["service"]["installed"] is True
+
+    # A service on another port is not this gateway.
+    other = runner.invoke(app, ["gateway", "stop", "--port", "18792"])
+    assert "LaunchAgent" not in other.output
+
+
+def test_exit_78_under_launchd_waits_before_exiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentos.cli import gateway_service
+
+    monkeypatch.setenv("AGENTOS_STATE_DIR", str(tmp_path / "home"))
+    monkeypatch.setenv("AGENTOS_SERVICE", "launchd")
+    slept: list[float] = []
+    monkeypatch.setattr("time.sleep", slept.append)
+    config = tmp_path / "config.toml"
+    config.write_text("[tools\n", encoding="utf-8")
+    first = runner.invoke(app, ["gateway", "run", "--config", str(config)])
+    second = runner.invoke(app, ["gateway", "run", "--config", str(config)])
+    assert first.exit_code == second.exit_code == 78
+    assert slept == [5, 10]
+    assert "waiting 5s before exiting" in " ".join(first.output.split())
+    assert gateway_service.SERVICE_ENV == "AGENTOS_SERVICE"
+
+
+def test_channels_status_table_shows_state_reason_and_safe_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentos.cli import channels_cmd
+
+    payload = {
+        "channels": [
+            {
+                "name": "tg",
+                "type": "telegram",
+                "status": "stopped",
+                "state": "terminal",
+                "terminal_reason": "auth: HTTP 401",
+            },
+            {
+                "name": "sl",
+                "type": "slack",
+                "status": "stopped",
+                "state": "start_failed",
+                "start_error": "ConnectionError: offline",
+            },
+        ],
+        "health_policy": {"safe_mode": {"active": True, "reason": "3 unclean", "clears_at": "T"}},
+    }
+    monkeypatch.setattr(channels_cmd, "run_gateway_sync", lambda fn, **_kw: payload)
+    out = runner.invoke(app, ["channels", "status"]).output
+    assert "terminal" in out and "auth: HTTP 401" in out
+    assert "start_failed" in out and "ConnectionError: offline" in out
+    assert "Safe mode: on (3 unclean)" in " ".join(out.split())
+
+    payload["health_policy"] = {"safe_mode": {"active": False}}
+    assert "Safe mode: off" in runner.invoke(app, ["channels", "status"]).output

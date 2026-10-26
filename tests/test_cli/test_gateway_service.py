@@ -295,3 +295,92 @@ def test_cli_status_deep_reports_the_service(tmp_path: Path, monkeypatch) -> Non
     result = runner.invoke(app, ["gateway", "status", "--deep", "--json"])
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["service"]["installed"] is True
+
+
+# ── follow-ups: PATH carry-over, service env, port, stop hint, exit-78 backoff ──
+
+
+def test_the_installing_shells_path_is_carried_after_the_standard_dirs(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, environ={"PATH": "/opt/nvm/versions/node/v22/bin:/usr/bin"})
+    path = spec.env["PATH"].split(":")
+    assert path[:3] == [str(tmp_path / ".local" / "bin"), "/opt/homebrew/bin", "/usr/local/bin"]
+    assert "/opt/nvm/versions/node/v22/bin" in path
+    assert path.count("/usr/bin") == 1
+    assert spec.env["AGENTOS_SERVICE"] == "launchd"
+    systemd = _spec(tmp_path, "systemd")
+    assert "Environment=AGENTOS_SERVICE=systemd\n" in gs.render_systemd_unit(systemd)
+
+
+@pytest.mark.parametrize("platform", ["launchd", "systemd"])
+def test_reinstalling_from_a_shell_with_another_path_is_not_a_conflict(
+    tmp_path: Path, platform: gs.ServicePlatform
+) -> None:
+    first = _spec(tmp_path, platform, environ={"PATH": "/a/bin"})
+    gs.install_service(first, runner=ScriptedRunner(), uid=501)
+    again = gs.install_service(
+        _spec(tmp_path, platform, environ={"PATH": "/b/bin"}), runner=ScriptedRunner(), uid=501
+    )
+    assert again.ok and again.state == "already_installed"
+    assert again.details["pathDiffers"] is True
+    # The unit on disk is left as it was.
+    assert gs.unit_path_for(platform, tmp_path).read_text(encoding="utf-8") == gs.render_unit(first)
+    other_port = gs.install_service(
+        _spec(tmp_path, platform, port=18999), runner=ScriptedRunner(), uid=501
+    )
+    assert other_port.state == "conflict"
+
+
+@pytest.mark.parametrize("platform", ["launchd", "systemd"])
+def test_status_reports_the_units_port(tmp_path: Path, platform: gs.ServicePlatform) -> None:
+    gs.install_service(_spec(tmp_path, platform, port=18803), runner=ScriptedRunner(), uid=501)
+    status = gs.service_status(platform, home=tmp_path, runner=ScriptedRunner(), uid=501)
+    assert status["port"] == 18803
+
+
+def test_stop_hint_names_the_service_and_the_way_out() -> None:
+    launchd = gs.service_stop_hint(
+        {"supported": True, "platform": "launchd", "installed": True, "loaded": True, "path": "p"},
+        uid=501,
+    )
+    assert launchd is not None
+    assert "launchctl bootout gui/501/dev.useagentos.gateway" in launchd
+    assert "agentos gateway uninstall" in launchd
+    systemd = gs.service_stop_hint(
+        {"supported": True, "platform": "systemd", "installed": True, "active": True, "path": "p"}
+    )
+    assert systemd is not None and "systemctl --user stop agentos-gateway.service" in systemd
+    assert gs.service_stop_hint({"supported": True, "installed": False, "loaded": False}) is None
+    assert gs.service_stop_hint({"supported": False}) is None
+
+
+def test_exit_78_under_launchd_backs_off_and_doubles(tmp_path: Path) -> None:
+    counter = tmp_path / "state" / "gateway" / "service-config-failures.json"
+    slept: list[float] = []
+    messages: list[str] = []
+    env = {"AGENTOS_SERVICE": "launchd"}
+    now = 1_000.0
+    for _ in range(8):
+        gs.config_failure_backoff(
+            counter_path=counter, environ=env, now=now, sleep=slept.append, emit=messages.append
+        )
+        now += slept[-1] + 10  # launchd's ThrottleInterval
+    assert slept == [5, 10, 20, 40, 80, 160, 300, 300]
+    assert "failure 1 in a row" in messages[0]
+    assert "agentos gateway uninstall" in messages[0]
+
+    # A streak older than 15 minutes starts over; a good boot clears it.
+    slept.clear()
+    gs.config_failure_backoff(counter_path=counter, environ=env, now=now + 901, sleep=slept.append)
+    assert slept == [5]
+    gs.clear_config_failures(counter)
+    assert not counter.exists()
+
+
+@pytest.mark.parametrize("env", [{}, {"AGENTOS_SERVICE": "systemd"}])
+def test_no_backoff_outside_launchd(tmp_path: Path, env: dict[str, str]) -> None:
+    slept: list[float] = []
+    delay = gs.config_failure_backoff(
+        counter_path=tmp_path / "c.json", environ=env, now=1.0, sleep=slept.append
+    )
+    # systemd's RestartPreventExitStatus=78 already stops the loop.
+    assert delay == 0.0 and slept == []

@@ -42,6 +42,14 @@ SYSTEMD_RESTART_S = 5
 #: Variables carried into the unit when the installing shell sets them, so
 #: the service runs against the same state and config as the operator's CLI.
 CARRIED_ENV = ("AGENTOS_STATE_DIR", "AGENTOS_GATEWAY_CONFIG_PATH")
+#: Set in every generated unit so the gateway knows a service manager runs
+#: it (``launchd`` or ``systemd``): see :func:`config_failure_backoff`.
+SERVICE_ENV = "AGENTOS_SERVICE"
+#: Exit-78 backoff under launchd: 5 s, doubling per recent failure, capped.
+CONFIG_BACKOFF_BASE_S = 5.0
+CONFIG_BACKOFF_MAX_S = 300.0
+#: A failure streak older than this starts over.
+CONFIG_BACKOFF_RESET_S = 900.0
 
 ServicePlatform = Literal["launchd", "systemd"]
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
@@ -169,7 +177,12 @@ def build_spec(
     environ: dict[str, str] | None = None,
 ) -> ServiceSpec:
     source = os.environ if environ is None else environ
-    env = {"PATH": service_path_env(home)}
+    # The installing shell's PATH rides along after the standard dirs, so
+    # CLIs installed with nvm, volta, bun or pyenv are found under the service.
+    env = {
+        "PATH": service_path_env(home, inherited=source.get("PATH")),
+        SERVICE_ENV: platform,
+    }
     for key in CARRIED_ENV:
         value = str(source.get(key, "") or "").strip()
         if value:
@@ -234,6 +247,54 @@ def render_systemd_unit(spec: ServiceSpec) -> str:
         "[Install]\n"
         "WantedBy=default.target\n"
     )
+
+
+def unit_identity(platform: ServicePlatform, text: str) -> str:
+    """A unit with its ``PATH`` removed: what decides "the same service"."""
+    if platform == "launchd":
+        try:
+            payload = plistlib.loads(text.encode("utf-8"))
+        except Exception:  # noqa: BLE001 - an unparsable plist is its own identity
+            return text
+        if isinstance(payload, dict):
+            env = payload.get("EnvironmentVariables")
+            if isinstance(env, dict):
+                env.pop("PATH", None)
+            return plistlib.dumps(payload, sort_keys=True).decode("utf-8")
+        return text
+    return "".join(
+        line
+        for line in text.splitlines(keepends=True)
+        if not line.startswith(("Environment=PATH=", 'Environment="PATH='))
+    )
+
+
+def unit_port(platform: ServicePlatform, text: str) -> int | None:
+    """The ``--port`` an installed unit runs the gateway with, if readable."""
+    argv: list[str] = []
+    if platform == "launchd":
+        try:
+            payload = plistlib.loads(text.encode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+        raw = payload.get("ProgramArguments") if isinstance(payload, dict) else None
+        argv = [str(part) for part in raw] if isinstance(raw, list) else []
+    else:
+        import shlex
+
+        for line in text.splitlines():
+            if line.startswith("ExecStart="):
+                try:
+                    argv = shlex.split(line[len("ExecStart=") :])
+                except ValueError:
+                    return None
+    for flag, value in zip(argv, argv[1:]):
+        if flag in {"--port", "-p"}:
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
 
 
 def render_unit(spec: ServiceSpec) -> str:
@@ -338,13 +399,22 @@ def install_service(
         except OSError as exc:
             existing = f"<unreadable: {exc}>"
     if existing is not None and existing != rendered:
-        result.ok = False
-        result.state = "conflict"
-        result.message = (
-            f"A service named {spec.label} is already installed at {path} with different "
-            f"settings. Remove it first with '{UNINSTALL_HINT}', then install again."
-        )
-        return result
+        if unit_identity(spec.platform, existing) == unit_identity(spec.platform, rendered):
+            # Same gateway, installed from a shell with another PATH: keep it.
+            result.state = "already_installed"
+            result.details["pathDiffers"] = True
+            result.message = (
+                f"{spec.label} is already installed ({path}); only its PATH differs from "
+                f"this shell's. To refresh it: {UNINSTALL_HINT}, then install again."
+            )
+        else:
+            result.ok = False
+            result.state = "conflict"
+            result.message = (
+                f"A service named {spec.label} is already installed at {path} with different "
+                f"settings. Remove it first with '{UNINSTALL_HINT}', then install again."
+            )
+            return result
 
     if spec.platform == "launchd" and existing is None and _launchd_loaded(runner, uid, commands):
         result.ok = False
@@ -367,7 +437,7 @@ def install_service(
 
     if not start:
         verb = "Wrote" if result.state == "installed" else "Already installed:"
-        result.message = f"{verb} {path}; not loaded (--no-start)."
+        result.message = result.message or f"{verb} {path}; not loaded (--no-start)."
         return result
 
     if spec.platform == "launchd":
@@ -470,14 +540,112 @@ def service_status(
         if platform == "launchd"
         else _systemd_active(runner, commands)
     )
+    port: int | None = None
+    if path.exists():
+        try:
+            port = unit_port(platform, path.read_text(encoding="utf-8"))
+        except OSError:
+            port = None
     return {
         "supported": True,
         "platform": platform,
         "label": LAUNCHD_LABEL if platform == "launchd" else SYSTEMD_UNIT,
         "path": str(path),
         "installed": path.exists(),
+        "port": port,
         "loaded" if platform == "launchd" else "active": loaded,
     }
+
+
+def service_stop_hint(service: dict[str, Any], *, uid: int | None = None) -> str | None:
+    """How to stop a gateway the installed service runs, or ``None`` if none does."""
+    if not service.get("supported"):
+        return None
+    loaded = bool(service.get("loaded", service.get("active")))
+    if not (service.get("installed") or loaded):
+        return None
+    if service.get("platform") == "launchd":
+        uid = _current_uid() if uid is None else uid
+        return (
+            f"It is run by the {LAUNCHD_LABEL} LaunchAgent ({service.get('path')}), which "
+            "starts it again whenever it exits. Stop it until the next login with "
+            f"'launchctl bootout {_launchd_domain(uid)}/{LAUNCHD_LABEL}', or remove the "
+            f"service with '{UNINSTALL_HINT}'."
+        )
+    return (
+        f"It is run by the systemd user unit {SYSTEMD_UNIT} ({service.get('path')}), which "
+        f"restarts it whenever it exits. Stop it with 'systemctl --user stop {SYSTEMD_UNIT}' "
+        f"('disable --now' keeps it off), or remove the service with '{UNINSTALL_HINT}'."
+    )
+
+
+# ── exit 78 under launchd: do not respawn a broken config every 10 s ──
+
+
+def config_failure_backoff(
+    *,
+    counter_path: Path,
+    environ: dict[str, str] | None = None,
+    now: float | None = None,
+    sleep: Callable[[float], Any] | None = None,
+    emit: Callable[[str], Any] | None = None,
+) -> float:
+    """Wait before an exit 78 when launchd would restart it at once; returns the wait.
+
+    systemd honours ``RestartPreventExitStatus=78`` and does not restart a
+    config error, but launchd's ``KeepAlive`` respawns every exit after
+    ``ThrottleInterval`` (10 s), forever. The wait doubles per recent
+    config failure (5 s, 10 s, 20 s, ... capped at 300 s; a streak older
+    than 15 minutes starts over), so a broken config costs a respawn every
+    five minutes instead of every ten seconds. The streak is kept in
+    ``counter_path`` and cleared by :func:`clear_config_failures` once a
+    boot succeeds.
+    """
+    import json
+    import time as _time
+
+    source = os.environ if environ is None else environ
+    if str(source.get(SERVICE_ENV, "")).strip().lower() != "launchd":
+        return 0.0
+    current = _time.time() if now is None else now
+    count = 0
+    try:
+        data = json.loads(counter_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and current - float(data.get("last_at", 0)) <= (
+            CONFIG_BACKOFF_RESET_S
+        ):
+            count = max(0, int(data.get("count", 0)))
+    except (OSError, ValueError, TypeError):
+        count = 0
+    delay = min(CONFIG_BACKOFF_BASE_S * (2**count), CONFIG_BACKOFF_MAX_S)
+    try:
+        counter_path.parent.mkdir(parents=True, exist_ok=True)
+        counter_path.write_text(
+            json.dumps({"count": count + 1, "last_at": current}), encoding="utf-8"
+        )
+    except OSError:
+        pass
+    message = (
+        f"Configuration error under launchd (failure {count + 1} in a row): waiting "
+        f"{int(delay)}s before exiting so the service does not restart a broken config "
+        f"every {LAUNCHD_THROTTLE_S}s. Fix it (agentos doctor) or stop the service "
+        f"({UNINSTALL_HINT})."
+    )
+    if emit is not None:
+        emit(message)
+    if sleep is None:
+        _time.sleep(delay)
+    else:
+        sleep(delay)
+    return float(delay)
+
+
+def clear_config_failures(counter_path: Path) -> None:
+    """A boot got past its config: the next config failure starts the streak over."""
+    try:
+        counter_path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ── CLI entry points (``agentos gateway install`` / ``uninstall``) ────
@@ -563,6 +731,12 @@ def uninstall_gateway(
 
 __all__ = [
     "CARRIED_ENV",
+    "SERVICE_ENV",
+    "clear_config_failures",
+    "config_failure_backoff",
+    "service_stop_hint",
+    "unit_identity",
+    "unit_port",
     "LAUNCHD_LABEL",
     "STOP_MARGIN_S",
     "SYSTEMD_UNIT",

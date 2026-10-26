@@ -92,7 +92,12 @@ LaunchAgent (`dev.useagentos.gateway`) on macOS, a systemd user unit
 refuses when a different unit with the same name exists (run
 `agentos gateway uninstall` first) and is a no-op for the same unit.
 `--no-start` writes the unit without loading it. `agentos gateway uninstall
-[--json]` stops and removes it, and succeeds when nothing is installed. A
+[--json]` stops and removes it, and succeeds when nothing is installed.
+`agentos gateway stop` cannot stop a service-run gateway (the service would
+start it again): it exits 3 and names the `launchctl bootout` /
+`systemctl --user stop` command and `gateway uninstall`. Under launchd a
+config error (exit 78) waits 5 s, doubling up to 5 minutes, before exiting,
+so the LaunchAgent does not respawn a broken config every 10 s. A
 gateway that crashes three times in five minutes starts in safe mode
 (channels, cron and heartbeat held back); see
 [Run as a service](gateway.md#run-as-a-service).

@@ -143,7 +143,9 @@ agentos channels status --json
   [`scheduling.md`](scheduling.md).
 - **Stopping.** A stop drains active turns for up to 30 s, then cancels the
   rest (`drain_budget_ms` in `agentos gateway status --json`); the service
-  units allow 42 s before they kill.
+  units allow 42 s before they kill. Stop a service-run gateway through the
+  service (`agentos gateway stop` tells you how) or remove it with
+  `agentos gateway uninstall`.
 
 ## Diagnostics
 

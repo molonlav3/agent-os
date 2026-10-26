@@ -112,6 +112,8 @@ def _render_status_table(payload: dict[str, Any], *, name: str | None = None) ->
     table.add_column("Enabled")
     table.add_column("Configured")
     table.add_column("Restart attempts", justify="right")
+    table.add_column("State")
+    table.add_column("Reason")
     for row in rows:
         table.add_row(
             str(row.get("name") or ""),
@@ -121,8 +123,22 @@ def _render_status_table(payload: dict[str, Any], *, name: str | None = None) ->
             str(row.get("enabled") or False),
             str(row.get("configured") or False),
             str(row.get("restart_attempts") or 0),
+            str(row.get("state") or "-"),
+            str(row.get("terminal_reason") or row.get("start_error") or ""),
         )
-    Console(width=180, force_terminal=False).print(table)
+    console = Console(width=180, force_terminal=False)
+    console.print(table)
+    policy = payload.get("health_policy") if isinstance(payload, dict) else None
+    safe_mode = policy.get("safe_mode") if isinstance(policy, dict) else None
+    if isinstance(safe_mode, dict) and safe_mode.get("active"):
+        console.print(
+            f"Safe mode: on ({safe_mode.get('reason') or 'repeated unclean boots'}); "
+            f"channels are held back until {safe_mode.get('clears_at') or 'it clears'}. "
+            "Start them now: agentos channels start --yes",
+            soft_wrap=True,
+        )
+    elif isinstance(safe_mode, dict):
+        console.print("Safe mode: off")
 
 
 def _filter_status_rows(payload: dict[str, Any], name: str | None) -> list[dict[str, Any]]:

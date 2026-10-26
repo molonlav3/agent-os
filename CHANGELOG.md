@@ -55,10 +55,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `ThrottleInterval 10`, `ExitTimeOut` = drain budget + 10 s) or a Linux
   systemd user unit (`agentos-gateway.service`: `Restart=always`,
   `RestartSec=5`, `RestartPreventExitStatus=78`, `KillMode=mixed`). Installing
-  the same unit twice is a no-op; a different unit under the same name is
-  refused. Not supported on Windows.
-- Crash-loop breaker (#3690): every boot is recorded in the gateway database,
-  and three unclean boots within five minutes start the gateway in safe mode —
+  the same unit twice is a no-op (also from a shell with another `PATH`; the
+  unit carries the installing shell's `PATH` after the standard dirs); a
+  different unit under the same name is refused. `agentos gateway stop` on a
+  service-run gateway names the service and how to stop or uninstall it.
+  Under launchd an exit-78 boot waits 5 s, doubling up to 5 minutes, before
+  exiting, so a broken config is not respawned every 10 s. Not supported on
+  Windows.
+- Crash-loop breaker (#3690): every boot is recorded in the gateway database
+  with a 30 s heartbeat, and three unclean boots that ended within five
+  minutes start the gateway in safe mode —
   control plane up, channels, cron and heartbeat held back, `/ready` and
   `agentos doctor` say so. It clears by itself once the window drains;
   `agentos channels start` (new, and the `channels.start` RPC) leaves it at

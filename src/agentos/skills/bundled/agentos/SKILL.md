@@ -348,9 +348,12 @@ cron and heartbeat are held back; `/ready` says `state: "safe_mode"` and
 `agentos doctor` shows a `gateway.safe_mode` finding. It clears by itself
 after five quiet minutes; `agentos channels start --yes` leaves it at once
 (`agentos channels start NAME --yes` starts one channel to find the bad one).
-After a laptop sleep the gateway restarts idle channels itself, and a
-5-minute health sweep restarts `disconnected`, `stuck` and `stale-socket`
-channels — never `terminal` (bad credentials) or `blocked` ones.
+After a laptop sleep the gateway restarts idle channels itself (a restart
+that fails is retried with backoff), and a 5-minute health sweep restarts
+`disconnected`, `stuck`, `start_failed` and `stale-socket` channels — never
+`terminal` (bad credentials) or `blocked` ones. `gateway stop` does not stop
+a service-run gateway: it names the `launchctl bootout` / `systemctl --user
+stop` command or `gateway uninstall`.
 
 `agentos gateway restart` restarts a gateway started by `gateway start`
 (stop, then start) and restarts any other healthy gateway (desktop app,

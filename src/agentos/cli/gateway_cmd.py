@@ -18,6 +18,7 @@ from agentos.cli.gateway_auth_prompt import (
     provision_public_bind_auth,
 )
 from agentos.cli.gateway_lifecycle import (
+    UNMANAGED_GATEWAY_RUNNING,
     GatewayLifecycleManager,
     GatewayLifecycleResult,
     remote_gateway_status,
@@ -112,7 +113,12 @@ def run_gateway(
     # Load config FIRST so its ``host`` field can act as the final
     # fallback below ``AGENTOS_GATEWAY_HOST``. A config that does not load is
     # EX_CONFIG (78): a supervisor repairs it before trying again.
-    config = _load_config_or_exit(config_path, exit_code=EX_CONFIG)
+    try:
+        config = _load_config_or_exit(config_path, exit_code=EX_CONFIG)
+    except typer.Exit as exc:
+        if exc.exit_code == EX_CONFIG:
+            _service_config_backoff()
+        raise
     if config_path and not config.config_path:
         config.config_path = str(config_path)
     # Treat the CLI ``--bind`` default as "not explicitly supplied" so the
@@ -177,6 +183,7 @@ def run_gateway(
         except BaseException as exc:
             _record_startup_failure(exc)
             raise
+        _clear_service_config_failures()
         assert server._task is not None
         try:
             await server._task
@@ -212,6 +219,7 @@ def run_gateway(
         # RestartPreventExitStatus=78; the desktop runs doctor, then retries).
         console.print(f"[red]Gateway could not start:[/red] {exc}")
         console.print("Inspect: agentos doctor")
+        _service_config_backoff()
         raise typer.Exit(code=EX_CONFIG) from exc
     except ValueError as exc:
         from agentos.onboarding.next_steps import env_recovery_commands
@@ -254,6 +262,48 @@ def run_gateway(
         raise typer.Exit(code=1) from exc
     except KeyboardInterrupt:
         console.print("\n[yellow]Gateway stopped.[/yellow]")
+
+
+def _service_config_failures_path() -> Path:
+    from agentos.paths import state_dir
+
+    return state_dir("gateway", "service-config-failures.json")
+
+
+def _service_config_backoff() -> None:
+    """Under launchd, slow an exit-78 respawn loop down (see gateway_service)."""
+    from agentos.cli.gateway_service import config_failure_backoff
+
+    config_failure_backoff(
+        counter_path=_service_config_failures_path(),
+        emit=lambda message: console.print(f"[yellow]{escape(message)}[/yellow]", soft_wrap=True),
+    )
+
+
+def _clear_service_config_failures() -> None:
+    from agentos.cli.gateway_service import clear_config_failures
+
+    clear_config_failures(_service_config_failures_path())
+
+
+def _with_service_hint(result: GatewayLifecycleResult) -> GatewayLifecycleResult:
+    """Say so when the gateway that answers belongs to the installed service."""
+    if result.code != UNMANAGED_GATEWAY_RUNNING:
+        return result
+    try:
+        from agentos.cli.gateway_service import service_stop_hint
+
+        service = _deep_service_status()
+        port = service.get("port")
+        if port is not None and port != result.port:
+            return result
+        hint = service_stop_hint(service)
+    except Exception:  # noqa: BLE001 - the hint is a courtesy
+        return result
+    if hint:
+        result.message = f"{result.message} {hint}"
+        result.details = {**result.details, "service": service}
+    return result
 
 
 def _record_startup_failure(exc: BaseException) -> None:
@@ -334,7 +384,7 @@ def start_gateway(
         config_path=config_path,
         health_timeout=health_timeout,
     )
-    _emit_lifecycle_result(manager.start(), json_output=json_output)
+    _emit_lifecycle_result(_with_service_hint(manager.start()), json_output=json_output)
 
 
 def gateway_handshake_version(
@@ -605,7 +655,7 @@ def stop_gateway(
         config_path=config_path,
         shutdown_timeout=shutdown_timeout,
     )
-    _emit_lifecycle_result(manager.stop(), json_output=json_output)
+    _emit_lifecycle_result(_with_service_hint(manager.stop()), json_output=json_output)
 
 
 class _RestartRpcRefusedError(Exception):
