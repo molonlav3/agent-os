@@ -420,7 +420,7 @@ async def test_start_gateway_server_schedules_router_preload_after_channels(
     def fake_create_background_task(coro: Any) -> Any:
         code = getattr(coro, "cr_code", None)
         name = getattr(code, "co_name", "")
-        if name == "preload_agentos_router_runtime":
+        if name in {"preload_agentos_router_runtime", "_router_preload_sidecar"}:
             events.append("router.preload.scheduled")
         elif name == "serve":
             events.append("server.serve.scheduled")

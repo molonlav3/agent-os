@@ -42,6 +42,7 @@ from agentos.engine.usage import UsageTracker as _UsageTracker
 from agentos.gateway.app import create_gateway_app
 from agentos.gateway.config import (
     GatewayConfig,
+    GatewayConfigError,
     enforce_public_bind_auth_guard,
     is_public_bind,
 )
@@ -1203,6 +1204,13 @@ class GatewayServer:
     _installed_signals: tuple[int, ...] = field(default=(), repr=False)
     _forced: bool = field(default=False, repr=False)
     _force_event: asyncio.Event | None = field(default=None, repr=False)
+    #: ``gateway.readiness.GatewayReadiness``: what ``/ready``, ``/startupz``
+    #: and the WebSocket handshake report (the supervisor contract).
+    readiness: Any = field(default=None, repr=False)
+    #: ``gateway.boot_lifecycle.BootTracker``: this boot's ledger row + safe mode.
+    _boot_tracker: Any = field(default=None, repr=False)
+    #: ``gateway.maintenance.GatewayMaintenance``: thaw detection + health sweep.
+    _maintenance: Any = field(default=None, repr=False)
 
     @property
     def shutdown_task(self) -> asyncio.Task | None:
@@ -1326,6 +1334,7 @@ class GatewayServer:
         *,
         drain_timeout: float = 30.0,
         cancel_in_flight: bool = False,
+        restart_expected_ms: int | None = None,
     ) -> None:
         """Gracefully shut down: stop channels, broadcast shutdown, close WS, stop server.
 
@@ -1335,10 +1344,28 @@ class GatewayServer:
         signal) does the same to a drain already under way. A second call is
         a no-op: the ``CancelledError`` branch in ``run_gateway`` and a
         restart in progress must not close the same services twice.
+
+        ``restart_expected_ms`` rides on the ``shutdown`` event: an estimate
+        of when this gateway serves again (the in-place restart), or ``None``
+        for a terminal stop (a signal, ``Ctrl+C``). The boot is recorded clean
+        at the end, so the crash-loop breaker never counts a deliberate stop.
         """
         if self._closed:
             return
         self._closed = True
+        if self.readiness is not None:
+            self.readiness.begin_drain()
+        if self._boot_tracker is not None:
+            self._boot_tracker.note_stopping(reason)
+        if self._maintenance is not None:
+            try:
+                await self._maintenance.stop()
+            except Exception:
+                log.debug("gateway.maintenance_stop_failed", exc_info=True)
+            from agentos.gateway.maintenance import get_maintenance, set_maintenance
+
+            if get_maintenance() is self._maintenance:
+                set_maintenance(None)
         # Drain in-flight turns FIRST so replies are not lost.
         # task_runtime.shutdown() waits for all running turns to complete before
         # returning; only then do we stop channel delivery.
@@ -1387,7 +1414,9 @@ class GatewayServer:
             log.info("gateway.channels_stopped")
 
         registry = get_registry()
-        await registry.broadcast("shutdown", {"reason": reason})
+        await registry.broadcast(
+            "shutdown", {"reason": reason, "restart_expected_ms": restart_expected_ms}
+        )
         # The broadcast only queues the event; let each writer put it on the
         # wire before the socket is closed under it (bounded per connection).
         await asyncio.gather(
@@ -1426,6 +1455,18 @@ class GatewayServer:
 
         if self._services is not None:
             await self._services.close()
+
+        if self._boot_tracker is not None:
+            self._boot_tracker.mark_clean(reason)
+            from agentos.gateway.boot_lifecycle import get_boot_tracker, set_boot_tracker
+
+            if get_boot_tracker() is self._boot_tracker:
+                set_boot_tracker(None)
+        if self.readiness is not None:
+            from agentos.gateway.readiness import get_gateway_readiness, set_gateway_readiness
+
+            if get_gateway_readiness() is self.readiness:
+                set_gateway_readiness(None)
 
         self.remove_signal_handlers()
         log.info("gateway.stopped", reason=reason, forced=self._forced)
@@ -1753,8 +1794,12 @@ async def build_services(
     turn_hooks: Sequence[Any] | None = None,
     compaction_hooks: Sequence[Any] | None = None,
     tool_hooks: Sequence[Any] | None = None,
+    start_scheduler: bool = True,
 ) -> ServiceContainer:
     """Initialize reusable services without any gateway-specific side effects.
+
+    ``start_scheduler=False`` builds the cron scheduler without starting its
+    timer (or its startup catch-up): the gateway's safe mode starts it later.
 
     This is the standalone entry point for service construction. It builds
     all the pieces that both the ASGI gateway and the CLI ``--standalone``
@@ -1828,7 +1873,14 @@ async def build_services(
         if "://" not in session_db_path:
             Path(session_db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         migrations_dir = _resolve_migrations_dir()
-        applied = apply_pending(session_db_path, migrations_dir)
+        try:
+            applied = apply_pending(session_db_path, migrations_dir)
+        except Exception as exc:
+            # A schema that cannot migrate is a config-class failure: the
+            # supervisor contract says exit 78, repair, then retry.
+            raise GatewayConfigError(
+                f"schema migration failed for {session_db_path}: {type(exc).__name__}: {exc}"
+            ) from exc
         if applied:
             log.info("build_services.migrations_applied", count=len(applied), ids=applied)
 
@@ -2187,12 +2239,17 @@ async def build_services(
                 ),
             },
         )
-        await cron_scheduler.start()
+        if start_scheduler:
+            await cron_scheduler.start()
         # Inject into the Control tool module so `cron` can dispatch to the scheduler.
         from agentos.tools.builtin.control import set_scheduler
 
         set_scheduler(cron_scheduler)
-        log.info("build_services.cron_scheduler_started")
+        log.info(
+            "build_services.cron_scheduler_started"
+            if start_scheduler
+            else "build_services.cron_scheduler_deferred"
+        )
     except Exception as e:
         log.warning("build_services.cron_scheduler_failed", error=str(e))
 
@@ -2428,6 +2485,40 @@ def build_turn_runner_from_services(
     return runner
 
 
+async def _start_all_channels(channel_manager: Any) -> dict[str, bool]:
+    """Start every channel adapter and log each outcome."""
+    results: dict[str, bool] = await channel_manager.start_all()
+    return await _log_channel_results(channel_manager, results)
+
+
+async def _log_channel_results(channel_manager: Any, results: dict[str, bool]) -> dict[str, bool]:
+    start_errors_fn = getattr(channel_manager, "start_errors", None)
+    start_errors = start_errors_fn() if start_errors_fn is not None else {}
+    for name, ok in results.items():
+        if ok:
+            log.info("gateway.channel_started", channel=name)
+        else:
+            details = start_errors.get(name, {})
+            log.warning(
+                "gateway.channel_failed",
+                channel=name,
+                error_type=details.get("error_type"),
+                error=details.get("error"),
+                exception=details.get("exception"),
+            )
+    return results
+
+
+async def _router_preload_sidecar(config: GatewayConfig, readiness: Any, name: str) -> None:
+    """Preload the router runtime; ``/startupz`` turns 200 once this settles."""
+    try:
+        await preload_agentos_router_runtime(config)
+    except Exception as exc:
+        readiness.settle_sidecar(name, error=f"{type(exc).__name__}: {exc}")
+        raise
+    readiness.settle_sidecar(name)
+
+
 async def start_gateway_server(
     port: int | None = None,
     config: GatewayConfig | None = None,
@@ -2441,14 +2532,31 @@ async def start_gateway_server(
     turn_hooks: Sequence[Any] | None = None,
     compaction_hooks: Sequence[Any] | None = None,
     tool_hooks: Sequence[Any] | None = None,
+    boot_tracker: Any = None,
 ) -> GatewayServer:
     """
     Boot sequence:
     1. Load/validate config
     2. Ensure auth token exists
-    3. Build ASGI app
-    4. Start uvicorn server
+    3. Record the boot; decide safe mode (crash-loop breaker)
+    4. Build ASGI app
+    5. Start uvicorn server, then the boot sidecars (channels, router preload)
+
+    ``boot_tracker`` overrides the crash-loop breaker (tests). By default a
+    real ``gateway run`` (``run=True``) records into the state directory's
+    ledger and an embedded boot records nothing.
     """
+    from agentos.gateway.readiness import (
+        SIDECAR_CHANNELS,
+        SIDECAR_ROUTER,
+        GatewayReadiness,
+        set_gateway_readiness,
+    )
+
+    # Created first so the boot duration it measures (the in-place restart's
+    # ``restart_expected_ms``) covers the whole boot.
+    readiness = GatewayReadiness()
+
     # ── Gateway-specific config handling ─────────────────────────────
     if config is None:
         config = GatewayConfig.load(os.environ.get("AGENTOS_GATEWAY_CONFIG_PATH"))
@@ -2522,6 +2630,23 @@ async def start_gateway_server(
     _pid_lock = GatewayPidLock(_state_path(config, ""))
     _pid_lock.acquire()
 
+    # ── Crash-loop breaker ───────────────────────────────────────────
+    # Recorded right after the pid lock (one gateway per state dir) and
+    # before any service: a crash anywhere below still counts as unclean.
+    from agentos.gateway.boot_lifecycle import BootTracker, set_boot_tracker
+
+    if boot_tracker is None:
+        boot_tracker = (
+            BootTracker.for_state_dir(_state_path(config, "")) if run else BootTracker(None)
+        )
+    safe_mode = boot_tracker.start()
+    readiness.attach_safe_mode(boot_tracker.snapshot)
+    set_boot_tracker(boot_tracker)
+    set_gateway_readiness(readiness)
+    # What safe mode holds back until it clears: every producer of automatic
+    # turns (channels, cron, heartbeat). The control plane starts regardless.
+    held_back = {"scheduler": safe_mode.active, "heartbeat": safe_mode.active}
+
     # ── Reusable service initialization via build_services ───────────
     svc = await build_services(
         config=config,
@@ -2533,6 +2658,7 @@ async def start_gateway_server(
         turn_hooks=turn_hooks,
         compaction_hooks=compaction_hooks,
         tool_hooks=tool_hooks,
+        start_scheduler=not safe_mode.active,
     )
 
     # Record boot time for uptime calculation (gateway-specific)
@@ -2702,7 +2828,8 @@ async def start_gateway_server(
     await heartbeat_watcher.start()
     svc.heartbeat_watcher = heartbeat_watcher
 
-    await heartbeat_loop.start()
+    if not held_back["heartbeat"]:
+        await heartbeat_loop.start()
     svc.heartbeat_loop = heartbeat_loop
 
     # Register cron agent_run handler (DI-based, no monkey-patch)
@@ -2943,12 +3070,20 @@ async def start_gateway_server(
         extra_routes=webhook_routes or None,
     )
     app.state.gateway_ready = False
+    app.state.readiness = readiness
+    app.state.boot_tracker = boot_tracker
+    readiness.attach_active_turns(lambda: int(getattr(task_runtime, "_global_in_flight", 0)))
 
     server_handle = GatewayServer(app=app, config=config)
     server_handle._channel_manager = channel_manager
     server_handle._services = svc
     server_handle._background_completion_manager = background_completion_manager
     server_handle._pid_lock = _pid_lock
+    server_handle.readiness = readiness
+    server_handle._boot_tracker = boot_tracker
+    # Registered before uvicorn listens, so a handshake that lands while the
+    # channels are still connecting is told to retry (STARTUP_SIDECARS).
+    readiness.begin_sidecar(SIDECAR_CHANNELS)
 
     if run:
         # In-place restart (``/restart``, ``gateway.restart``, the ``gateway``
@@ -3007,25 +3142,39 @@ async def start_gateway_server(
         log.info("gateway.started", host=config.host, port=config.port)
 
     # Start channels (after app is ready to receive webhooks)
-    if channel_manager is not None:
-        results = await channel_manager.start_all()
-        start_errors_fn = getattr(channel_manager, "start_errors", None)
-        start_errors = start_errors_fn() if start_errors_fn is not None else {}
-        for name, ok in results.items():
-            if ok:
-                log.info("gateway.channel_started", channel=name)
+    if channel_manager is not None and not safe_mode.active:
+        await _start_all_channels(channel_manager)
+    elif channel_manager is not None:
+        log.warning(
+            "gateway.safe_mode.channels_held",
+            count=len(list(channel_manager.items())),
+            hint="run 'agentos channels start --yes' to start them now",
+        )
+    readiness.settle_sidecar(SIDECAR_CHANNELS)
+
+    async def _resume_after_safe_mode(reason: str) -> None:
+        """Start what safe mode held back; runs once, when it clears."""
+        if channel_manager is not None:
+            # Not start_all: an operator may have started one channel by name
+            # while safe mode held (channels.start <name>).
+            start_stopped = getattr(channel_manager, "start_stopped", None)
+            if callable(start_stopped):
+                await _log_channel_results(channel_manager, await start_stopped())
             else:
-                details = start_errors.get(name, {})
-                log.warning(
-                    "gateway.channel_failed",
-                    channel=name,
-                    error_type=details.get("error_type"),
-                    error=details.get("error"),
-                    exception=details.get("exception"),
-                )
+                await _start_all_channels(channel_manager)
+        if held_back["scheduler"] and svc.cron_scheduler is not None:
+            held_back["scheduler"] = False
+            await svc.cron_scheduler.start()
+        if held_back["heartbeat"]:
+            held_back["heartbeat"] = False
+            await heartbeat_loop.start()
+        log.info("gateway.safe_mode_resumed", reason=reason)
+
+    boot_tracker.set_resume_hook(_resume_after_safe_mode)
 
     if run:
-        create_background_task(preload_agentos_router_runtime(config))
+        readiness.begin_sidecar(SIDECAR_ROUTER)
+        create_background_task(_router_preload_sidecar(config, readiness, SIDECAR_ROUTER))
         # If the previous image restarted in place on request, tell the chat
         # that asked. Channels are up by now, which is what the send needs.
         from agentos.gateway.restart import announce_restart_completion
@@ -3038,5 +3187,21 @@ async def start_gateway_server(
             )
         )
 
+        # Thaw detection, the channel health sweep and safe-mode
+        # re-evaluation share one 30 s tick (gateway/maintenance.py).
+        from agentos.gateway.maintenance import GatewayMaintenance, set_maintenance
+
+        maintenance = GatewayMaintenance(
+            channel_manager_ref=lambda: _cm_holder[0],
+            scheduler_ref=lambda: svc.cron_scheduler,
+            safe_mode_active=lambda: boot_tracker.safe_mode_active,
+            on_tick=[boot_tracker.reevaluate],
+            broadcast=get_registry().broadcast,
+        )
+        maintenance.start()
+        server_handle._maintenance = maintenance
+        set_maintenance(maintenance)
+
     app.state.gateway_ready = True
+    readiness.mark_serving()
     return server_handle

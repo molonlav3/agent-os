@@ -3040,6 +3040,16 @@ def _mode_protects_public_bind(auth: AuthConfig) -> bool:
     return auth.mode in ("token", "trusted-proxy")
 
 
+class GatewayConfigError(ValueError):
+    """A startup failure only a configuration change can fix.
+
+    ``agentos gateway run`` exits ``78`` (``EX_CONFIG``) on it instead of
+    ``1``, so a supervisor can tell "repair the config, then retry" from
+    "this crashed, restarting may help": the refused public bind, a schema
+    migration that cannot apply, a config file that does not parse.
+    """
+
+
 def enforce_public_bind_auth_guard(config: GatewayConfig) -> None:
     """Refuse every unauthenticated non-loopback listener."""
 
@@ -3049,7 +3059,7 @@ def enforce_public_bind_auth_guard(config: GatewayConfig) -> None:
         return
     if is_loopback_bind(config.host):
         return
-    raise ValueError(
+    raise GatewayConfigError(
         f"Refusing to serve: auth.mode={config.auth.mode!r} does not enforce "
         f"credentials on a non-loopback bind {config.host!r}. "
         "Anyone who can reach this port would get full access to chat, sessions, "

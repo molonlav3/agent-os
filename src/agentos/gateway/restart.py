@@ -381,6 +381,23 @@ class GatewayRestarter:
         services = getattr(self._server, "_services", None)
         return getattr(services, "task_runtime", None)
 
+    def restart_expected_ms(self) -> int:
+        """When clients should expect this gateway back, for the ``shutdown`` event.
+
+        Derived from how long this image took to boot (``GatewayReadiness``);
+        a server without one gets the contract's floor.
+        """
+        readiness = getattr(self._server, "readiness", None)
+        estimate = getattr(readiness, "restart_expected_ms", None)
+        if callable(estimate):
+            try:
+                return int(estimate())
+            except Exception:  # noqa: BLE001
+                pass
+        from agentos.gateway.readiness import MIN_RESTART_EXPECTED_MS
+
+        return MIN_RESTART_EXPECTED_MS
+
     def _set_ready(self, ready: bool) -> None:
         app = getattr(self._server, "app", None)
         state = getattr(app, "state", None)
@@ -441,6 +458,7 @@ class GatewayRestarter:
                     reason=f"restart:{req.mode}",
                     drain_timeout=timeout,
                     cancel_in_flight=req.mode == "force",
+                    restart_expected_ms=self.restart_expected_ms(),
                 ),
                 timeout=timeout + CLOSE_SLACK_S,
             )

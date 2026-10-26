@@ -173,6 +173,10 @@ class _ChannelInFlightSet:
     def full(self) -> bool:
         return len(self._tasks) >= self._cap
 
+    def active_count(self) -> int:
+        """Deliveries in flight plus reserved slots (the health sweep's "busy")."""
+        return len(self._tasks)
+
     def add(self, task: asyncio.Task[Any]) -> None:
         self._tasks.add(task)
 

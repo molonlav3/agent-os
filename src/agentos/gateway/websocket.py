@@ -1001,6 +1001,45 @@ async def handle_ws_connection(
         log.info("ws.disconnected", conn_id=conn_id)
 
 
+async def _refuse_while_starting(conn: WsConnection, req_id: str) -> bool:
+    """Supervisor contract: answer ``connect`` during boot with a retry hint.
+
+    While the boot sidecars (channel start) are still running, a connect is
+    answered with a retryable ``UNAVAILABLE`` (``details.code`` =
+    ``STARTUP_SIDECARS``, ``retry_after_ms``) and closed ``1013`` instead of
+    being served by a half-started gateway (gateway/readiness.py).
+    """
+    from agentos.gateway.readiness import (
+        WS_CLOSE_REASON_STARTING,
+        WS_CLOSE_TRY_AGAIN_LATER,
+        readiness_from_scope,
+    )
+
+    readiness = readiness_from_scope(getattr(conn.ws, "scope", None))
+    if readiness is None or readiness.accepting_connections():
+        return False
+    retry_after_ms = readiness.retry_after_ms()
+    try:
+        await conn.send_res(
+            make_error_res(
+                req_id,
+                ErrorCode.UNAVAILABLE,
+                "Gateway is starting; retry shortly",
+                retryable=True,
+                details={
+                    "code": ErrorDetailCode.STARTUP_SIDECARS.value,
+                    "retry_after_ms": retry_after_ms,
+                    "pending": readiness.pending_sidecars(),
+                },
+                retry_after_ms=retry_after_ms,
+            )
+        )
+        await conn.ws.close(code=WS_CLOSE_TRY_AGAIN_LATER, reason=WS_CLOSE_REASON_STARTING)
+    except Exception:  # noqa: BLE001 - the client may already be gone
+        pass
+    return True
+
+
 async def _handshake(
     conn: WsConnection,
     config: GatewayConfig,
@@ -1111,6 +1150,10 @@ async def _handshake(
         await conn.close(code=1002)
         return None
     req_id = frame.id
+
+    # Supervisor contract: a gateway still booting tells the client to retry.
+    if await _refuse_while_starting(conn, req_id):
+        return None
 
     try:
         params = ConnectParams.model_validate(frame.params if frame.params is not None else {})

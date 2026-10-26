@@ -1418,6 +1418,40 @@ def evaluate_channels(payload: dict[str, Any]) -> list[HealthFinding]:
                     restart_required=True,
                 )
             )
+        elif row.get("terminal_reason") or row.get("state") in {"terminal", "blocked"}:
+            reason = str(row.get("terminal_reason") or row.get("state"))
+            findings.append(
+                HealthFinding(
+                    id=f"channel.{name}.terminal",
+                    severity="error",
+                    readiness_impact="degrades",
+                    surface="channels",
+                    title=f"Channel {name} needs operator action",
+                    detail=(
+                        f"The channel stopped on a failure a restart cannot fix ({reason}). "
+                        "The gateway health sweep does not restart it automatically; fix the "
+                        "credentials or account, then restart the channel."
+                    ),
+                    evidence={
+                        "name": name,
+                        "status": status,
+                        "state": row.get("state"),
+                        "terminalReason": row.get("terminal_reason"),
+                        "type": row.get("type"),
+                    },
+                    fix_steps=[
+                        FixStep(
+                            label="Update channel credentials",
+                            command=f"agentos channels edit {name_arg} --token YOUR_TOKEN",
+                            detail="Replace YOUR_TOKEN with a valid credential for the channel.",
+                        ),
+                        FixStep(
+                            label="Restart channel",
+                            command=f"agentos channels restart {name_arg} --yes",
+                        ),
+                    ],
+                )
+            )
         elif status in {"dead", "exhausted"}:
             findings.append(
                 HealthFinding(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
@@ -20,6 +21,38 @@ from agentos.gateway.channel_dispatch import run_channel_dispatch
 from agentos.session.keys import DmScope, build_direct_key, build_group_key, build_thread_key
 
 log = structlog.get_logger(__name__)
+
+#: Start/dispatch failures that no restart can fix: a revoked or wrong token,
+#: an account the platform disabled. The health sweep never auto-restarts a
+#: channel that hit one; an operator restart (after fixing the credentials)
+#: clears it.
+_TERMINAL_ERROR_RE = re.compile(
+    r"(?<!\d)(401|403|4004)(?!\d)|unauthori[sz]ed|authentication failed|invalid[_ ]?auth"
+    r"|invalid[_ ]?token|not_authed|token_revoked|account_inactive|invalid_api_key"
+    r"|forbidden|login ?failure|improper token",
+    re.IGNORECASE,
+)
+
+
+def terminal_reason_for(exc: BaseException) -> str | None:
+    """``"auth: <message>"`` for a credential-class failure, else ``None``."""
+    text = f"{type(exc).__name__}: {exc}"
+    if _TERMINAL_ERROR_RE.search(text):
+        return f"auth: {text[:200]}"
+    return None
+
+
+#: Runtime states :meth:`ChannelManager.runtime_status` reports. ``stale-socket``
+#: is added on top by the gateway health sweep, which owns the clock.
+CHANNEL_STATES = (
+    "connected",
+    "disconnected",
+    "stuck",
+    "stopped",
+    "terminal",
+    "blocked",
+)
+
 
 #: Channel types whose send path takes a thread id as the address it delivers
 #: to: Slack's ``thread_ts``, Telegram's forum ``message_thread_id``, Discord's
@@ -66,6 +99,13 @@ class ChannelManager:
     _dispatch_states: dict[str, str] = field(default_factory=dict)
     _restart_counts: dict[str, int] = field(default_factory=dict)
     _start_errors: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Runtime status for the gateway health sweep (epoch seconds): when each
+    # channel last (re)started and last handed the dispatch loop an inbound
+    # event, and why a channel is terminal (never auto-restarted).
+    _started_at: dict[str, float] = field(default_factory=dict)
+    _last_event_at: dict[str, float] = field(default_factory=dict)
+    _terminal_reasons: dict[str, str] = field(default_factory=dict)
+    _clock: Callable[[], float] = field(default=time.time, repr=False)
     # Inner-loop retry policy (overridable for tests).
     _max_retries: int = 5
     _retry_backoff_initial: float = 1.0
@@ -230,6 +270,37 @@ class ChannelManager:
                     "error": str(result),
                     "exception": repr(result),
                 }
+                reason = terminal_reason_for(result)
+                if reason:
+                    self._terminal_reasons[name] = reason
+                statuses[name] = False
+            else:
+                self._start_errors.pop(name, None)
+                statuses[name] = True
+        return statuses
+
+    async def start_stopped(self) -> dict[str, bool]:
+        """Start only the channels with no dispatch loop; running ones are left alone.
+
+        :meth:`start_all` assumes nothing runs yet (boot). This is the safe
+        form for later: leaving the gateway's safe mode, or ``channels.start``
+        while some channels already run.
+        """
+        statuses: dict[str, bool] = {}
+        for name in self._channels:
+            if name in self._tasks:
+                continue
+            try:
+                await self._safe_start(name)
+            except Exception as exc:  # noqa: BLE001 - reported per channel
+                self._start_errors[name] = {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "exception": repr(exc),
+                }
+                reason = terminal_reason_for(exc)
+                if reason:
+                    self._terminal_reasons[name] = reason
                 statuses[name] = False
             else:
                 self._start_errors.pop(name, None)
@@ -262,7 +333,15 @@ class ChannelManager:
             self._unregister_tool_channel(name, adapter)
             raise
         entry_agent_id = self._agent_ids.get(name, "main")
-        key_builder = partial(self._build_session_key, name, agent_id=entry_agent_id)
+        build_key = partial(self._build_session_key, name, agent_id=entry_agent_id)
+
+        def key_builder(msg: Any) -> str:
+            # Called once per inbound event the dispatch loop receives: the
+            # cheapest place to know a socket still delivers.
+            self._last_event_at[name] = self._clock()
+            return build_key(msg)
+
+        self._started_at[name] = self._clock()
         cap = _compute_channel_cap(self._config)
         in_flight = _ChannelInFlightSet(cap)
         self._in_flight_sets[name] = in_flight
@@ -319,6 +398,9 @@ class ChannelManager:
                     error_type=type(exc).__name__,
                     error=str(exc),
                 )
+                reason = terminal_reason_for(exc)
+                if reason:
+                    self._terminal_reasons[name] = reason
                 if attempt < self._max_retries:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, max_backoff)
@@ -412,9 +494,106 @@ class ChannelManager:
         prev_state = self._dispatch_states.get(name)
         await self.stop_channel(name)
         self._restart_counts[name] = 0
+        # An operator restart is the way out of a terminal state: the
+        # credentials were presumably fixed. A failure sets it again.
+        self._terminal_reasons.pop(name, None)
         if prev_state == "dead":
             log.info("dispatch.dead_to_running", channel=name)
-        await self._safe_start(name)
+        try:
+            await self._safe_start(name)
+        except Exception as exc:
+            reason = terminal_reason_for(exc)
+            if reason:
+                self._terminal_reasons[name] = reason
+            raise
+
+    async def start_channel(self, name: str) -> None:
+        """Start one channel: a restart when it runs, a first start when it does not."""
+        if name not in self._channels:
+            raise KeyError(f"Channel not found: {name}")
+        await self.restart_channel(name)
+
+    def in_flight_count(self, name: str) -> int:
+        in_flight = self._in_flight_sets.get(name)
+        count = getattr(in_flight, "active_count", None)
+        return int(count()) if callable(count) else 0
+
+    async def restart_if_idle(self, name: str) -> bool:
+        """Restart ``name`` unless it is delivering a reply or is terminal.
+
+        Used by the gateway's thaw handler and health sweep, never by an
+        operator: returns ``False`` (and does nothing) when the channel is
+        unknown, terminal, stopped by the operator, or busy, so the caller
+        retries on its next pass.
+        """
+        if name not in self._channels:
+            return False
+        if self._terminal_reasons.get(name):
+            return False
+        if name not in self._tasks and self._dispatch_states.get(name) != "dead":
+            return False
+        if self.in_flight_count(name) > 0:
+            log.info("channel.restart_deferred_busy", channel=name)
+            return False
+        try:
+            await self.restart_channel(name)
+        except Exception as exc:  # noqa: BLE001 - the sweep logs and moves on
+            log.warning(
+                "channel.auto_restart_failed",
+                channel=name,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return False
+        return True
+
+    async def runtime_status(self) -> dict[str, dict[str, Any]]:
+        """Per-channel runtime facts for the health sweep and ``channels.status``.
+
+        ``state`` is one of :data:`CHANNEL_STATES`. Adapters may report a
+        terminal condition themselves through ``health_check().extra``
+        (``terminal_reason``, or ``blocked``); otherwise it is inferred from
+        start/dispatch errors that look like a credential failure.
+        """
+        out: dict[str, dict[str, Any]] = {}
+        for name, adapter in self._channels.items():
+            connected = False
+            extra: dict[str, Any] = {}
+            try:
+                health = await adapter.health_check()
+                connected = bool(getattr(health, "connected", False))
+                extra = dict(getattr(health, "extra", None) or {})
+            except Exception:  # noqa: BLE001 - a broken probe reads as disconnected
+                connected = False
+            terminal = self._terminal_reasons.get(name) or extra.get("terminal_reason")
+            dispatch_state = self._dispatch_states.get(name, "unknown")
+            task = self._tasks.get(name)
+            if extra.get("blocked"):
+                state = "blocked"
+                terminal = terminal or f"blocked: {extra.get('blocked')}"
+            elif terminal:
+                state = "terminal"
+            elif dispatch_state == "dead" or (
+                task is not None and task.done() and dispatch_state == "running"
+            ):
+                state = "stuck"
+            elif task is None:
+                state = "stopped"
+            elif not connected:
+                state = "disconnected"
+            else:
+                state = "connected"
+            out[name] = {
+                "state": state,
+                "connected": connected,
+                "dispatch_state": dispatch_state,
+                "transport": getattr(adapter, "transport_name", None) or extra.get("transport"),
+                "started_at": self._started_at.get(name),
+                "last_event_at": self._last_event_at.get(name),
+                "terminal_reason": str(terminal) if terminal else None,
+                "in_flight": self.in_flight_count(name),
+            }
+        return out
 
     # ── Health ───────────────────────────────────────────────
 

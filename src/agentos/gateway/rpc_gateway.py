@@ -106,3 +106,50 @@ async def _handle_gateway_restart(params: dict | None, ctx: RpcContext) -> dict[
         "pid": req.pid,
         "version": __version__,
     }
+
+
+@_d.method("gateway.status")
+async def _handle_gateway_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """The supervisor contract's live numbers: state, drain budget, active turns.
+
+    The same ``state``/``failing``/``safe_mode`` as ``GET /ready``, plus what
+    only an authenticated caller should see: how many turns are running
+    right now (what a stop would have to drain).
+    """
+    import os
+
+    from agentos.gateway.readiness import drain_budget_ms, get_gateway_readiness
+
+    readiness = get_gateway_readiness()
+    restarter = get_restarter()
+    pending = restarter.pending if restarter is not None else None
+    if readiness is None:
+        return {
+            "state": "ready",
+            "ready": True,
+            "failing": [],
+            "safe_mode": {"active": False},
+            "drain_budget_ms": drain_budget_ms(),
+            "active_turns": _active_turns(ctx),
+            "pid": os.getpid(),
+            "version": __version__,
+            "restart_pending": pending is not None,
+        }
+    payload = readiness.snapshot(gateway_ready=False if pending is not None else None)
+    active = readiness.active_turns()
+    payload.update(
+        {
+            "active_turns": active if active is not None else _active_turns(ctx),
+            "pid": os.getpid(),
+            "version": __version__,
+            "restart_pending": pending is not None,
+            "restart_expected_ms": readiness.restart_expected_ms(),
+        }
+    )
+    return payload
+
+
+def _active_turns(ctx: RpcContext) -> int | None:
+    runtime = getattr(ctx, "task_runtime", None)
+    value = getattr(runtime, "_global_in_flight", None)
+    return int(value) if isinstance(value, int) else None

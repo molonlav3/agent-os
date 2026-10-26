@@ -1229,3 +1229,36 @@ def test_memory_embedding_evaluator_does_not_report_unknown_status_as_ready() ->
         "agentos memory status --deep --json",
         "agentos gateway restart",
     ]
+
+
+def test_channel_evaluator_flags_a_terminal_channel_with_the_credential_fix() -> None:
+    (finding,) = evaluate_channels(
+        {
+            "channels": [
+                {
+                    "name": "tg",
+                    "enabled": True,
+                    "status": "stopped",
+                    "state": "terminal",
+                    "terminal_reason": "auth: RuntimeError: 401 Unauthorized",
+                    "type": "telegram",
+                }
+            ]
+        }
+    )
+    assert finding.id == "channel.tg.terminal"
+    assert finding.severity == "error"
+    assert "does not restart it automatically" in finding.detail
+    assert "401 Unauthorized" in finding.detail
+    commands = [step.command for step in finding.fix_steps]
+    assert commands == [
+        "agentos channels edit tg --token YOUR_TOKEN",
+        "agentos channels restart tg --yes",
+    ]
+
+
+def test_channel_evaluator_flags_a_blocked_channel_as_terminal() -> None:
+    (finding,) = evaluate_channels(
+        {"channels": [{"name": "s", "enabled": True, "status": "connected", "state": "blocked"}]}
+    )
+    assert finding.id == "channel.s.terminal"

@@ -126,7 +126,12 @@ async def test_restart_from_a_telegram_topic_round_trip(wired: Any) -> None:
 
     await wired.restarter.task
     assert wired.server.close_calls == [
-        {"reason": "restart:safe", "drain_timeout": 30.0, "cancel_in_flight": False}
+        {
+            "reason": "restart:safe",
+            "drain_timeout": 30.0,
+            "cancel_in_flight": False,
+            "restart_expected_ms": 3000,
+        }
     ]
     assert wired.server.app.state.gateway_ready is False
 
