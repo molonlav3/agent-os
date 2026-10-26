@@ -21,8 +21,9 @@ _NO_LOCAL: frozenset[str] = frozenset()
         ("192.168.1.10/24", "192.168.1.99", True),  # host bits are ignored
         ("fd7a:115c:a1e0::/48", "fd7a:115c:a1e0:ab12::1", True),
         ("fd7a:115c:a1e0::/48", "fd7a:115d::1", False),
-        # An IPv4 block never admits an IPv4-mapped IPv6 peer.
-        ("10.0.0.0/8", "::ffff:10.0.0.1", False),
+        # A dual-stack listener reports IPv4 peers in mapped form.
+        ("10.0.0.0/8", "::ffff:10.0.0.1", True),
+        ("10.0.0.0/8", "::ffff:11.0.0.1", False),
         ("127.0.0.1, 10.0.0.0/8", "10.1.1.1", True),
         # An unparseable block keeps the exact string comparison.
         ("10.0.0.0/99", "10.0.0.0/99", True),

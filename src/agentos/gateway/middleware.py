@@ -278,9 +278,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     )
             else:
                 client_ip = request_client_ip(request, self._config)
-                # A browser request (it carries Origin) is keyed by that origin
-                # and never loopback-exempt, as on the WebSocket: a page in the
-                # operator's browser reaches the gateway from loopback too.
+                # A browser request (it carries Origin) is also charged to the
+                # address's browser budget, which is never loopback-exempt, as
+                # on the WebSocket: a page in the operator's browser reaches
+                # the gateway from loopback too.
                 origin = request.headers.get("origin") or None
                 decision = limiter.check(client_ip, TOKEN_SCOPE, origin=origin)
                 if not decision.allowed:

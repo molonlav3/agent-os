@@ -30,9 +30,10 @@ class _Clock:
         return self.now
 
 
-def _config(**rate_limit: Any) -> GatewayConfig:
+def _config(*, host: str = "127.0.0.1", **rate_limit: Any) -> GatewayConfig:
     return GatewayConfig(
-        auth=AuthConfig(mode="token", token=_TOKEN, rate_limit=AuthRateLimitConfig(**rate_limit))
+        host=host,
+        auth=AuthConfig(mode="token", token=_TOKEN, rate_limit=AuthRateLimitConfig(**rate_limit)),
     )
 
 
@@ -100,17 +101,49 @@ def test_loopback_is_never_locked_out_but_answers_slower_and_slower() -> None:
     assert limiter.check("::1").allowed is True
 
 
-def test_browser_attempts_are_keyed_by_origin_and_never_exempt() -> None:
+def test_browser_attempts_on_loopback_are_lockable_whatever_the_origin() -> None:
     limiter, _clock = _limiter(max_failures=3)
-    origin = "http://evil.example"
-    for _ in range(3):
-        decision = limiter.record_failure("127.0.0.1", origin=origin)
-        assert decision.delay_s == 0
-    assert limiter.check("127.0.0.1", origin=origin).allowed is False
-    # The same loopback peer without that Origin is a different key.
+    # Rotating the Origin value gains nothing: one browser bucket per address.
+    for port in (5173, 5174, 5175):
+        limiter.record_failure("127.0.0.1", origin=f"http://127.0.0.1:{port}")
+    assert limiter.check("127.0.0.1", origin="http://127.0.0.1:9999").allowed is False
+    assert limiter.check("127.0.0.1", origin="https://other.example").allowed is False
+    # The local CLI (no Origin) is still exempt from lockout.
     assert limiter.check("127.0.0.1").allowed is True
-    # The lock follows the origin, whichever address it comes from.
-    assert limiter.check("10.1.2.3", origin=origin).allowed is False
+
+
+def test_rotating_origin_never_lifts_an_address_lockout() -> None:
+    limiter, _clock = _limiter()
+    for _ in range(10):
+        limiter.record_failure(_REMOTE)
+    for i in range(20):
+        assert limiter.check(_REMOTE, origin=f"https://attacker-{i}.example").allowed is False
+
+
+def test_rotating_origins_are_charged_to_the_address() -> None:
+    limiter, _clock = _limiter()
+    for i in range(10):
+        limiter.record_failure(_REMOTE, origin=f"https://attacker-{i}.example")
+    assert limiter.check(_REMOTE).allowed is False
+    assert limiter.check(_REMOTE, origin="https://fresh.example").allowed is False
+
+
+def test_an_origin_cannot_lock_out_another_address() -> None:
+    limiter, _clock = _limiter()
+    console = "http://192.168.1.20:18791"
+    for _ in range(10):
+        limiter.record_failure(_REMOTE, origin=console)
+    assert limiter.check(_REMOTE, origin=console).allowed is False
+    assert limiter.check("192.168.1.20", origin=console).allowed is True
+
+
+def test_a_browser_success_does_not_reset_the_budget() -> None:
+    limiter, _clock = _limiter(max_failures=3)
+    for _ in range(2):
+        limiter.record_failure(_REMOTE, origin="https://page.example")
+    limiter.record_success(_REMOTE, origin="https://console.example")
+    limiter.record_failure(_REMOTE, origin="https://page.example")
+    assert limiter.check(_REMOTE, origin="https://page.example").allowed is False
 
 
 def test_loopback_exemption_can_be_turned_off() -> None:
@@ -274,6 +307,52 @@ def test_ws_missing_token_never_consumes_budget() -> None:
         res = _ws_attempt(client, None)
         assert res["error"]["code"] == "UNAUTHORIZED"
         assert res["error"]["details"] is None
+    assert _ws_attempt(client, _TOKEN)["type"] == "hello-ok"
+
+
+def test_http_rotating_origins_cannot_bypass_the_lockout() -> None:
+    # A non-loopback bind accepts any browser Origin, so only the limiter stands.
+    client = _http(_config(host="0.0.0.0"))
+    for i in range(10):
+        headers = {"Authorization": "Bearer nope", "Origin": f"https://attacker-{i}.example"}
+        assert client.get("/api/system/status", headers=headers).status_code == 401
+    for i in range(10, 40):
+        headers = {"Authorization": "Bearer nope", "Origin": f"https://attacker-{i}.example"}
+        assert client.get("/api/system/status", headers=headers).status_code == 429
+    no_origin = {"Authorization": "Bearer nope"}
+    assert client.get("/api/system/status", headers=no_origin).status_code == 429
+
+
+def test_ws_rotating_origins_cannot_bypass_the_lockout() -> None:
+    client = _http(_config(host="0.0.0.0"))
+    for _ in range(10):
+        assert _ws_attempt(client, "nope")["error"]["details"] is None
+    for i in range(20):
+        res = _ws_attempt(client, "nope", {"origin": f"https://attacker-{i}.example"})
+        assert res["error"]["details"]["code"] == "AUTH_RATE_LIMITED"
+
+
+def test_ws_attacker_using_the_console_origin_does_not_lock_out_the_operator() -> None:
+    app = create_gateway_app(_config(host="0.0.0.0"))
+    console = {"origin": "http://192.168.1.20:18791"}
+    attacker = TestClient(app, client=(_REMOTE, 50000))
+    operator = TestClient(app, client=("192.168.1.20", 50000))
+    for _ in range(10):
+        _ws_attempt(attacker, "nope", console)
+    assert _ws_attempt(attacker, _TOKEN, console)["error"]["details"]["code"] == (
+        "AUTH_RATE_LIMITED"
+    )
+    assert _ws_attempt(operator, _TOKEN, console)["type"] == "hello-ok"
+
+
+def test_ws_loopback_rotating_origins_get_locked_out() -> None:
+    client = _http(_config(), host="127.0.0.1")
+    results = [
+        _ws_attempt(client, "nope", {"origin": f"http://127.0.0.1:{20000 + i}"}) for i in range(11)
+    ]
+    assert [r["error"]["details"] for r in results[:10]] == [None] * 10
+    assert results[10]["error"]["details"]["code"] == "AUTH_RATE_LIMITED"
+    # The local CLI keeps working.
     assert _ws_attempt(client, _TOKEN)["type"] == "hello-ok"
 
 

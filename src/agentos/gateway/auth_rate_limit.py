@@ -5,21 +5,23 @@ failed attempts that token can be guessed at network speed from anywhere the
 port is reachable (a LAN or tailnet bind). This module keeps two guards that
 the HTTP middleware and the WebSocket handshake share:
 
-* :class:`AuthRateLimiter` counts *wrong* credentials per
-  ``{client, credential scope}``. ``max_failures`` failures inside
-  ``window_seconds`` lock the key out for ``lockout_seconds``; a locked key is
-  refused before its credential is even compared. A *missing* credential
-  never consumes budget: a client that sends none is told to authenticate,
-  and an operator whose console has not loaded its token yet must not lock
-  themself out.
+* :class:`AuthRateLimiter` counts *wrong* credentials per client address
+  and credential scope. ``max_failures`` failures inside ``window_seconds``
+  lock the address out for ``lockout_seconds``; a locked address is refused
+  before its credential is even compared, whatever ``Origin`` the attempt
+  carries. A *missing* credential never consumes budget: a client that
+  sends none is told to authenticate, and an operator whose console has not
+  loaded its token yet must not lock themself out.
 
-  A loopback peer (no ``Origin``) is never locked out when
-  ``exempt_loopback`` is on (the default), so a stale local script cannot
-  shut the operator out of their own machine; each of its failures is
-  answered after a progressive delay instead (250 ms, doubling, capped at
-  5 s). A browser attempt (one that carries ``Origin``) is keyed by that
-  origin and is never exempt: a page in the operator's browser reaches the
-  gateway from a loopback address too.
+  A loopback address is never locked out when ``exempt_loopback`` is on (the
+  default), so a stale local script cannot shut the operator out of their
+  own machine; each of its failures is answered after a progressive delay
+  instead (250 ms, doubling, capped at 5 s). Browser attempts (those that
+  carry ``Origin``) are additionally counted in a second bucket per address,
+  shared by every ``Origin`` value and never exempt: a page in the
+  operator's browser reaches the gateway from a loopback address too, and
+  rotating the ``Origin`` header gains it nothing. That bucket can only add
+  a lockout, never lift the address one.
 
 * :class:`PreauthBudget` caps the sockets one client address may hold open
   while it has not finished the handshake, so a peer cannot pin the
@@ -84,10 +86,13 @@ def _rate_limit_settings(config: Any) -> Any:
 
 
 class AuthRateLimiter:
-    """Per ``{client, scope}`` failed-credential counter with lockout.
+    """Failed-credential counter with lockout, per client address and scope.
 
-    Reads ``config.auth.rate_limit`` on every call, so ``config.apply`` (or a
-    test) changing it takes effect at once.
+    Every wrong credential is charged to the address bucket; one that came
+    with an ``Origin`` header is also charged to that address's browser
+    bucket. An attempt is refused while either bucket it belongs to is
+    locked. Reads ``config.auth.rate_limit`` on every call, so
+    ``config.apply`` (or a test) changing it takes effect at once.
     """
 
     def __init__(
@@ -105,16 +110,31 @@ class AuthRateLimiter:
     # ── keys ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def key_for(client_ip: str | None, scope: str, *, origin: str | None = None) -> tuple[str, str]:
-        if origin:
-            return (f"origin:{origin.strip().lower()}", scope)
-        return (f"ip:{(client_ip or 'unknown').strip().lower()}", scope)
+    def _address(client_ip: str | None) -> str:
+        return (client_ip or "unknown").strip().lower()
 
-    def _exempt(self, client_ip: str | None, origin: str | None) -> bool:
+    @classmethod
+    def address_key(cls, client_ip: str | None, scope: str) -> tuple[str, str]:
+        return (f"ip:{cls._address(client_ip)}", scope)
+
+    @classmethod
+    def browser_key(cls, client_ip: str | None, scope: str) -> tuple[str, str]:
+        return (f"browser:{cls._address(client_ip)}", scope)
+
+    def _keys(
+        self, client_ip: str | None, scope: str, origin: str | None
+    ) -> list[tuple[tuple[str, str], bool]]:
+        """``(key, exempt)`` for every bucket an attempt is charged to."""
+        keys = [(self.address_key(client_ip, scope), self._address_exempt(client_ip))]
+        if origin:
+            keys.append((self.browser_key(client_ip, scope), False))
+        return keys
+
+    def _address_exempt(self, client_ip: str | None) -> bool:
         settings = _rate_limit_settings(self._config)
         if settings is None or not bool(getattr(settings, "exempt_loopback", True)):
             return False
-        return not origin and is_loopback_address(client_ip)
+        return is_loopback_address(client_ip)
 
     def _enabled(self) -> bool:
         settings = _rate_limit_settings(self._config)
@@ -133,16 +153,18 @@ class AuthRateLimiter:
         self, client_ip: str | None, scope: str = TOKEN_SCOPE, *, origin: str | None = None
     ) -> AuthRateDecision:
         """Whether a presented credential may be evaluated at all."""
-        if not self._enabled() or self._exempt(client_ip, origin):
-            return _ALLOW
-        entry = self._entries.get(self.key_for(client_ip, scope, origin=origin))
-        if entry is None:
+        if not self._enabled():
             return _ALLOW
         now = self._clock()
-        if entry.locked_until > now:
-            return AuthRateDecision(
-                allowed=False, retry_after_ms=max(1, int((entry.locked_until - now) * 1000))
-            )
+        retry_after = 0.0
+        for key, exempt in self._keys(client_ip, scope, origin):
+            entry = self._entries.get(key)
+            if entry is None or exempt:
+                continue
+            if entry.locked_until > now:
+                retry_after = max(retry_after, entry.locked_until - now)
+        if retry_after > 0:
+            return AuthRateDecision(allowed=False, retry_after_ms=max(1, int(retry_after * 1000)))
         return _ALLOW
 
     def record_failure(
@@ -151,38 +173,49 @@ class AuthRateLimiter:
         """Count one wrong credential and return the resulting decision."""
         if not self._enabled():
             return _ALLOW
-        key = self.key_for(client_ip, scope, origin=origin)
         now = self._clock()
         max_failures, window, lockout = self._settings()
-        entry = self._entries.get(key)
-        if entry is None:
-            entry = _Entry(failures=[])
-            self._entries[key] = entry
-        self._entries.move_to_end(key)
-        entry.failures = [t for t in entry.failures if now - t < window]
-        entry.failures.append(now)
-        entry.consecutive += 1
+        delay = 0.0
+        locked_for = 0.0
+        for key, exempt in self._keys(client_ip, scope, origin):
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _Entry(failures=[])
+                self._entries[key] = entry
+            self._entries.move_to_end(key)
+            entry.failures = [t for t in entry.failures if now - t < window]
+            entry.failures.append(now)
+            entry.consecutive += 1
+            if exempt:
+                # The delay is for exempt (non-browser) loopback callers; a
+                # browser attempt is held back by its own, lockable bucket.
+                if not origin:
+                    delay = min(
+                        LOOPBACK_DELAY_MAX_S,
+                        LOOPBACK_DELAY_START_S * (2 ** min(entry.consecutive - 1, 16)),
+                    )
+                continue
+            if len(entry.failures) >= max_failures and lockout > 0:
+                entry.locked_until = now + lockout
+                entry.failures.clear()
+                locked_for = lockout
         self._evict(now, window)
-
-        if self._exempt(client_ip, origin):
-            delay = min(
-                LOOPBACK_DELAY_MAX_S,
-                LOOPBACK_DELAY_START_S * (2 ** min(entry.consecutive - 1, 16)),
-            )
-            return AuthRateDecision(allowed=True, delay_s=delay)
-
-        if len(entry.failures) >= max_failures and lockout > 0:
-            entry.locked_until = now + lockout
-            entry.failures.clear()
-            return AuthRateDecision(allowed=False, retry_after_ms=int(lockout * 1000))
-        return _ALLOW
+        if locked_for > 0:
+            return AuthRateDecision(allowed=False, retry_after_ms=int(locked_for * 1000))
+        return AuthRateDecision(allowed=True, delay_s=delay)
 
     def record_success(
         self, client_ip: str | None, scope: str = TOKEN_SCOPE, *, origin: str | None = None
     ) -> None:
-        """A correct credential clears the key's failure history."""
-        if self._entries:
-            self._entries.pop(self.key_for(client_ip, scope, origin=origin), None)
+        """A correct non-browser credential clears its address's failure history.
+
+        A browser success clears nothing: the browser bucket is shared by
+        every page on that address, and the operator's console connecting
+        must not hand a hostile page a fresh budget.
+        """
+        if not self._entries or origin:
+            return
+        self._entries.pop(self.address_key(client_ip, scope), None)
 
     def reset(self) -> None:
         self._entries.clear()

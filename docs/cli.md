@@ -1760,6 +1760,7 @@ agentos doctor                         # --deep is the default
 agentos doctor --quick --json
 agentos doctor --agent main --gateway ws://localhost:18791/ws
 agentos doctor --config ./agentos.toml # inspected when the local gateway is unavailable
+agentos doctor --token "$AGENTOS_TOKEN" # default: AGENTOS_GATEWAY_TOKEN, then auth.token
 agentos models list
 agentos models list --provider openrouter --capability tools --json
 agentos migrate                        # dry-run; auto-detects ~/.openclaw and ~/.hermes
@@ -1769,12 +1770,17 @@ agentos migrate openclaw --skill-conflict rename --overwrite --json
 agentos reset --key <session-key>
 ```
 
-`agentos doctor` exits 1 when the install is not ready. Its `gateway`
-findings cover network exposure: a non-loopback bind without auth, wildcard
-`control_ui.allowed_origins`, CORS `*` with credentials off loopback,
-`trusted-proxy` mode without `auth.trusted_proxy`, failed-auth rate limiting
-off, and a token shorter than 24 characters (see
-[`remote-access.md`](remote-access.md)). `--deep` (the
+`agentos doctor` exits 1 when the install is not ready. It presents the
+gateway token from `--token`, `AGENTOS_GATEWAY_TOKEN` or `auth.token` in the
+config. Its `gateway` findings cover network exposure: a non-loopback bind
+without auth, wildcard `control_ui.allowed_origins`, CORS `*` with
+credentials off loopback, `trusted-proxy` mode without `auth.trusted_proxy`,
+failed-auth rate limiting off, loopback exempt from the lockout behind a
+same-host proxy, and a token shorter than 24 characters. When no gateway
+answers (one that refuses to start, or admits nobody) they are read from the
+config file instead. Their fix commands write that file (`config set` with
+`--config <file>`); see
+[`remote-access.md`](remote-access.md). `--deep` (the
 default) includes deeper memory diagnostics for `--agent` (default `main`);
 `--quick` runs the shallow checks only. `--gateway` (or
 `AGENTOS_GATEWAY_URL`) picks the gateway to ask, and `--config` names the

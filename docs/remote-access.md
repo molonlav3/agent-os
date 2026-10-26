@@ -20,8 +20,30 @@ client on one machine to drive a gateway running on another.
 Whatever you choose, run `agentos doctor` afterwards: it reports the risky
 combinations (`gateway.bind_no_auth`, `gateway.allowed_origins_wildcard`,
 `gateway.cors_wildcard_with_credentials`, `gateway.trusted_proxy_unset`,
-`gateway.auth_rate_limit_off`, `gateway.token_short`) with the command that
-fixes each.
+`gateway.auth_rate_limit_off`,
+`gateway.rate_limit_loopback_exempt_behind_proxy`, `gateway.token_short`)
+with the command that fixes each. It finds the token on its own
+(`AGENTOS_GATEWAY_TOKEN`, then `auth.token` in the config, or `--token`), and
+when no gateway answers it checks the config file instead.
+
+## Writing the Config
+
+Every recipe below changes settings in the gateway's config file. Use
+`agentos config set <key> <value> --config <file>`: **without `--config` the
+command only prints an `export AGENTOS_GATEWAY_…` line and changes nothing**
+for a gateway started anywhere else. The examples write
+`~/.agentos/config.toml`, the file a gateway reads by default (under
+`AGENTOS_STATE_DIR` when that is set); if your gateway was started with
+`--config <file>` or from a directory with an `agentos.toml`, use that file
+instead (`agentos doctor` names it). Editing the TOML by hand works just as
+well. The gateway reads the file at startup, so restart it afterwards:
+
+```sh
+agentos gateway restart
+```
+
+Configure authentication **before** you expose the gateway, never after:
+until the restart the old settings are live.
 
 ## SSH Tunnel
 
@@ -55,36 +77,48 @@ if other people have accounts on the remote host.
 
 [Tailscale Serve](https://tailscale.com/kb/1312/serve) publishes a loopback
 service to your tailnet over HTTPS with a `*.ts.net` certificate. The gateway
-keeps its loopback bind:
+keeps its loopback bind. Serve connects to it from loopback, so the gateway
+must enforce a token first; without one every device on your tailnet would be
+admitted as if it sat at the keyboard.
 
-```sh
-tailscale serve --bg --https=443 http://127.0.0.1:18791
-```
-
-The console is then at `https://<machine>.<tailnet>.ts.net/control/`. Two
-settings make it work from a browser on another device:
-
-1. Enforce a token. Serve connects from loopback, so without one every
-   device on your tailnet would be admitted as if it sat at the keyboard:
-
-   ```sh
-   agentos config set auth.mode token
-   agentos config set auth.token "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-   ```
-
-2. Allow the tailnet origin. On a loopback bind the gateway accepts browser
-   requests only from loopback origins (the guard against cross-site
-   WebSocket hijacking and DNS rebinding); add the Serve origin explicitly:
+1. Enforce a token, allow the tailnet origin, and let the rate limiter see
+   the real client. On a loopback bind the gateway accepts browser requests
+   only from loopback origins (the guard against cross-site WebSocket
+   hijacking and DNS rebinding), so the Serve origin must be listed. Serve
+   adds `X-Forwarded-For`; trusting it as a local proxy makes failed-token
+   lockouts apply per tailnet device instead of exempting everything that
+   arrives from 127.0.0.1:
 
    ```sh
-   agentos config set control_ui.allowed_origins '["https://<machine>.<tailnet>.ts.net"]'
+   CFG=~/.agentos/config.toml
+   agentos config set auth.mode token --config "$CFG"
+   agentos config set auth.token "$(python3 -c 'import secrets; print(secrets.token_hex(32))')" --config "$CFG"
+   agentos config set control_ui.allowed_origins '["https://<machine>.<tailnet>.ts.net"]' --config "$CFG"
+   agentos config set auth.trusted_proxy 127.0.0.1 --config "$CFG"
+   agentos gateway restart
    ```
 
-Restart the gateway, open the console URL, enter the token under Overview ›
-Gateway connection › Token and press Connect.
+   Check it took effect before going further: `agentos doctor` must not
+   report `gateway.rate_limit_loopback_exempt_behind_proxy`, and
+   `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18791/api/sessions`
+   must print `401`.
+
+2. Only now publish it:
+
+   ```sh
+   tailscale serve --bg --https=443 http://127.0.0.1:18791
+   ```
+
+Open `https://<machine>.<tailnet>.ts.net/control/`, enter the token under
+Overview › Gateway connection › Token and press Connect.
 `tailscale serve status` shows what is published; `tailscale serve --https=443
 off` takes it down. Do not use Tailscale **Funnel** for the gateway: it
 publishes the port to the whole internet.
+
+If you would rather not trust the proxy's header, lock out loopback too
+instead (`agentos config set auth.rate_limit.exempt_loopback false --config
+"$CFG"`); a local script with a stale token is then locked out like anyone
+else.
 
 ## Reverse Proxy with Trusted-Proxy Mode
 
@@ -103,9 +137,10 @@ trusted_proxy = "127.0.0.1"   # IPs or CIDR blocks, comma-separated
 allowed_origins = ["https://agent.example.com"]
 ```
 
-In this mode a request is admitted only when the *transport peer* (the
-address the TCP connection comes from, never a header) is listed in
-`auth.trusted_proxy`. Anything else gets `401`. The mode is accepted on a
+Write those keys with `agentos config set … --config <file>` or edit the
+file, then restart. In this mode a request is admitted only when the
+*transport peer* (the address the TCP connection comes from, never a header)
+is listed in `auth.trusted_proxy`. Anything else gets `401`. The mode is accepted on a
 non-loopback bind for that reason; with an empty `trusted_proxy` nothing is
 admitted and `doctor` reports `gateway.trusted_proxy_unset`.
 
@@ -116,6 +151,12 @@ first address your proxies did not add is the client used for rate limiting.
 An address that names the gateway host itself (loopback or one of its own
 interfaces) is treated as spoofed and ignored. List every proxy hop, for
 example `trusted_proxy = "10.0.0.0/8"` behind a load balancer.
+
+If the proxy instead forwards to a gateway in `token` mode on the same host,
+set `auth.trusted_proxy` to the proxy's address anyway: otherwise every client
+it forwards looks like a loopback peer, and loopback is exempt from the
+failed-token lockout (`doctor` reports
+`gateway.rate_limit_loopback_exempt_behind_proxy`).
 
 A minimal Caddy site:
 
@@ -142,20 +183,23 @@ location / {
 ## Token on a LAN or Public Bind
 
 Binding beyond loopback requires an enforced auth mode; the gateway refuses
-to start with `auth.mode = "none"` on `0.0.0.0` or a LAN address:
+to start with `auth.mode = "none"` on `0.0.0.0` or a LAN address. Set the
+mode in the file first, then start on the wider bind:
 
 ```sh
-agentos config set auth.mode token
+agentos config set auth.mode token --config ~/.agentos/config.toml
 agentos gateway run --listen 0.0.0.0
 ```
 
 A token is generated at startup when none is set. Clients send it as
 `Authorization: Bearer <token>` (HTTP) or in the WebSocket `connect`
 request; it is never accepted in a query string. Wrong tokens are throttled
-per client: ten failures in a minute lock that client out for five minutes
-(`429` with `Retry-After` over HTTP, `AUTH_RATE_LIMITED` over the
-WebSocket). Tune it under `[auth.rate_limit]`; keep it on for any
-non-loopback bind.
+per client address: ten failures in a minute lock that address out for five
+minutes (`429` with `Retry-After` over HTTP, `AUTH_RATE_LIMITED` over the
+WebSocket), whatever `Origin` header the attempts carry. Tune it under
+`[auth.rate_limit]`; keep it on for any non-loopback bind. An address that
+already holds 128 sockets in the handshake gets `HTTP 403` for the next one
+until some of them finish.
 
 Only do this on a network you trust. The traffic is plain HTTP unless you
 also set `[tls] certfile` and `keyfile`.
@@ -165,7 +209,7 @@ also set `[tls] certfile` and `keyfile`.
 Generate a new token, restart, then update every client:
 
 ```sh
-agentos config set auth.token "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+agentos config set auth.token "$(python3 -c 'import secrets; print(secrets.token_hex(32))')" --config ~/.agentos/config.toml
 agentos gateway restart
 ```
 

@@ -13,7 +13,7 @@ from agentos.gateway.config import (
     CorsConfig,
     GatewayConfig,
 )
-from agentos.gateway.rpc_doctor import gateway_security_payload
+from agentos.gateway.exposure import gateway_security_payload
 from agentos.health.gateway_security import MIN_TOKEN_CHARS, evaluate_gateway_security
 
 _LONG_TOKEN = "t" * 43
@@ -47,7 +47,10 @@ def test_bind_no_auth() -> None:
     findings = evaluate_gateway_security(gateway_security_payload(config))
     bind = next(f for f in findings if f.id == "gateway.bind_no_auth")
     assert bind.severity == "error"
-    assert any(step.command == "agentos config set auth.mode token" for step in bind.fix_steps)
+    assert any(
+        (step.command or "").startswith("agentos config set auth.mode token --config ")
+        for step in bind.fix_steps
+    )
 
 
 def test_allowed_origins_wildcard() -> None:
@@ -121,3 +124,83 @@ async def test_doctor_status_reports_gateway_findings() -> None:
     assert result.ok, result.error
     ids = {finding["id"] for finding in result.payload["findings"]}
     assert "gateway.token_short" in ids
+
+
+def test_fix_commands_write_the_config_file(tmp_path) -> None:
+    """``config set`` without ``--config`` only prints an export line."""
+    path = tmp_path / "my config.toml"
+    config = GatewayConfig.model_construct(
+        host="0.0.0.0",
+        auth=AuthConfig.model_construct(
+            mode="token", token="short", rate_limit=AuthRateLimitConfig(enabled=False)
+        ),
+        cors=CorsConfig(allowed_origins=["*"], allow_credentials=True),
+        control_ui=ControlUiConfig(allowed_origins=["*"]),
+        config_path=str(path),
+    )
+    findings = evaluate_gateway_security(gateway_security_payload(config))
+    commands = [step.command for f in findings for step in f.fix_steps if step.command]
+    assert commands
+    assert all(f"--config '{path}'" in command for command in commands), commands
+
+
+def test_fix_commands_default_to_the_user_config_without_a_loaded_file() -> None:
+    from agentos.paths import default_agentos_home
+
+    findings = evaluate_gateway_security(
+        gateway_security_payload(GatewayConfig(auth=AuthConfig(mode="token", token="x")))
+    )
+    command = findings[0].fix_steps[0].command or ""
+    assert str(default_agentos_home() / "config.toml") in command
+
+
+def test_loopback_exempt_behind_a_same_host_proxy() -> None:
+    proxied = ControlUiConfig(allowed_origins=["https://box.tail1234.ts.net"])
+    config = GatewayConfig(auth=AuthConfig(mode="token", token=_LONG_TOKEN), control_ui=proxied)
+    assert "gateway.rate_limit_loopback_exempt_behind_proxy" in _ids(config)
+    # Trusting the local proxy (X-Forwarded-For names the client) fixes it...
+    trusted = AuthConfig(mode="token", token=_LONG_TOKEN, trusted_proxy="127.0.0.1")
+    assert "gateway.rate_limit_loopback_exempt_behind_proxy" not in _ids(
+        GatewayConfig(auth=trusted, control_ui=proxied)
+    )
+    # ...and so does locking out loopback too.
+    strict = AuthConfig(
+        mode="token",
+        token=_LONG_TOKEN,
+        rate_limit=AuthRateLimitConfig(exempt_loopback=False),
+    )
+    assert "gateway.rate_limit_loopback_exempt_behind_proxy" not in _ids(
+        GatewayConfig(auth=strict, control_ui=proxied)
+    )
+    # Loopback-only origins mean no proxy: nothing to report.
+    local = ControlUiConfig(allowed_origins=["http://localhost:5173"])
+    assert "gateway.rate_limit_loopback_exempt_behind_proxy" not in _ids(
+        GatewayConfig(auth=AuthConfig(mode="token", token=_LONG_TOKEN), control_ui=local)
+    )
+
+
+@pytest.mark.parametrize(
+    ("toml", "finding"),
+    [
+        ('host = "0.0.0.0"\n[auth]\nmode = "none"\n', "gateway.bind_no_auth"),
+        ('[auth]\nmode = "trusted-proxy"\n', "gateway.trusted_proxy_unset"),
+        ('[auth]\nmode = "token"\ntoken = "short"\n', "gateway.token_short"),
+    ],
+)
+def test_offline_doctor_reports_exposure_from_the_config_file(
+    tmp_path, toml: str, finding: str
+) -> None:
+    """The findings a gateway cannot report itself (it will not start, or
+    admits nobody) come from the local config when no gateway answers."""
+    from agentos.cli.doctor_cmd import _offline_report
+
+    path = tmp_path / "agentos.toml"
+    path.write_text(toml, encoding="utf-8")
+    report = _offline_report(
+        ConnectionError("connection refused"),
+        gateway_url="ws://127.0.0.1:19999/ws",
+        config_path=path,
+    )
+    ids = {item["id"] for item in report["findings"]}
+    assert finding in ids
+    assert "gateway.security.ok" not in ids

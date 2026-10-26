@@ -8,8 +8,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any, cast
 
-from agentos.gateway.access import is_loopback_bind
 from agentos.gateway.config import GatewayConfig
+from agentos.gateway.exposure import gateway_security_payload
 from agentos.gateway.rpc import RpcContext, get_dispatcher
 from agentos.gateway.rpc_channels import _handle_channels_status
 from agentos.gateway.rpc_logs import _build_logs_status
@@ -531,30 +531,6 @@ def _control_ui_payload(ctx: RpcContext) -> dict[str, Any]:
         "sourceMtime": report.source_mtime,
         "bundleMtime": report.bundle_mtime,
         "wheelInstall": report.wheel_install,
-    }
-
-
-def gateway_security_payload(config: Any) -> dict[str, Any]:
-    """What the evaluator needs, read from a live ``GatewayConfig``.
-
-    Never carries a secret: the token is reduced to its length.
-    """
-    auth = getattr(config, "auth", None)
-    rate_limit = getattr(auth, "rate_limit", None)
-    cors = getattr(config, "cors", None)
-    control_ui = getattr(config, "control_ui", None)
-    host = str(getattr(config, "host", "") or "")
-    token = getattr(auth, "token", None)
-    return {
-        "host": host,
-        "loopbackBind": is_loopback_bind(host),
-        "authMode": str(getattr(auth, "mode", "none") or "none"),
-        "tokenLength": len(token) if isinstance(token, str) else 0,
-        "trustedProxy": str(getattr(auth, "trusted_proxy", "") or ""),
-        "authRateLimitEnabled": bool(getattr(rate_limit, "enabled", True)),
-        "allowedOrigins": list(getattr(control_ui, "allowed_origins", []) or []),
-        "corsAllowedOrigins": list(getattr(cors, "allowed_origins", []) or []),
-        "corsAllowCredentials": bool(getattr(cors, "allow_credentials", False)),
     }
 
 

@@ -153,8 +153,9 @@ def peer_is_trusted_proxy(trusted_proxy: str | None, peer_ip: str | None) -> boo
     valid textual forms, and the operator writing the config and the ASGI
     server reporting the peer need not choose the same one, so ``::1`` was not
     matching a peer reported as ``0:0:0:0:0:0:0:1``. A CIDR entry admits every
-    address in its block (an IPv4 block never admits an IPv4-mapped IPv6
-    peer: that is a distinct address). An entry that is neither — a hostname,
+    address in its block, an IPv4 block also the IPv4-mapped form a
+    dual-stack listener reports (``::ffff:10.0.0.7``); an exact IPv4 entry
+    stays exact. An entry that is neither — a hostname,
     or anything unparseable — keeps the exact string comparison it had, so
     this only ever matches an address already configured.
     """
@@ -167,10 +168,14 @@ def peer_is_trusted_proxy(trusted_proxy: str | None, peer_ip: str | None) -> boo
     peer_address = _parsed_ip(peer)
     if peer_address is None:
         return False
+    mapped = getattr(peer_address, "ipv4_mapped", None)
     for entry in configured:
         network = _parsed_network(entry)
         if network is not None:
             if peer_address.version == network.version and peer_address in network:
+                return True
+            # A dual-stack listener reports IPv4 peers as ``::ffff:a.b.c.d``.
+            if mapped is not None and network.version == 4 and mapped in network:
                 return True
             continue
         address = _parsed_ip(entry)

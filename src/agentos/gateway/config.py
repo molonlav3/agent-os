@@ -72,10 +72,11 @@ class AuthRateLimitConfig(BaseSettings):
     """``[auth.rate_limit]``: failed-credential throttling (``gateway.auth_rate_limit``).
 
     ``max_failures`` wrong credentials inside ``window_seconds`` from one
-    client (a browser attempt: one ``Origin``) lock it out for
-    ``lockout_seconds``. A missing credential never counts. With
-    ``exempt_loopback`` a loopback peer without ``Origin`` is never locked
-    out; its failures are answered after a delay growing from 250 ms to 5 s.
+    client address lock it out for ``lockout_seconds``, whatever ``Origin``
+    the attempts carry. A missing credential never counts. With
+    ``exempt_loopback`` a loopback address is never locked out (its
+    failures are answered after a delay growing from 250 ms to 5 s), except
+    its browser attempts, which share a second, lockable budget.
     """
 
     model_config = SettingsConfigDict(

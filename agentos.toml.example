@@ -672,7 +672,10 @@ cron_default_mode = "bypass"            # off | bypass | full
 # Wrong tokens per client (HTTP and WebSocket share the budget): max_failures
 # within window_seconds lock the client out for lockout_seconds (HTTP 429 +
 # Retry-After). A missing token never counts. With exempt_loopback a loopback
-# peer without an Origin header is only slowed down, never locked out.
+# peer is only slowed down, never locked out (browser attempts, which carry
+# Origin, still are). Behind a proxy on the same host (Tailscale Serve, Caddy)
+# every client is loopback: set auth.trusted_proxy = "127.0.0.1" so the
+# proxy's X-Forwarded-For names the client, or exempt_loopback = false.
 # enabled = true
 # max_failures = 10
 # window_seconds = 60
