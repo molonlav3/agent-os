@@ -191,8 +191,10 @@ async def test_first_signal_starts_close_once_second_forces_the_drain() -> None:
     assert server.shutdown_task is task
     await asyncio.wait_for(task, timeout=FORCE_DRAIN_TIMEOUT_S + 3)
     assert runtime.calls[1] == {"cancel": True, "timeout": FORCE_DRAIN_TIMEOUT_S}
-    assert server._server.force_exit is True  # type: ignore[union-attr]
     assert server._server.should_exit is True  # type: ignore[union-attr]
+    # Not force_exit: that skips the ASGI lifespan shutdown (browser cleanup)
+    # and leaves its task to die with a CancelledError traceback.
+    assert server._server.force_exit is False  # type: ignore[union-attr]
 
 
 async def test_request_shutdown_is_idempotent() -> None:
@@ -282,3 +284,79 @@ def test_start_gateway_server_owns_signals_and_disables_uvicorn_capture(
     assert set(installed) == {int(signal.SIGTERM), int(signal.SIGINT)}
     assert after_close == ()
     assert holder["server"].capture_signals is contextlib.nullcontext
+
+
+class _FrozenConnection:
+    """A client that never answers the closing handshake."""
+
+    def __init__(self) -> None:
+        self.authenticated = True
+        self.closed = False
+
+    async def send_event(self, event: str, payload: Any = None) -> None:
+        return None
+
+    async def flush(self, timeout: float = 1.0) -> None:
+        return None
+
+    async def close(self) -> None:
+        await asyncio.sleep(3600)
+
+
+async def test_a_frozen_client_cannot_stall_the_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agentos.gateway.websocket import ConnectionRegistry
+
+    registry = ConnectionRegistry()
+    for index in range(3):
+        conn = _FrozenConnection()
+        conn.conn_id = f"frozen-{index}"  # type: ignore[attr-defined]
+        registry.register(conn)  # type: ignore[arg-type]
+    monkeypatch.setattr(boot, "get_registry", lambda: registry)
+    monkeypatch.setattr(boot, "WS_CLOSE_TIMEOUT_S", 0.2)
+    server = _server()
+
+    started = asyncio.get_running_loop().time()
+    await asyncio.wait_for(server.close("test"), timeout=5)
+    # Concurrent and bounded: three frozen sockets cost one timeout, not three.
+    assert asyncio.get_running_loop().time() - started < 1.5
+
+
+def test_uvicorn_bounds_its_own_graceful_wait(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _Config:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    class _Server:
+        def __init__(self, config: Any) -> None:
+            self.should_exit = False
+            self.force_exit = False
+
+        async def serve(self) -> None:
+            while not self.should_exit:
+                await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(boot.uvicorn, "Config", _Config)
+    monkeypatch.setattr(boot.uvicorn, "Server", _Server)
+    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
+    monkeypatch.setattr("agentos.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
+    monkeypatch.setattr("agentos.gateway.pidlock.GatewayPidLock.release", lambda self: None)
+
+    async def run() -> None:
+        config = GatewayConfig(
+            state_dir=str(tmp_path / "state"),
+            workspace_dir=str(tmp_path / "workspace"),
+            control_ui={"enabled": False},
+            channels={"channels": []},
+        )
+        handle = await boot.start_gateway_server(config=config, run=True)
+        await handle.close()
+
+    asyncio.run(run())
+    assert captured["timeout_graceful_shutdown"] == boot.UVICORN_GRACEFUL_SHUTDOWN_S
+    from agentos.gateway.ws_transport import GatewayWebSocketProtocol
+
+    assert captured["ws"] is GatewayWebSocketProtocol

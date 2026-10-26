@@ -217,6 +217,7 @@ def test_connect_without_params_or_client_still_works() -> None:
         ({"auth": "secret"}, ["auth"]),
         ({"client": "agentos-web"}, ["client"]),
         ({"caps": "all"}, ["caps"]),
+        ({"minProtocol": 3, "maxProtocol": 1}, []),
         (["minProtocol", 3], []),
     ],
 )

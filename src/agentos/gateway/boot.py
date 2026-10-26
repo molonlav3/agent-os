@@ -57,6 +57,7 @@ from agentos.gateway.session_lifecycle import (
 from agentos.gateway.session_services import get_session_storage
 from agentos.gateway.session_streams import get_session_streams
 from agentos.gateway.websocket import get_registry
+from agentos.gateway.ws_transport import GatewayWebSocketProtocol
 from agentos.paths import default_agentos_home
 from agentos.permissions import configured_cron_default_elevated, configured_default_elevated
 from agentos.router_tiers import DEFAULT_ROUTER_STRATEGY
@@ -1166,6 +1167,13 @@ def _setup_file_logging(config: GatewayConfig | None = None) -> None:
 SIGNAL_DRAIN_TIMEOUT_S = 30.0
 #: After a second signal: how long cancelled turns get to unwind.
 FORCE_DRAIN_TIMEOUT_S = 2.0
+#: How long shutdown waits for all WebSocket closing handshakes together.
+WS_CLOSE_TIMEOUT_S = 2.0
+#: uvicorn's own bound on waiting for open HTTP connections at shutdown.
+UVICORN_GRACEFUL_SHUTDOWN_S = 5
+#: How long close() waits for uvicorn to finish (its graceful wait included)
+#: before cancelling it.
+UVICORN_STOP_TIMEOUT_S = 10.0
 
 
 @dataclass
@@ -1277,13 +1285,19 @@ class GatewayServer:
         return self._shutdown_task
 
     def force_shutdown(self) -> None:
-        """Cut a running drain short: cancel in-flight turns, force uvicorn out."""
+        """Cut a running drain short: cancel in-flight turns now.
+
+        uvicorn is only told to exit, not to force-exit: a forced uvicorn
+        skips the ASGI lifespan shutdown (browser sessions stay open, and the
+        abandoned lifespan task logs a CancelledError traceback at exit). Its
+        own wait for open connections is bounded by
+        ``timeout_graceful_shutdown`` instead.
+        """
         self._forced = True
         if self._force_event is not None:
             self._force_event.set()
         if self._server is not None:
             self._server.should_exit = True
-            self._server.force_exit = True
 
     async def _drain(self, work: Any) -> bool:
         """Await ``work`` unless a forced shutdown arrives first.
@@ -1380,9 +1394,17 @@ class GatewayServer:
             *(conn.flush(timeout=1.0) for conn in registry.all()), return_exceptions=True
         )
 
-        # Close all active WS connections
-        for conn in registry.all():
-            await conn.close()
+        # Close all active WS connections, concurrently and bounded: a client
+        # that stopped reading must not hold the shutdown on its closing
+        # handshake.
+        connections = registry.all()
+        if connections:
+            _done, stuck = await asyncio.wait(
+                [asyncio.ensure_future(conn.close()) for conn in connections],
+                timeout=WS_CLOSE_TIMEOUT_S,
+            )
+            for task in stuck:
+                task.cancel()
 
         # Close MCP clients
         try:
@@ -1398,7 +1420,7 @@ class GatewayServer:
 
         if self._task is not None:
             try:
-                await asyncio.wait_for(self._task, timeout=5.0)
+                await asyncio.wait_for(self._task, timeout=UVICORN_STOP_TIMEOUT_S)
             except TimeoutError:
                 self._task.cancel()
 
@@ -2939,10 +2961,13 @@ async def start_gateway_server(
             "port": config.port,
             "log_level": "info" if not config.debug else "debug",
             "access_log": config.debug,
-            # The post-handshake frame ceiling ``hello-ok.policy.max_payload``
-            # advertises; frames before ``hello-ok`` are held to
-            # MAX_PREAUTH_PAYLOAD_BYTES by the handshake itself.
+            # The post-handshake ceiling ``hello-ok.policy.max_payload``
+            # advertises. The protocol class holds every connection to
+            # MAX_PREAUTH_PAYLOAD_BYTES until its handshake succeeds, refusing
+            # a larger pre-auth message before reading it.
             "ws_max_size": MAX_PAYLOAD_BYTES,
+            "ws": GatewayWebSocketProtocol,
+            "timeout_graceful_shutdown": UVICORN_GRACEFUL_SHUTDOWN_S,
         }
         if config.tls.keyfile and config.tls.certfile:
             uvicorn_kwargs["ssl_keyfile"] = config.tls.keyfile

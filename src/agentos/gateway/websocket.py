@@ -45,6 +45,7 @@ from agentos.gateway.protocol import (
     validation_error_details,
 )
 from agentos.gateway.rpc import RpcContext, RpcDispatcher
+from agentos.gateway.ws_transport import raise_message_limit
 from agentos.session.keys import canonicalize_session_key
 
 log = structlog.get_logger(__name__)
@@ -905,7 +906,9 @@ async def handle_ws_connection(
             client_ip=client_ip,
             limit=preauth.limit,
         )
-        await ws.close(code=1013)  # try again later
+        # Refused before accept(): the upgrade never completes, so the client
+        # sees an HTTP 403 response rather than a WebSocket close code.
+        await ws.close(code=1013)
         return
     try:
         hello = await _handshake(
@@ -922,6 +925,10 @@ async def handle_ws_connection(
             preauth.release(client_ip)
     if hello is None:
         return
+    # Frames before hello-ok were held to MAX_PREAUTH_PAYLOAD_BYTES at the
+    # transport (ws_transport.GatewayWebSocketProtocol); from here on the
+    # advertised max_payload applies.
+    raise_message_limit(getattr(ws, "scope", None), hello.policy.max_payload)
 
     registry.register(conn)
     # Boundary: pre-auth direct-send ends here. After registry.register(conn),
@@ -1046,7 +1053,10 @@ async def _handshake(
         await conn.close(code=1003)
         return None
 
-    # Step 3: Size gate, then parse and validate the connect request.
+    # Step 3: Size gate, then parse and validate the connect request. The
+    # transport already refuses larger frames before reading them when the
+    # gateway runs under ws_transport.GatewayWebSocketProtocol; this check
+    # covers any other ASGI server.
     if _utf8_size_exceeds(raw, MAX_PREAUTH_PAYLOAD_BYTES):
         log.warning("ws.preauth_frame_too_large", conn_id=conn.conn_id, chars=len(raw))
         await conn.send_res(
@@ -1387,6 +1397,10 @@ class RequestStartQueue:
             await asyncio.wait(deps, timeout=max(0.0, deadline - loop.time()))
             if any(not task.done() for task in deps):
                 await on_start_timeout()
+                # Refused, but still a link in its lane: the requests queued
+                # behind this one must keep waiting for what it waited for,
+                # or they would overtake a request that is still running.
+                await asyncio.wait(deps)
                 return
         try:
             await asyncio.wait_for(self._slots.acquire(), timeout=max(0.0, deadline - loop.time()))

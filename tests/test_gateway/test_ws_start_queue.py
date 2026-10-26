@@ -290,6 +290,39 @@ async def test_request_that_cannot_start_in_time_is_refused_retryable() -> None:
     await asyncio.wait_for(loop, timeout=2.0)
 
 
+@pytest.mark.parametrize("lane", ["session:a", "barrier"])
+async def test_a_refused_request_still_holds_back_the_ones_behind_it(lane: str) -> None:
+    """a1 runs long, a2 is refused for timing out, a3 must not start before a1 ends."""
+    queue = RequestStartQueue(start_timeout_s=0.1)
+    release = asyncio.Event()
+    events: list[str] = []
+
+    async def _a1() -> None:
+        events.append("a1 start")
+        await release.wait()
+        events.append("a1 end")
+
+    async def _a2() -> None:  # pragma: no cover - refused before it starts
+        events.append("a2 start")
+
+    async def _a3() -> None:
+        events.append("a3 start")
+
+    async def _refused(name: str) -> None:
+        events.append(f"{name} refused")
+
+    first = queue.submit(lane, _a1, lambda: _refused("a1"))
+    second = queue.submit(lane, _a2, lambda: _refused("a2"))
+    await asyncio.sleep(0.15)
+    assert events == ["a1 start", "a2 refused"]
+    third = queue.submit(lane, _a3, lambda: _refused("a3"))
+    await asyncio.sleep(0.03)
+    assert "a3 start" not in events  # still behind a1, through the refused a2
+    release.set()
+    await asyncio.wait_for(asyncio.gather(first, second, third), timeout=2.0)
+    assert events == ["a1 start", "a2 refused", "a1 end", "a3 start"]
+
+
 async def test_slot_wait_also_counts_against_the_start_timeout() -> None:
     queue = RequestStartQueue(max_concurrent=1, start_timeout_s=0.1)
     release = asyncio.Event()

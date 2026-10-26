@@ -14,6 +14,7 @@ from pydantic import (
     StrictInt,
     StrictStr,
     field_validator,
+    model_validator,
 )
 
 # Protocol version negotiated during handshake
@@ -359,6 +360,12 @@ class ConnectParams(BaseModel):
     auth: dict[str, Any] | None = None
     locale: StrictStr | None = None
     user_agent: StrictStr | None = Field(default=None, alias="userAgent")
+
+    @model_validator(mode="after")
+    def _range_is_ordered(self) -> ConnectParams:
+        if self.min_protocol > self.max_protocol:
+            raise ValueError("minProtocol must not be greater than maxProtocol")
+        return self
 
     @field_validator("auth")
     @classmethod
