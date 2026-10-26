@@ -21,6 +21,7 @@ from agentos.gateway.input_normalization import (
     materialize_generated_text_attachments,
     normalize_incoming_text,
 )
+from agentos.gateway.protocol import ErrorCode, ErrorDetailCode
 from agentos.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
@@ -308,9 +309,7 @@ def _buffer_session_event(
     event_name: str,
     payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if event_name.startswith("session.event."):
-        return get_session_streams().record(session_key, event_name, payload)
-    return dict(payload or {})
+    return get_session_streams().record_if_replayable(session_key, event_name, payload)
 
 
 async def _resolve_attachments(
@@ -1517,13 +1516,44 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
 
     task_runtime = getattr(ctx, "task_runtime", None)
     if task_runtime is not None:
-        cancelled_count = await _cancel_task_runtime(
+        if not hasattr(task_runtime, "terminal_publications"):
+            # A runtime without the terminal reservation (a test double): the
+            # plain cancel is all it supports.
+            cancelled_count = await _cancel_task_runtime(
+                task_runtime,
+                session_key=key,
+                source=_cancel_source_from_params(params, "sessions_abort"),
+                reason="user_abort",
+            )
+            return {"aborted": cancelled_count > 0, "key": key}
+        from agentos.gateway.run_abort import abort_session_runs
+
+        outcome = await abort_session_runs(
             task_runtime,
-            session_key=key,
+            key,
+            session_manager=ctx.session_manager,
             source=_cancel_source_from_params(params, "sessions_abort"),
-            reason="user_abort",
         )
-        return {"aborted": cancelled_count > 0, "key": key}
+        if outcome.still_running:
+            raise RpcHandlerError(
+                ErrorCode.UNAVAILABLE,
+                "The run was stopped, but some of its runs are still running.",
+                details={
+                    "code": ErrorDetailCode.ABORT_INCOMPLETE.value,
+                    "key": key,
+                    "aborted": outcome.aborted,
+                    "children_aborted": outcome.children_aborted,
+                    "still_running": outcome.still_running,
+                },
+                retryable=True,
+            )
+        # ``aborted`` lists the stopped run ids: truthy exactly when a run was
+        # stopped, which is how callers have always read it.
+        return {
+            "aborted": outcome.aborted,
+            "children_aborted": outcome.children_aborted,
+            "key": key,
+        }
 
     # Cancel running agent task via registry
     registry = get_agent_task_registry()
@@ -2411,7 +2441,21 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
         "replay_gap_reason": replay.gap_reason,
         "replayed_count": replayed_count,
         **task_state,
+        # Authoritative: ``None`` means nothing runs, so a client drops any
+        # live view it reconstructed; an object is what the run said so far.
+        "in_flight_run": get_session_streams().in_flight_snapshot(
+            key, active_task=task_state.get("active_task")
+        ),
     }
+
+
+async def session_in_flight_run(ctx: RpcContext, session_key: str) -> dict[str, Any] | None:
+    """``in_flight_run`` for ``session_key`` (see ``sessions.messages.subscribe``)."""
+    storage = get_session_storage(getattr(ctx, "session_manager", None))
+    task_state = _task_state_summary(await _list_task_rows(ctx, storage, session_key))
+    return get_session_streams().in_flight_snapshot(
+        session_key, active_task=task_state.get("active_task")
+    )
 
 
 @_d.method("sessions.messages.unsubscribe")

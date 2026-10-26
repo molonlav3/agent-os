@@ -35,7 +35,7 @@ def _field(owner: object, name: str) -> BoundedRegistry:
 @pytest.mark.parametrize(
     "factory,fields",
     [
-        (SessionStreamRegistry, ["_seq_by_session", "_events_by_session"]),
+        (SessionStreamRegistry, ["_seq_by_session", "_events_by_session", "_live_runs"]),
         (StaleOutputCache, ["_entries"]),
         (SubagentRegistry, ["_archived"]),
         (PlanModeStore, ["_sessions"]),

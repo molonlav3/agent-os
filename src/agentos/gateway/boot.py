@@ -685,6 +685,8 @@ async def dispatch_task_runtime_turn(
             ),
             stream_event_sink=getattr(run, "stream_event_sink", None),
             show_thinking=bool(getattr(getattr(config, "control_ui", None), "show_thinking", True)),
+            run_id=_run_id(run),
+            terminal_publications=getattr(run, "terminal_publications", None),
         )
         return
     run_kwargs = build_task_runtime_run_kwargs(
@@ -712,6 +714,8 @@ async def dispatch_task_runtime_turn(
             heartbeat_interval=heartbeat_interval,
             stream_event_sink=getattr(run, "stream_event_sink", None),
             show_thinking=bool(getattr(getattr(config, "control_ui", None), "show_thinking", True)),
+            run_id=_run_id(run),
+            terminal_publications=getattr(run, "terminal_publications", None),
         )
     except TaskRuntimeStreamError as exc:
         if exc.code in {
@@ -746,6 +750,11 @@ async def dispatch_task_runtime_turn(
                         error=str(rb_exc),
                     )
         raise
+
+
+def _run_id(run: Any) -> str | None:
+    task_id = getattr(run, "task_id", None)
+    return task_id if isinstance(task_id, str) and task_id else None
 
 
 def _is_acp_session_row(session: Any) -> bool:
@@ -859,6 +868,12 @@ def _make_task_session_lifecycle_listener(
 ) -> Any:
     async def _listener(event: TaskLifecycleEvent) -> None:
         if event.run_kind in ("subagent", "acp"):
+            # A child run's session row is not written here: the subagent
+            # announce owns it (it finishes the row and leaves a steered ACP
+            # turn's session running for its replacement). The run state still
+            # has to reach clients, or a child stays "Working" after its run
+            # ended -- so publish it, scoped to the child session.
+            await _emit_child_run_state(event, event_emitter=event_emitter)
             return
         changed = await apply_task_lifecycle_to_session(
             event,
@@ -885,6 +900,28 @@ def _make_task_session_lifecycle_listener(
     return _listener
 
 
+async def _emit_child_run_state(event: TaskLifecycleEvent, *, event_emitter: Any) -> None:
+    """``sessions.changed`` for a child session's run transition, row untouched."""
+    if event.phase == "terminal" and event.has_followup:
+        # The session has more work queued (a steer's replacement turn): its
+        # own ``task.running`` reports the state; a terminal here would read
+        # as "stopped" while the replacement runs.
+        return
+    reason = "task_running" if event.phase == "running" else "task_terminal"
+    state_field = "active_task" if event.phase == "running" else "last_task"
+    await event_emitter(
+        event.session_key,
+        "sessions.changed",
+        build_sessions_changed_payload(
+            event.session_key,
+            reason,
+            run_status=_task_run_status_for_session_change(event),
+            run_kind=event.run_kind,
+            **{state_field: _task_state_for_session_change(event)},
+        ),
+    )
+
+
 def _optional_positive_timeout(config: Any, attr: str, default: float) -> float | None:
     raw = getattr(config, attr, default)
     try:
@@ -903,15 +940,24 @@ async def _emit_task_runtime_stream_events(
     heartbeat_interval: float | None = None,
     stream_event_sink: Any = None,
     show_thinking: bool = True,
+    run_id: str | None = None,
+    terminal_publications: Any = None,
 ) -> None:
     """Emit turn events and fail the task if the stream reports an error.
 
     ``show_thinking`` mirrors ``control_ui.show_thinking``: when off, model
     reasoning is neither streamed nor carried on the ``done`` event.
+
+    ``run_id`` (the task id) tags the terminal ``done`` / ``error`` frame,
+    and with ``terminal_publications`` (the runtime's reservation, see
+    :mod:`agentos.gateway.terminal_events`) makes it exactly-once: a run an
+    abort already holds, or whose terminal was already published, does not
+    get a second one.
     """
     from dataclasses import asdict, is_dataclass
 
     from agentos.engine.stream_wrappers import wrap_stream
+    from agentos.gateway.terminal_events import terminal_state
 
     error_message: str | None = None
     error_code: str | None = None
@@ -989,11 +1035,17 @@ async def _emit_task_runtime_stream_events(
             event_dict["terminal_message"] = terminal_message
             event_dict["terminal_reason"] = terminal_payload["terminal_reason"]
             event_dict["error_message"] = safe_error_message
-        await event_emitter(
-            session_key,
-            f"session.event.{event_kind}",
-            event_dict,
-        )
+        event_name = f"session.event.{event_kind}"
+        emit = True
+        if event_kind in ("done", "error"):
+            event_dict["state"] = terminal_state(event_name, event_dict)
+            if run_id:
+                event_dict["run_id"] = run_id
+                event_dict["task_id"] = run_id
+                if terminal_publications is not None:
+                    emit = terminal_publications.try_publish(run_id, event_name, event_dict)
+        if emit:
+            await event_emitter(session_key, event_name, event_dict)
         if event_kind == "error":
             message = event_dict.get("error_message")
             error_message = message if isinstance(message, str) and message else "Agent error"
@@ -2904,8 +2956,10 @@ async def start_gateway_server(
                     except Exception:
                         pass
 
-            sessions_changed_payload = build_sessions_changed_payload(
-                origin_session_key, "cron_result"
+            sessions_changed_payload = get_session_streams().record(
+                origin_session_key,
+                "sessions.changed",
+                build_sessions_changed_payload(origin_session_key, "cron_result"),
             )
             for conn_id in (
                 _sub_mgr.get_message_subscribers(origin_session_key)
@@ -2930,10 +2984,8 @@ async def start_gateway_server(
                 return
 
             _registry = get_registry()
-            stream_payload = (
-                get_session_streams().record(session_key, event_name, payload)
-                if event_name.startswith("session.event.")
-                else payload
+            stream_payload = get_session_streams().record_if_replayable(
+                session_key, event_name, payload
             )
             conn_ids = _sub_mgr.get_message_subscribers(session_key)
             if event_name.startswith("sessions."):

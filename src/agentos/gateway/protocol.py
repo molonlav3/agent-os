@@ -51,12 +51,16 @@ WS_CLOSE_SEQ_GAP = 4000
 #: once shipped; a client must treat an unknown name as absent.
 CAPABILITIES: frozenset[str] = frozenset(
     {
+        "approval-events",
         "auth-rate-limit",
         "challenge-ts",
+        "idempotency-keys",
+        "inflight-snapshot",
         "rpc-http",
         # /ready + /startupz states, STARTUP_SIDECARS during boot, and
         # `shutdown {reason, restart_expected_ms}` (gateway/readiness.py).
         "supervisor-contract",
+        "terminal-replay",
         "typed-errors",
     }
 )
