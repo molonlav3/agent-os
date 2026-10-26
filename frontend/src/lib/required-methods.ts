@@ -5,8 +5,9 @@
  * array and fails when a name here is not registered in the gateway's RPC
  * registry, so CI catches a console that calls a method the engine does not
  * ship. Keep it honest: add a method here in the same change that starts
- * calling it, including names built at runtime (the trading cards' `↻` reads,
- * `channels.pairing.approve|deny`, the cron editor's create/update).
+ * calling it, including names built at runtime or held in a constant (the
+ * trading cards' `↻` reads, `channels.pairing.approve|deny`, the cron
+ * editor's create/update, the artifact ticket call `artifacts.download`).
  *
  * The desktop's additional methods live in
  * `desktop/src/renderer/src/lib/required-methods.ts`.
@@ -21,6 +22,7 @@ export const REQUIRED_METHODS: readonly string[] = [
   'agents.delete',
   'agents.list',
   'agents.update',
+  'artifacts.download',
   'auth.status',
   'auth.xai.login.poll',
   'auth.xai.login.start',
@@ -96,6 +98,9 @@ export const REQUIRED_METHODS: readonly string[] = [
   'projects.delete',
   'projects.list',
   'projects.update',
+  'push.web.subscribe',
+  'push.web.unsubscribe',
+  'push.web.vapid_public_key',
   'router.hold.clear',
   'router.hold.get',
   'router.hold.set',
