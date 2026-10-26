@@ -38,6 +38,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   a wrong token or a protocol mismatch. The CLI gives up after 60 s without a
   gateway, so `agentos chat` prints "reconnecting…" during an outage and the
   old "Gateway connection lost" error when the gateway does not come back.
+- Gateway supervisor contract (#3682): `/ready` now returns
+  `{ready, state, failing, ...}` with `state` one of `starting`, `ready`,
+  `draining`, `safe_mode` (`503` while starting or draining), and a new
+  public `/startupz` answers `200` once channels and the router preload have
+  settled. A WebSocket `connect` during boot gets a retryable `UNAVAILABLE`
+  (`details.code: "STARTUP_SIDECARS"`, `retry_after_ms`) and close `1013`
+  instead of a half-started gateway; the CLI, the web console and the desktop
+  app retry it. The `shutdown` event carries `restart_expected_ms` (an
+  estimate for an in-place restart, `null` for a terminal stop) and the
+  console reconnects when the gateway said it would be back.
+  `agentos gateway status --json` adds `drain_budget_ms`, `active_turns` and
+  the gateway's `runtime.state` (new `gateway.status` RPC).
+- `agentos gateway install` / `uninstall` / `status --deep` (#3690): run the
+  gateway as a macOS LaunchAgent (`dev.useagentos.gateway`: `KeepAlive`,
+  `ThrottleInterval 10`, `ExitTimeOut` = drain budget + 10 s) or a Linux
+  systemd user unit (`agentos-gateway.service`: `Restart=always`,
+  `RestartSec=5`, `RestartPreventExitStatus=78`, `KillMode=mixed`). Installing
+  the same unit twice is a no-op; a different unit under the same name is
+  refused. Not supported on Windows.
+- Crash-loop breaker (#3690): every boot is recorded in the gateway database,
+  and three unclean boots within five minutes start the gateway in safe mode —
+  control plane up, channels, cron and heartbeat held back, `/ready` and
+  `agentos doctor` say so. It clears by itself once the window drains;
+  `agentos channels start` (new, and the `channels.start` RPC) leaves it at
+  once, or starts a single channel to find the one that crashes the gateway.
+- Sleep/thaw detection and a channel health sweep (#3691): a 30 s maintenance
+  tick notices a machine that slept, restarts idle channels, wakes the
+  scheduler and logs `gateway.thaw`; every 5 minutes it restarts channels that
+  are `disconnected`, `stuck` or `stale-socket` (no inbound event for 30
+  minutes), at most once per two sweeps, and never one stopped on bad
+  credentials or blocked. `channels.status` reports each channel's `state`,
+  `last_event_at` and `terminal_reason` plus the policy and the last
+  sweep/thaw; doctor flags a terminal channel with the fix.
 - Cron jobs take a `concurrency` policy (`forbid` default, `replace`, `allow`)
   for a run that comes due while the previous one still runs
   (`agentos cron add|update --concurrency`, `cron.add`/`cron.update`), and
@@ -70,6 +103,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   nonce.
 - `agentos gateway stop` and the desktop app send a second SIGTERM (cancel
   the turns still running) before falling back to SIGKILL.
+- `agentos gateway run` exits `78` (`EX_CONFIG`) instead of `2`/`1` when only a
+  configuration change can fix the start: a config file that is not valid
+  TOML (previously a traceback) or does not validate, a schema migration that
+  cannot apply, a public bind without auth. Other startup failures still exit
+  `1`; other commands keep exit `2` for a bad config. (#3682)
 
 ### Fixed
 - Gateway: SIGTERM — what `agentos gateway stop`, the desktop app, launchd

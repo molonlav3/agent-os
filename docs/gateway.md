@@ -53,6 +53,114 @@ agentos gateway stop
 Use the managed gateway for the Web UI, channels, scheduled jobs, and local
 automation that should survive the current terminal tab.
 
+`agentos gateway status --json` also reports what a supervisor needs from a
+live gateway: `drain_budget_ms` (how long a stop may take to drain turns),
+`active_turns` (turns running right now) and `runtime` — the gateway's own
+readiness `state` (`starting`, `ready`, `draining`, `safe_mode`), what is
+`failing`, and the `safe_mode` details. The top-level `state` stays the
+process state (`running`, `unmanaged`, `not_started`, ...). Add `--deep` to
+also report an installed service.
+
+## Run as a Service
+
+Keep the gateway running across crashes, logouts and reboots by installing it
+as a user service:
+
+```sh
+agentos gateway install            # port from config (usually 18791)
+agentos gateway install --port 18792 --config ~/.agentos/config.toml
+agentos gateway status --deep      # adds the service: installed, loaded/active
+agentos gateway uninstall
+```
+
+| Platform | Unit | Restart policy |
+|---|---|---|
+| macOS | LaunchAgent `~/Library/LaunchAgents/dev.useagentos.gateway.plist` (label `dev.useagentos.gateway`), logs in `~/Library/Logs/AgentOS/gateway-service.log` and `gateway-service.err.log` | `KeepAlive`, `RunAtLoad`, `ThrottleInterval 10` (at most one respawn per 10 s), `ExitTimeOut 42` |
+| Linux | systemd user unit `~/.config/systemd/user/agentos-gateway.service` (`systemctl --user daemon-reload` + `enable --now`) | `Restart=always`, `RestartSec=5`, `RestartPreventExitStatus=78`, `KillMode=mixed`, `TimeoutStopSec=42` |
+| Windows | not supported | — |
+
+The unit runs the absolute path of the `agentos` you installed it with
+(`~/.local/bin/agentos` keeps working after `uv tool upgrade`) as
+`agentos gateway run --port N [--config PATH]`, with a `PATH` that starts with
+`~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin` so harness CLIs are
+found. `AGENTOS_STATE_DIR` and `AGENTOS_GATEWAY_CONFIG_PATH` are carried into
+the unit when they are set in the installing shell. The stop timeout (42 s)
+is the drain budget — 30 s for turns to finish plus 2 s to cancel the rest —
+plus a 10 s margin.
+
+Installing the same unit again is a no-op. A different unit under the same
+name (another port or config, or a job with that label loaded from elsewhere)
+is refused: run `agentos gateway uninstall` first. `--no-start` writes the
+unit without loading it. `uninstall` with nothing installed succeeds. On
+Linux, run `loginctl enable-linger $USER` once if the gateway should keep
+running after you log out.
+
+The desktop app adopts a gateway that already answers on its port, so it works
+with an installed service; do not let both start their own gateway on the same
+state directory.
+
+### Crash-loop breaker (safe mode)
+
+Every boot is recorded in the gateway database. When a boot finds **3 unclean
+boots in the last 5 minutes** — runs that ended without a clean shutdown
+(killed, crashed, out of memory) — it starts in **safe mode** instead of
+restarting the same crash forever:
+
+- the control plane starts as usual: Web UI, WebSocket, HTTP, `agentos doctor`,
+  logs, config;
+- channels, the cron scheduler and the heartbeat are held back, so no
+  automatic turn runs;
+- `/ready` answers `200` with `state: "safe_mode"` and the reason, and
+  `agentos doctor` reports a `gateway.safe_mode` finding with the way out;
+- safe mode clears by itself once the 5-minute window drains without another
+  unclean boot (checked every 30 s), and everything it held back starts then.
+
+To leave it sooner, fix the cause (the log has the crash) and run
+`agentos channels start --yes`: it starts every channel, the scheduler and the
+heartbeat, and stops counting the recorded crashes. `agentos channels start
+NAME --yes` starts a single channel and keeps safe mode on for the rest — the
+way to find which channel crashes the gateway.
+
+A clean stop never counts: `agentos gateway stop`, a service manager's or the
+desktop app's SIGTERM, `Ctrl+C` and an in-place restart are all clean. Nor
+does a boot that failed before it served (a bad config, a failed migration):
+safe mode could not help it. If the boot ledger cannot be read the breaker is
+skipped for that boot (fail open), never the start.
+
+## Supervisor Contract
+
+What a process supervisor (the desktop app, launchd, systemd, a script) can
+rely on:
+
+| Signal | Contract |
+|---|---|
+| `GET /health` | Liveness: `200` whenever the HTTP server answers. |
+| `GET /ready` | `{ready, state, failing, startup, safe_mode, drain_budget_ms, uptime_ms}`. `state` is `starting` (boot sidecars still running; `failing` names them, e.g. `["channels"]`), `ready`, `draining` (stopping or restarting in place; `failing: ["draining"]`) or `safe_mode` (`failing: ["safe_mode"]`). `503` while `starting` or `draining`; `200` for `ready` and `safe_mode`, where the control plane serves so the cause can be fixed. |
+| `GET /startupz` | `200` once every boot sidecar settled (channels started, router preloaded), `503` before; `pending` lists what is left. |
+| WebSocket `connect` during boot | Answered with a retryable error `UNAVAILABLE`, `details: {code: "STARTUP_SIDECARS", retry_after_ms}`, then close `1013` (`gateway starting`). Clients retry after `retry_after_ms`; the CLI retries for up to 30 s, the web console and desktop keep "connecting". |
+| `shutdown` event | Sent before close `1012`: `{reason, restart_expected_ms}`. A number is an in-place restart with an estimate of when the gateway serves again (this boot's own duration plus teardown, at least 3 s); `null` is a terminal stop. |
+| Exit code `78` | `EX_CONFIG`: a startup failure only a configuration change fixes — a config file that is not valid TOML or does not validate, a schema migration that cannot apply, a public bind without auth. Repair, then retry; systemd's `RestartPreventExitStatus=78` stops a restart loop. Other startup failures exit `1`. |
+
+The desktop app follows it: a spawned gateway is "running" once `/ready`
+answers `200`; on exit `78` it runs `agentos doctor --json` once, retries the
+start once, and otherwise shows the exit code with doctor's top finding.
+
+### Sleep and wake
+
+A laptop gateway checks itself every 30 s. A gap of more than 45 s between two
+checks during which the process used almost no CPU means the machine slept:
+the gateway logs `gateway.thaw`, restarts the channels that are idle (their
+sockets are stale after a sleep), wakes the scheduler and tells connected
+clients to refresh (`health` event). Every 5 minutes (after a 60 s start-up
+grace) it also sweeps channel health and restarts a channel that is
+`disconnected`, `stuck` (its retry loop gave up) or `stale-socket` (no inbound
+event for 30 minutes on a socket or polling transport), at most once per two
+sweeps each. A channel that failed on bad credentials (`terminal`) or that the
+platform `blocked` is never restarted automatically: doctor reports it with
+the fix. `agentos channels status --json` shows each channel's `state`,
+`last_event_at` and `terminal_reason`, and the policy plus the last sweep and
+thaw under `health_policy`.
+
 ## Host and Port
 
 Use a different port:
@@ -155,7 +263,15 @@ Check status and readiness:
 ```sh
 agentos gateway status
 agentos doctor
+curl -s http://127.0.0.1:18791/ready
 ```
+
+If `/ready` reports `state: "safe_mode"`, the gateway restarted after crashing
+three times in five minutes and is holding channels, cron and heartbeat back;
+see [Crash-loop breaker](#crash-loop-breaker-safe-mode).
+
+If `agentos gateway run` exits `78`, the configuration is the problem: run
+`agentos doctor` and fix what it reports before starting again.
 
 If the port is busy:
 

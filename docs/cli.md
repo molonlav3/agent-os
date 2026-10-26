@@ -61,15 +61,41 @@ Web UI and gateway:
 agentos gateway run
 agentos gateway start --json
 agentos gateway status
+agentos gateway status --deep --json
 agentos gateway restart
 agentos gateway stop
+agentos gateway install --port 18791
+agentos gateway uninstall
 ```
 
 `agentos gateway status` (and `--json`) reports **both** the installed CLI
 version (`cliVersion`) and the running gateway's version (`gatewayVersion`);
 when they differ it sets `versionMismatch` and prints a diagnostic advising a
 restart — the normal state right after a package upgrade with `--no-restart`,
-or after a manual upgrade.
+or after a manual upgrade. `--json` also carries `drain_budget_ms` (32000:
+30 s to drain turns plus 2 s to cancel), `active_turns` (turns running now;
+`null` when the gateway is not reachable) and `runtime` — the gateway's
+readiness `state` (`starting`, `ready`, `draining`, `safe_mode`), `failing`
+and `safe_mode`. The top-level `state` stays the process state (`running`,
+`unmanaged`, `not_started`, `stale`, ...). `--deep` adds `service`: whether
+`agentos gateway install` put a unit in place and whether it is loaded.
+
+`agentos gateway run` exits `78` (`EX_CONFIG`) when only a configuration
+change can fix the start — a config file that does not parse or validate, a
+schema migration that cannot apply, a public bind without auth — and `1` for
+other failures. See [Supervisor contract](gateway.md#supervisor-contract).
+
+`agentos gateway install [--port N] [--config PATH] [--no-start] [--json]`
+runs the gateway as a user service that restarts it when it dies: a
+LaunchAgent (`dev.useagentos.gateway`) on macOS, a systemd user unit
+(`agentos-gateway.service`) on Linux; not supported on Windows (exit 1). It
+refuses when a different unit with the same name exists (run
+`agentos gateway uninstall` first) and is a no-op for the same unit.
+`--no-start` writes the unit without loading it. `agentos gateway uninstall
+[--json]` stops and removes it, and succeeds when nothing is installed. A
+gateway that crashes three times in five minutes starts in safe mode
+(channels, cron and heartbeat held back); see
+[Run as a service](gateway.md#run-as-a-service).
 
 `agentos gateway stop` sends SIGTERM, which runs the gateway's orderly
 shutdown (turns in flight get up to 30 seconds, then channels stop and
@@ -638,8 +664,22 @@ agentos channels logout personal -y
 agentos channels enable personal
 agentos channels disable personal
 agentos channels restart personal
+agentos channels start --yes
+agentos channels start personal --yes
 agentos channels remove personal
 ```
+
+`agentos channels start [NAME] [--yes] [--json]` starts channels on the
+running gateway. Without a name it starts every channel that is not running
+and, when the gateway is in safe mode (three unclean boots in five minutes),
+leaves it: cron and heartbeat resume too, and the recorded crashes stop
+counting. With a name it starts only that channel and keeps safe mode on for
+the rest. `agentos channels status --json` reports each channel's runtime
+`state` (`connected`, `disconnected`, `stale-socket`, `stuck`, `stopped`,
+`terminal`, `blocked`), `last_event_at` and `terminal_reason`, plus the
+gateway's automatic restart policy and its last health sweep and sleep/thaw
+under `health_policy`. A `terminal` channel (bad credentials) is never
+restarted automatically; fix it with `channels edit`, then `channels restart`.
 
 `native-commands` prints the native platform payload derived from the same
 channel command registry used for text `/command` dispatch. Telegram and

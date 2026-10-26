@@ -511,6 +511,13 @@ The gateway log records `scheduler_wake_gap` (a sleep or a clock moved
 forward), `scheduler_clock_back`, and `scheduler_late_wake` (the scheduler woke
 more than twice as late as planned) when they happen.
 
+- **Safe mode.** A gateway that crashed three times in five minutes boots in
+  safe mode and does not start the scheduler: no job runs on its own until
+  safe mode clears (after five quiet minutes, or `agentos channels start
+  --yes`), and the startup catch-up runs then. `agentos cron run <id>` still
+  works meanwhile, except for a job the crash left marked running. See
+  [Gateway](gateway.md#crash-loop-breaker-safe-mode).
+
 ## Troubleshooting
 
 Check the gateway and job state:

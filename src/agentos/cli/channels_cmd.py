@@ -312,6 +312,49 @@ def channels_status(
     _render_status_table(payload)
 
 
+@channels_app.command("start")
+def channels_start(
+    name: str | None = typer.Argument(
+        None, help="Channel to start; omit to start every channel and leave safe mode"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    config_path: Path | None = typer.Option(None, "--config", help="Override config path."),
+) -> None:
+    """Start channels on the running gateway; the override for its safe mode.
+
+    Without a name every stopped channel starts, and a gateway in safe mode
+    (repeated unclean boots) leaves it: cron and heartbeat resume too. With a
+    name only that channel starts, to find which one crashes the gateway.
+    """
+
+    prompt = (
+        f"Start channel {name!r}?"
+        if name
+        else "Start every channel (and leave safe mode if the gateway is in it)?"
+    )
+    confirm_or_exit(prompt, yes=yes, json_output=json_output)
+
+    async def _run(client):
+        return await client.call("channels.start", {"name": name} if name else {})
+
+    payload = run_gateway_sync(_run, json_output=json_output, config_path=config_path)
+    if json_output:
+        print_json(payload)
+        return
+    if name:
+        typer.echo(f"Channel started: {payload.get('channel', name)}")
+        return
+    results = payload.get("channels") or {}
+    started = sorted(n for n, ok in results.items() if ok)
+    failed = sorted(n for n, ok in results.items() if not ok)
+    if payload.get("safe_mode_cleared"):
+        typer.echo("Safe mode cleared; channels, cron and heartbeat resumed.")
+    typer.echo(f"Channels started: {', '.join(started) if started else 'none'}")
+    if failed:
+        typer.echo(f"Channels failed: {', '.join(failed)}", err=True)
+
+
 @channels_app.command("restart")
 def channels_restart(
     name: str = typer.Argument(..., help="Channel name to restart"),

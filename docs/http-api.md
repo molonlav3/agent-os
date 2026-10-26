@@ -78,7 +78,7 @@ lockout_seconds = 300
 exempt_loopback = true
 ```
 
-`/health` and `/ready` never require a token. Cross-origin browser requests are
+`/health`, `/ready` and `/startupz` never require a token. Cross-origin browser requests are
 governed by CORS configuration regardless of auth mode.
 
 ## Liveness and Readiness
@@ -86,9 +86,12 @@ governed by CORS configuration regardless of auth mode.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health`, `/healthz` | Liveness probe — `{"ok": true, "status": "live"}`. |
-| `GET` | `/ready`, `/readyz` | Readiness probe — `503` until the gateway is ready. |
+| `GET` | `/ready`, `/readyz` | Readiness probe — `{ready, state, failing, startup, safe_mode, drain_budget_ms, uptime_ms}`; `state` is `starting`, `ready`, `draining` or `safe_mode`. `503` while starting or draining, `200` when ready and in safe mode. The older `status` field mirrors `state`. |
+| `GET` | `/startupz` | Startup probe — `200` once every boot sidecar settled (channels started, router preloaded), `503` with the `pending` list before. |
 
 These require no auth and are safe for load balancers and container probes.
+The full supervisor contract (WebSocket refusal during boot, the `shutdown`
+event, exit code `78`) is in [`gateway.md`](gateway.md#supervisor-contract).
 
 ## Core Endpoints
 
