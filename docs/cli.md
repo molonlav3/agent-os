@@ -71,6 +71,12 @@ when they differ it sets `versionMismatch` and prints a diagnostic advising a
 restart — the normal state right after a package upgrade with `--no-restart`,
 or after a manual upgrade.
 
+`agentos gateway stop` sends SIGTERM, which runs the gateway's orderly
+shutdown (turns in flight get up to 30 seconds, then channels stop and
+clients are told). If the gateway is still running after `--timeout`
+(default 10 seconds) it sends a second SIGTERM, which cancels the remaining
+turns, and only then SIGKILL.
+
 `agentos gateway restart` stops and starts a gateway that `agentos gateway
 start` spawned. A healthy gateway the CLI does not manage (started by the
 desktop app, launchd, systemd or a terminal `gateway run`) is restarted **in

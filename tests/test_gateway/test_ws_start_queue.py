@@ -470,3 +470,18 @@ async def test_event_wire_is_byte_identical_to_the_model_serialization() -> None
         assert ws.sent[0] == expected
     finally:
         await conn._stop_writer()  # noqa: SLF001
+
+
+async def test_flush_waits_until_queued_frames_are_on_the_wire() -> None:
+    conn, ws = _slow_conn(max_bytes=10_000)
+    try:
+        await conn.send_event("shutdown", {"reason": "signal:SIGTERM"})
+        flushing = asyncio.create_task(conn.flush(timeout=2.0))
+        await asyncio.sleep(0.05)
+        assert not flushing.done()
+        ws.unblock.set()
+        await asyncio.wait_for(flushing, timeout=2.0)
+        assert json.loads(ws.sent[0])["event"] == "shutdown"
+    finally:
+        ws.unblock.set()
+        await conn._stop_writer()  # noqa: SLF001

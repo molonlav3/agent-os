@@ -159,6 +159,15 @@ def run_gateway(
             await server._task
         except (KeyboardInterrupt, asyncio.CancelledError):
             await server.close("keyboard_interrupt")
+        # SIGTERM / SIGINT run ``close()`` in a task of their own (the server
+        # installs the handlers): uvicorn returns as soon as close() stops it,
+        # but the services are closed after that, so wait for the rest.
+        shutdown_task = getattr(server, "shutdown_task", None)
+        if shutdown_task is not None:
+            try:
+                await shutdown_task
+            except asyncio.CancelledError:
+                pass
         # An in-place restart ends the server task from inside its own
         # ``close()``. Let it finish closing the services here, inside the
         # loop, before ``asyncio.run`` tears the loop down under it.
@@ -173,6 +182,7 @@ def run_gateway(
     try:
         asyncio.run(_run())
         _exec_pending_restart()
+        console.print("[yellow]Gateway stopped.[/yellow]")
     except ValueError as exc:
         from agentos.onboarding.next_steps import env_recovery_commands
         from agentos.onboarding.status import get_onboarding_status

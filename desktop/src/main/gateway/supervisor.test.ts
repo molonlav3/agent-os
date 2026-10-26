@@ -6,7 +6,7 @@ import path from 'node:path'
 import { PassThrough } from 'node:stream'
 import { describe, expect, it, vi } from 'vitest'
 import type { GatewaySettings } from '@shared/settings'
-import { GatewaySupervisor } from './supervisor'
+import { GatewaySupervisor, STOP_DRAIN_MS, STOP_FORCE_MS } from './supervisor'
 
 const external: GatewaySettings = {
   mode: 'external',
@@ -197,5 +197,72 @@ describe('GatewaySupervisor (spawn arguments)', () => {
     const sup = new GatewaySupervisor(() => external, { probe: async () => true })
     await sup.start()
     expect(sup.operatorSecret()).toBeNull()
+  })
+})
+
+describe('GatewaySupervisor.stop escalation', () => {
+  async function startedWithChild(onKill: (signal: string) => void) {
+    const child = new EventEmitter() as EventEmitter & {
+      pid: number
+      stdout: PassThrough
+      stderr: PassThrough
+      kill: (signal: string) => boolean
+    }
+    child.pid = 4343
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.kill = (signal: string) => {
+      onKill(signal)
+      return true
+    }
+    const spawn = vi.fn(() => child) as unknown as typeof import('node:child_process').spawn
+    let probes = 0
+    const sup = new GatewaySupervisor(
+      () => ({ ...external, mode: 'managed', cliPath: '/opt/agentos' }),
+      {
+        probe: async () => probes++ > 0,
+        locate: (override) => override,
+        secretDir: mkdtempSync(path.join(os.tmpdir(), 'agentos-sup-')),
+        spawn,
+      },
+    )
+    await sup.start()
+    return { sup, child }
+  }
+
+  it('lets the gateway drain, then forces with a second SIGTERM, then SIGKILL', async () => {
+    const signals: string[] = []
+    const { sup } = await startedWithChild((signal) => signals.push(signal))
+    vi.useFakeTimers()
+    try {
+      const stopping = sup.stop()
+      expect(signals).toEqual(['SIGTERM'])
+      await vi.advanceTimersByTimeAsync(STOP_DRAIN_MS)
+      expect(signals).toEqual(['SIGTERM', 'SIGTERM'])
+      await vi.advanceTimersByTimeAsync(STOP_FORCE_MS)
+      expect(signals).toEqual(['SIGTERM', 'SIGTERM', 'SIGKILL'])
+      await stopping
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('sends nothing more once the gateway exits on the first SIGTERM', async () => {
+    const signals: string[] = []
+    let exit: (() => void) | null = null
+    const { sup, child } = await startedWithChild((signal) => {
+      signals.push(signal)
+      exit?.()
+    })
+    exit = () => queueMicrotask(() => child.emit('exit', 0, null))
+    vi.useFakeTimers()
+    try {
+      const stopping = sup.stop()
+      await vi.advanceTimersByTimeAsync(STOP_DRAIN_MS + STOP_FORCE_MS)
+      await stopping
+      expect(signals).toEqual(['SIGTERM'])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

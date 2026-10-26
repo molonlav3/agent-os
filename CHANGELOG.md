@@ -47,8 +47,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The web console and the desktop app send a `client` block `{id, version,
   platform, mode}` and an exact protocol range in `connect`; the challenge
   carries a timestamp and `hello-ok.auth` echoes its nonce.
+- `agentos gateway stop` and the desktop app send a second SIGTERM (cancel
+  the turns still running) before falling back to SIGKILL.
 
 ### Fixed
+- Gateway: SIGTERM — what `agentos gateway stop`, the desktop app, launchd
+  and systemd send — now runs the same orderly shutdown as Ctrl+C: turns get
+  up to 30 s to finish, channels stop, clients receive the `shutdown` event,
+  sockets and MCP clients close, and the process exits 0. A second signal
+  forces it. Before, the process died before any of that ran. A stop signal
+  during an in-place restart no longer re-executes a new gateway.
+- Gateway: the `shutdown` event is delivered before the socket closes; it was
+  queued and then dropped with the connection.
 - Gateway: the advertised payload limits are enforced. Frames before
   `hello-ok` are capped at 64 KiB (`1009` close), and uvicorn is configured
   with the advertised 25 MiB `max_payload` instead of its 16 MiB default.

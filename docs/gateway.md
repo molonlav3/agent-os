@@ -21,7 +21,12 @@ Open the control console:
 http://127.0.0.1:18791/control/
 ```
 
-Stop a foreground gateway with `Ctrl+C`.
+Stop a foreground gateway with `Ctrl+C`. `Ctrl+C` and `SIGTERM` (what
+`agentos gateway stop`, the desktop app, launchd and systemd send) run the
+same orderly shutdown: new turns are refused, turns in flight get up to 30
+seconds to finish, channels stop, connected clients receive a `shutdown`
+event, sockets and MCP clients close, and the process exits 0. A second
+signal cancels the turns still running instead of waiting for them.
 
 ## Managed Background Gateway
 

@@ -187,6 +187,13 @@ _SENTINEL_STOP: Any = object()
 
 
 @dataclass(slots=True)
+class _Flush:
+    """Queued by :meth:`WsConnection.flush`; resolved once the writer reaches it."""
+
+    done: asyncio.Future[None]
+
+
+@dataclass(slots=True)
 class _SeqSkip:
     """Queued in place of frames dropped under the byte budget.
 
@@ -388,6 +395,29 @@ class WsConnection:
         except Exception:
             pass
 
+    async def flush(self, timeout: float = 1.0) -> None:
+        """Wait (at most ``timeout``) until every frame queued so far is written.
+
+        A no-op without a running writer. Used before a shutdown closes the
+        socket, so the ``shutdown`` event already queued reaches the client.
+        """
+        if (
+            not self._queue_enabled
+            or self._outbox is None
+            or self._writer_task is None
+            or self._closing
+        ):
+            return
+        done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        try:
+            self._outbox.put_nowait(_Flush(done))
+        except asyncio.QueueFull:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(done), timeout=timeout)
+        except TimeoutError:
+            log.debug("gateway.ws_flush_timeout", conn_id=self.conn_id)
+
     # ------------------------------------------------------------------
     # Writer task lifecycle
     # ------------------------------------------------------------------
@@ -515,6 +545,10 @@ class WsConnection:
                     return
                 if isinstance(item, _SeqSkip):
                     self._seq += item.count
+                    continue
+                if isinstance(item, _Flush):
+                    if not item.done.done():
+                        item.done.set_result(None)
                     continue
                 if not isinstance(item, _OutboundFrame):
                     continue

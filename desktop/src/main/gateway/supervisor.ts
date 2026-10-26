@@ -13,6 +13,14 @@ type Listener = (status: GatewayStatus) => void
 /** How long a freshly spawned gateway may take to answer /health. */
 const READY_TIMEOUT_MS = 60_000
 const READY_POLL_MS = 400
+/**
+ * Stop: SIGTERM starts the gateway's orderly shutdown (drain turns, stop
+ * channels, tell clients). If it is still draining after STOP_DRAIN_MS, a
+ * second SIGTERM makes it cancel the turns instead; SIGKILL only if that
+ * does not finish within STOP_FORCE_MS either.
+ */
+export const STOP_DRAIN_MS = 8_000
+export const STOP_FORCE_MS = 4_000
 
 /**
  * Owns the lifecycle of the local gateway process when settings.mode is
@@ -276,12 +284,17 @@ export class GatewaySupervisor {
     }
     this.set({ ...this.status, state: 'stopping' })
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL')
-        resolve()
-      }, 8000)
+      let killTimer: ReturnType<typeof setTimeout> | null = null
+      const forceTimer = setTimeout(() => {
+        child.kill('SIGTERM')
+        killTimer = setTimeout(() => {
+          child.kill('SIGKILL')
+          resolve()
+        }, STOP_FORCE_MS)
+      }, STOP_DRAIN_MS)
       child.once('exit', () => {
-        clearTimeout(timer)
+        clearTimeout(forceTimer)
+        if (killTimer) clearTimeout(killTimer)
         resolve()
       })
       child.kill('SIGTERM')

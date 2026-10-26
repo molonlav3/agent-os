@@ -298,6 +298,9 @@ class GatewayRestarter:
         self._task: Any = None
         self._exec_plan: tuple[list[str], dict[str, str]] | None = None
         self._fatal = False
+        # Set when the process was told to stop (SIGTERM / SIGINT) while a
+        # restart was pending: finish closing, but do not exec a new image.
+        self._exec_cancelled: str | None = None
 
     # ── introspection ────────────────────────────────────────────────
 
@@ -320,6 +323,19 @@ class GatewayRestarter:
 
     def request_path(self) -> Path:
         return restart_request_path(self._config)
+
+    def cancel_exec(self, reason: str) -> None:
+        """Stop a pending restart from exec'ing: the process is shutting down.
+
+        A supervisor that sends SIGTERM during a restart's drain wants the
+        gateway gone; exec'ing a fresh image would leave an orphan it no
+        longer tracks. No-op when no restart is pending.
+        """
+        if self._request is None or self._exec_cancelled is not None:
+            return
+        self._exec_cancelled = reason
+        self._exec_plan = None
+        log.warning("gateway.restart_cancelled", restart_id=self._request.restart_id, reason=reason)
 
     # ── entry point ──────────────────────────────────────────────────
 
@@ -433,6 +449,12 @@ class GatewayRestarter:
         except Exception:
             log.exception("gateway.restart_close_failed", restart_id=req.restart_id)
 
+        if self._exec_cancelled is not None:
+            # Told to stop while draining: the services are closed, exit
+            # normally instead of coming back.
+            self._remove_request_file()
+            return
+
         # From here there is no way back: services are closed. A failure now
         # ends the process with exit 1 so an on-failure supervisor respawns it.
         try:
@@ -472,7 +494,7 @@ class GatewayRestarter:
         if self._fatal:
             raise SystemExit(1)
         plan = self._exec_plan
-        if plan is None:
+        if plan is None or self._exec_cancelled is not None:
             return
         argv, env = plan
         req = self._request
