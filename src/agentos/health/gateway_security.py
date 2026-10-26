@@ -120,13 +120,16 @@ def evaluate_gateway_security(payload: dict[str, Any]) -> list[HealthFinding]:
         findings.append(
             HealthFinding(
                 id="gateway.cors_wildcard_with_credentials",
-                severity="warn",
+                severity="info",
                 surface=_SURFACE,
-                title="CORS allows every origin with credentials on a non-loopback bind",
+                title="cors.allowed_origins lists a wildcard, which allows nothing",
                 detail=(
-                    'cors.allowed_origins = ["*"] with cors.allow_credentials = true makes '
-                    "the gateway reflect any page's Origin with credentials. On a loopback "
-                    "bind the origin guard fences this; on this bind nothing does."
+                    'cors.allowed_origins = ["*"] with cors.allow_credentials = true reads '
+                    "as if any page's Origin were reflected with credentials. It is not: on "
+                    "every bind the gateway answers CORS only for origins its origin policy "
+                    "admits (declared origins, a private address opened as itself, its own "
+                    "localhost), never with *. List the console origin so the config says "
+                    "what the gateway does."
                 ),
                 evidence={
                     **evidence,

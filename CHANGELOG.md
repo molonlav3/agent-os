@@ -235,6 +235,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Off loopback the `Host` guard answers to IP addresses, `.local` / `.ts.net`
   names and the hostnames of declared origins instead of any name; another
   name gets `400` naming `[gateway] public_origin` (#3692).
+- `agentos doctor` reports `gateway.cors_wildcard_with_credentials` as `info`
+  instead of `warn`: under the origin policy a `*` CORS entry allows nothing
+  on any bind (#3692).
 - Approval buttons on Telegram, Discord and Slack resolve a request only in the
   chat its session is delivered to (a child session's parent chat, the main DM
   session's last chat). A paired sender could previously approve any request
