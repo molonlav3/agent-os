@@ -118,9 +118,10 @@ export function GatewayProviders({ children }: { children: ReactNode }) {
         secret ? { operatorSecret: secret } : null,
       )
     })
-    // Approvals are a REST poller against the same origin; only worth running
-    // while there is a gateway to ask.
-    approvalMonitor.start()
+    // Approvals arrive as pushed events on this client, with a REST backfill
+    // against the same origin on every (re)connect; only worth running while
+    // there is a gateway to ask.
+    approvalMonitor.start(rpc)
     return () => {
       cancelled = true
       approvalMonitor.stop()

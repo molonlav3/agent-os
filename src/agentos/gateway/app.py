@@ -18,7 +18,7 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
 from agentos import __version__
-from agentos.application.approval_rpc import approval_display_title
+from agentos.application.approval_events import approval_display_item
 from agentos.gateway.approval_queue import get_approval_queue
 from agentos.gateway.auth_rate_limit import AuthGuard
 from agentos.gateway.config import GatewayConfig
@@ -368,35 +368,8 @@ def create_gateway_app(
         settings = result.payload or {}
         mode = settings.get("mode", "prompt")
         queue = get_approval_queue()
-        pending = queue.list_pending()
-        # Enrich pending items with params fields for UI display
-        items = []
-        for p in pending:
-            item = {
-                "id": p["id"],
-                "namespace": p["namespace"],
-                "created_at": p.get("created_at"),
-            }
-            params = p.get("params", {})
-            argv = params.get("argv")
-            command = params.get("command")
-            if not command and isinstance(argv, list):
-                command = " ".join(str(part) for part in argv)
-            item["toolName"] = params.get(
-                "toolName",
-                params.get("pluginId", params.get("action_kind", "Unknown")),
-            )
-            item["sessionKey"] = params.get("sessionKey", "")
-            item["agent"] = params.get("agent", "")
-            item["args"] = params.get("args", params.get("permissions"))
-            item["command"] = command or ""
-            item["warning"] = params.get("warning", params.get("reason", ""))
-            item["actionKind"] = params.get("action_kind", "")
-            item["argv"] = argv if isinstance(argv, list) else []
-            item["mode"] = params.get("mode", mode)
-            item["params"] = params
-            item["title"] = approval_display_title(str(p["namespace"]), params)
-            items.append(item)
+        # Enriched for UI display; ``approval.requested`` carries the same item.
+        items = [approval_display_item(p, mode=mode) for p in queue.list_pending()]
         return JSONResponse(
             {
                 "pending": items,

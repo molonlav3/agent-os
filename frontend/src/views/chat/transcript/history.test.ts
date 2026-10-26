@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  applyHistoryDelta,
   createHistoryRenderer,
+  formatEntrySize,
   historyMessageArtifacts,
   mergeHistoryMessagePages,
   messagePageIdentity,
@@ -743,5 +745,79 @@ describe('history thinking block (has_thinking → chat.thinking fetch-on-expand
     const noFetcher = createHistoryRenderer(historyDeps(thread))
     noFetcher.renderHistoryMessages(flagged, pagingState(flagged))
     expect(thread.querySelector('.thinking-block')).toBeNull()
+  })
+})
+
+describe('oversized history rows (chat.history placeholders → chat.entry)', () => {
+  const placeholder = {
+    role: 'assistant',
+    text: 'The first part of a very long answer',
+    message_id: 'msg-big',
+    transcript_id: 7,
+    placeholder: true,
+    truncated: true,
+    byte_size: 150 * 1024,
+    entry_id: 7,
+  } as unknown as ChatMessage
+
+  it('says the row is truncated, how large it is, and offers the full text', async () => {
+    const thread = document.createElement('div')
+    document.body.appendChild(thread)
+    const full = { role: 'assistant', text: 'The whole answer, all of it', message_id: 'msg-big' }
+    const fetchEntry = vi.fn().mockResolvedValue(full)
+    const renderer = createHistoryRenderer(historyDeps(thread, { fetchEntry }))
+    renderer.renderHistoryMessages([placeholder], pagingState([placeholder]))
+
+    const notice = thread.querySelector('.msg-body .msg-truncated')
+    expect(notice).not.toBeNull()
+    expect(notice!.textContent).toContain('Message truncated (150 KiB)')
+    const show = notice!.querySelector<HTMLButtonElement>('.msg-truncated__show')!
+    show.click()
+    await vi.waitFor(() => expect(thread.textContent).toContain('The whole answer, all of it'))
+    expect(fetchEntry).toHaveBeenCalledWith('7')
+    expect(thread.querySelector('.msg-truncated')).toBeNull()
+
+    // A later refresh brings the placeholder again: the full text stays.
+    renderer.renderHistoryMessages([placeholder], pagingState([placeholder]))
+    expect(thread.textContent).toContain('The whole answer, all of it')
+    expect(thread.querySelector('.msg-truncated')).toBeNull()
+  })
+
+  it('keeps the notice and reports a failed fetch', async () => {
+    const thread = document.createElement('div')
+    document.body.appendChild(thread)
+    const fetchEntry = vi.fn().mockRejectedValue(new Error('gone'))
+    const renderer = createHistoryRenderer(historyDeps(thread, { fetchEntry }))
+    renderer.renderHistoryMessages([placeholder], pagingState([placeholder]))
+
+    thread.querySelector<HTMLButtonElement>('.msg-truncated__show')!.click()
+    await vi.waitFor(() =>
+      expect(thread.querySelector('.msg-truncated')!.textContent).toContain('gone'),
+    )
+    expect(thread.querySelector<HTMLButtonElement>('.msg-truncated__show')!.disabled).toBe(false)
+  })
+
+  it('formats sizes and folds a delta into what is loaded', () => {
+    expect(formatEntrySize(150 * 1024)).toBe('150 KiB')
+    expect(formatEntrySize(3 * 1024 * 1024)).toBe('3.0 MiB')
+    expect(formatEntrySize(undefined)).toBe('')
+
+    const loaded = [
+      { role: 'user', text: 'a', message_id: 'm1' },
+      { role: 'assistant', text: 'b', message_id: 'm2' },
+    ] as unknown as ChatMessage[]
+    const paging = { ...pagingState(loaded), oldestCursor: '1|1', hasMore: true }
+    const merged = applyHistoryDelta(paging, {
+      kind: 'delta',
+      messages: [{ role: 'user', text: 'c', message_id: 'm3' }] as unknown as ChatMessage[],
+      newest_cursor: '3|3',
+      has_more: false,
+    })
+    expect(merged!.messages!.map((m) => m.text)).toEqual(['a', 'b', 'c'])
+    expect(merged!.newest_cursor).toBe('3|3')
+    expect(merged!.oldest_cursor).toBe('1|1')
+    expect(merged!.has_more).toBe(true)
+    expect(applyHistoryDelta(paging, { kind: 'reset', messages: [] })).toBeNull()
+    expect(applyHistoryDelta(paging, { kind: 'delta', has_more: true })).toBeNull()
   })
 })

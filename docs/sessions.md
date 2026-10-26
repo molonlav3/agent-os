@@ -95,7 +95,9 @@ agentos sessions abort <session-key>
 agentos sessions abort <session-key> --json
 ```
 
-Abort stops the running turn if one exists. It does not delete the session.
+Abort stops the running turn if one exists, together with any coding-agent or
+subagent runs it spawned, and returns once they have ended. It does not delete
+the session.
 
 ## Export a Transcript
 

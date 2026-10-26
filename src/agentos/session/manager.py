@@ -884,10 +884,12 @@ class SessionManager:
         if node.started_at:
             node.runtime_ms = now - node.started_at
         await self._storage.upsert_session(node)
-        self._evict_session_runtime_state(session_key)
+        # Finished, not gone: a later turn (a follow-up to a child, a resume)
+        # continues the same stream, so its position and replay buffer stay.
+        self._evict_session_runtime_state(session_key, deleted=False)
         return node
 
-    def _evict_session_runtime_state(self, session_key: str) -> None:
+    def _evict_session_runtime_state(self, session_key: str, *, deleted: bool = True) -> None:
         """Drop in-memory subagent and routing bookkeeping for ``session_key``.
 
         Called from ``finish`` and from every deletion path so neither
@@ -903,7 +905,7 @@ class SessionManager:
         session created under the same name.
         """
         self._epoch_cache.pop(session_key, None)
-        evict_session_runtime_state(session_key)
+        evict_session_runtime_state(session_key, deleted=deleted)
 
     async def _cancel_task_runtime(self, session_key: str, *, reason: str) -> None:
         """Cancel active/queued runtime tasks for ``session_key``, best effort.

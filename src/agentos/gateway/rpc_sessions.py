@@ -16,11 +16,19 @@ from agentos.engine.start_turn import start_turn_via_runtime
 from agentos.gateway import attachment_ingest as _attachment_ingest
 from agentos.gateway.access import CONTROL_AND_CHANNEL, ConnectionSurface
 from agentos.gateway.agent_tasks import get_agent_task_registry
+from agentos.gateway.idempotency import (
+    get_idempotency_cache,
+    idempotency_key,
+    request_conflict,
+    request_fingerprint,
+    run_idempotent,
+)
 from agentos.gateway.input_normalization import (
     infer_normalized_input_from_attachments,
     materialize_generated_text_attachments,
     normalize_incoming_text,
 )
+from agentos.gateway.protocol import ErrorCode, ErrorDetailCode
 from agentos.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
@@ -308,9 +316,7 @@ def _buffer_session_event(
     event_name: str,
     payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if event_name.startswith("session.event."):
-        return get_session_streams().record(session_key, event_name, payload)
-    return dict(payload or {})
+    return get_session_streams().record_if_replayable(session_key, event_name, payload)
 
 
 async def _resolve_attachments(
@@ -863,6 +869,13 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
 
 @_d.method("sessions.create")
 async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
+    """Create a session; a retried ``idempotency_key`` returns the same one."""
+    return await run_idempotent(
+        "sessions.create", params, lambda: _sessions_create_impl(params, ctx)
+    )
+
+
+async def _sessions_create_impl(params: dict | None, ctx: RpcContext) -> dict:
     if not isinstance(params, dict):
         params = {}
     agent_id = normalize_agent_id(params.get("agentId", "main"))
@@ -933,8 +946,79 @@ async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
     return result
 
 
+def _task_still_active(ctx: RpcContext) -> Any:
+    """``pinned`` predicate for an idempotent send: its turn is still live."""
+
+    def _pinned(result: dict[str, Any]) -> bool:
+        task_runtime = getattr(ctx, "task_runtime", None)
+        probe = getattr(task_runtime, "is_task_active", None)
+        task_id = result.get("task_id") if isinstance(result, dict) else None
+        return bool(callable(probe) and isinstance(task_id, str) and probe(task_id))
+
+    return _pinned
+
+
+async def persisted_send_answer(
+    ctx: RpcContext,
+    session_key: str,
+    key: str,
+    fingerprint: str,
+) -> dict[str, Any] | None:
+    """The answer a send with this ``idempotency_key`` already got, from its task.
+
+    The in-memory cache does not survive a restart; the key recorded on the
+    task the send started does. Same key, different request: a conflict.
+    """
+    rows = await _list_task_rows(ctx, get_session_storage(ctx.session_manager), session_key)
+    for row in _sorted_task_rows(rows)[:_PERSISTED_IDEMPOTENCY_SCAN]:
+        details = getattr(row, "details", None)
+        if not isinstance(details, dict) or details.get("idempotency_key") != key:
+            continue
+        recorded = details.get("idempotency_fingerprint")
+        if recorded and recorded != fingerprint:
+            raise request_conflict(key)
+        return {"status": "accepted", "key": session_key, "task_id": getattr(row, "task_id", None)}
+    return None
+
+
+#: Recent tasks of a session searched for a send's recorded idempotency key.
+_PERSISTED_IDEMPOTENCY_SCAN = 50
+
+
+def _recorded_idempotency(params: dict[str, Any], field: str) -> str | None:
+    """The idempotency key / fingerprint to record on the turn's task.
+
+    Set by the deduplicating front of ``sessions.send`` / ``chat.send`` (an
+    internal ``_idempotency`` param), never read from the caller directly.
+    """
+    recorded = params.get("_idempotency")
+    value = recorded.get(field) if isinstance(recorded, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
 @_d.method("sessions.send")
 async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
+    """Start a turn; ``idempotency_key`` makes a retry return the first answer."""
+    key = idempotency_key(params)
+    if key is None or not isinstance(params, dict):
+        return await _sessions_send_impl(params, ctx)
+    fingerprint = request_fingerprint(params)
+    session_key = canonicalize_session_key(_require_key(params))
+
+    async def _send() -> dict[str, Any]:
+        persisted = await persisted_send_answer(ctx, session_key, key, fingerprint)
+        if persisted is not None:
+            return persisted
+        return await _sessions_send_impl(
+            {**params, "_idempotency": {"key": key, "fingerprint": fingerprint}}, ctx
+        )
+
+    return await get_idempotency_cache().run(
+        "sessions.send", key, fingerprint, _send, pinned=_task_still_active(ctx)
+    )
+
+
+async def _sessions_send_impl(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
     if not isinstance(params, dict) or "message" not in params:
         raise ValueError("params.message is required")
@@ -1192,6 +1276,8 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
                 semantic_message=semantic_message_text,
                 persisted_user_message_id=getattr(persisted_entry, "message_id", None),
                 fresh_user_session=fresh_user_session,
+                idempotency_key=_recorded_idempotency(params, "key"),
+                idempotency_fingerprint=_recorded_idempotency(params, "fingerprint"),
             )
         except Exception as exc:
             # Ensure the uuid eviction does NOT fire on this
@@ -1505,6 +1591,11 @@ async def _emit_to_subscribers(
 @_d.method("sessions.abort", CONTROL_AND_CHANNEL)
 async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
+    # Captured before the first await: what this abort stops is what was
+    # running when it was asked, never a turn queued while it waits.
+    runtime = getattr(ctx, "task_runtime", None)
+    active_ids = getattr(runtime, "active_task_ids", None)
+    captured_runs = list(active_ids(key)) if callable(active_ids) else None
 
     if ctx.session_manager is None:
         return {"aborted": False, "key": key}
@@ -1517,13 +1608,45 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
 
     task_runtime = getattr(ctx, "task_runtime", None)
     if task_runtime is not None:
-        cancelled_count = await _cancel_task_runtime(
+        if not hasattr(task_runtime, "terminal_publications"):
+            # A runtime without the terminal reservation (a test double): the
+            # plain cancel is all it supports.
+            cancelled_count = await _cancel_task_runtime(
+                task_runtime,
+                session_key=key,
+                source=_cancel_source_from_params(params, "sessions_abort"),
+                reason="user_abort",
+            )
+            return {"aborted": cancelled_count > 0, "key": key}
+        from agentos.gateway.run_abort import abort_session_runs
+
+        outcome = await abort_session_runs(
             task_runtime,
-            session_key=key,
+            key,
+            session_manager=ctx.session_manager,
             source=_cancel_source_from_params(params, "sessions_abort"),
-            reason="user_abort",
+            runs=captured_runs,
         )
-        return {"aborted": cancelled_count > 0, "key": key}
+        if outcome.still_running:
+            raise RpcHandlerError(
+                ErrorCode.UNAVAILABLE,
+                "The run was stopped, but some of its runs are still running.",
+                details={
+                    "code": ErrorDetailCode.ABORT_INCOMPLETE.value,
+                    "key": key,
+                    "aborted": outcome.aborted,
+                    "children_aborted": outcome.children_aborted,
+                    "still_running": outcome.still_running,
+                },
+                retryable=True,
+            )
+        # ``aborted`` lists the stopped run ids: truthy exactly when a run was
+        # stopped, which is how callers have always read it.
+        return {
+            "aborted": outcome.aborted,
+            "children_aborted": outcome.children_aborted,
+            "key": key,
+        }
 
     # Cancel running agent task via registry
     registry = get_agent_task_registry()
@@ -2411,7 +2534,21 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
         "replay_gap_reason": replay.gap_reason,
         "replayed_count": replayed_count,
         **task_state,
+        # Authoritative: ``None`` means nothing runs, so a client drops any
+        # live view it reconstructed; an object is what the run said so far.
+        "in_flight_run": get_session_streams().in_flight_snapshot(
+            key, active_task=task_state.get("active_task")
+        ),
     }
+
+
+async def session_in_flight_run(ctx: RpcContext, session_key: str) -> dict[str, Any] | None:
+    """``in_flight_run`` for ``session_key`` (see ``sessions.messages.subscribe``)."""
+    storage = get_session_storage(getattr(ctx, "session_manager", None))
+    task_state = _task_state_summary(await _list_task_rows(ctx, storage, session_key))
+    return get_session_streams().in_flight_snapshot(
+        session_key, active_task=task_state.get("active_task")
+    )
 
 
 @_d.method("sessions.messages.unsubscribe")

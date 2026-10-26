@@ -19,6 +19,8 @@ Lock ordering invariant:
 from __future__ import annotations
 
 import asyncio
+import builtins
+import functools
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -31,6 +33,7 @@ import structlog
 from agentos.engine.outcome import completed_outcome, outcome_from_error
 from agentos.gateway.routing import RouteEnvelope, SourceKind
 from agentos.gateway.session_lifecycle import TaskLifecycleEvent, TaskLifecycleListener
+from agentos.gateway.terminal_events import TerminalPublications, runtime_terminal_frame
 from agentos.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
 from agentos.session.models import AgentTaskRecord, AgentTaskStatus
 from agentos.session.terminal_reply import (
@@ -136,6 +139,9 @@ class TaskRun:
     # same live text stream that WebUI already receives without changing
     # the public WS event payload.
     stream_event_sink: TaskStreamEventSink | None = None
+    # The runtime's terminal reservation: the turn stream claims the run's
+    # ``done`` / ``error`` here before emitting it (see ``terminal_events``).
+    terminal_publications: TerminalPublications | None = None
 
     @property
     def session_key(self) -> str:
@@ -213,6 +219,9 @@ class _RuntimeTask:
     overflow_dropped: bool = False
     cancel_source: str | None = None
     cancel_reason: str | None = None
+    #: Set once the task reached ``running``: only a run that started has a
+    #: stream, so only it owes a terminal stream frame.
+    started: bool = False
 
 
 TaskHandler = Callable[[TaskRun], Awaitable[Any]]
@@ -417,6 +426,9 @@ class TaskRuntime:
         # Flipped off by ``stop_admission`` while the gateway drains for a
         # restart; ``enqueue`` refuses new work until ``resume_admission``.
         self._admitting = True
+        # One terminal stream frame per run, whichever path ends it.
+        self._terminal_publications = TerminalPublications()
+        self._finalizers: set[asyncio.Task[None]] = set()
 
     def stop_admission(self) -> None:
         """Refuse every further :meth:`enqueue` until :meth:`resume_admission`."""
@@ -429,6 +441,10 @@ class TaskRuntime:
     @property
     def admitting(self) -> bool:
         return self._admitting
+
+    @property
+    def terminal_publications(self) -> TerminalPublications:
+        return self._terminal_publications
 
     async def enqueue(
         self,
@@ -446,6 +462,8 @@ class TaskRuntime:
         *,
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
+        idempotency_key: str | None = None,
+        idempotency_fingerprint: str | None = None,
     ) -> TaskHandle:
         if not self._admitting:
             raise TaskRuntimeNotAdmittingError()
@@ -499,6 +517,13 @@ class TaskRuntime:
                 "fresh_user_session": fresh_user_session,
             },
         )
+        if idempotency_key and isinstance(record.details, dict):
+            # On the task record, not the envelope: the cached envelope is
+            # reused by later runtime sends, which must not inherit the key.
+            # A retry after a restart finds the turn it already started here.
+            record.details["idempotency_key"] = idempotency_key
+            if idempotency_fingerprint:
+                record.details["idempotency_fingerprint"] = idempotency_fingerprint
         await self._storage.create_agent_task(record)
         runtime_task = _RuntimeTask(
             task_id=record.task_id,
@@ -531,6 +556,9 @@ class TaskRuntime:
             if update_envelope_cache:
                 self._last_envelope_by_session[envelope.session_key] = envelope
             runtime_task.asyncio_task = asyncio.create_task(self._execute(runtime_task))
+            runtime_task.asyncio_task.add_done_callback(
+                functools.partial(self._finalize_unstarted, task=runtime_task)
+            )
             _queue_depth = len(self._pending_by_session.get(envelope.session_key, []))
             _queue_position = _queue_depth
             _total_queue_depth = sum(len(v) for v in self._pending_by_session.values())
@@ -655,6 +683,36 @@ class TaskRuntime:
             return await self.status(task_id)
         await asyncio.wait_for(runtime_task.done.wait(), timeout=timeout)
         return await self.status(task_id)
+
+    def is_task_active(self, task_id: str) -> bool:
+        """True while ``task_id`` is queued or running in this process."""
+        task = self._tasks.get(task_id)
+        return task is not None and task.status not in TERMINAL_STATUSES
+
+    def active_task_ids(self, session_key: str) -> builtins.list[str]:
+        """Ids of the queued and running tasks of ``session_key``, oldest first."""
+        session_key = canonicalize_session_key(session_key)
+        return [
+            task.task_id
+            for task in self._tasks.values()
+            if task.envelope.session_key == session_key and task.status not in TERMINAL_STATUSES
+        ]
+
+    def active_child_session_keys(self, parent_session_key: str) -> builtins.list[str]:
+        """Sessions with a live child run (subagent / ACP) spawned by the parent."""
+        parent_session_key = canonicalize_session_key(parent_session_key)
+        keys: builtins.list[str] = []
+        for task in self._tasks.values():
+            if task.status in TERMINAL_STATUSES or task.run_kind not in _CHILD_RUN_KINDS:
+                continue
+            parent = task.envelope.metadata.get("parent_session_key")
+            if not isinstance(parent, str) or not parent:
+                continue
+            if canonicalize_session_key(parent) != parent_session_key:
+                continue
+            if task.envelope.session_key not in keys:
+                keys.append(task.envelope.session_key)
+        return keys
 
     async def shutdown(
         self,
@@ -862,6 +920,30 @@ class TaskRuntime:
             status=AgentTaskStatus.QUEUED,
         )
 
+    def _finalize_unstarted(self, asyncio_task: asyncio.Task[None], *, task: _RuntimeTask) -> None:
+        """Record the end of a task cancelled before its coroutine ever ran.
+
+        ``_execute`` owns every terminal, but a task cancelled in the same tick
+        it was enqueued never runs it, so nothing marked it terminal and every
+        waiter -- ``sessions.abort`` among them -- hung on ``done``.
+        """
+        if task.terminal_emitted or not asyncio_task.cancelled():
+            return
+        try:
+            finalizer = asyncio.ensure_future(
+                self._mark_terminal(
+                    task,
+                    AgentTaskStatus.CANCELLED,
+                    terminal_reason=(
+                        "dropped_by_overflow" if task.overflow_dropped else "cancelled_before_start"
+                    ),
+                )
+            )
+        except RuntimeError:
+            return
+        self._finalizers.add(finalizer)
+        finalizer.add_done_callback(self._finalizers.discard)
+
     def _lock_is_evictable(self, lock: asyncio.Lock) -> bool:
         return not lock.locked() and id(lock) not in self._pinned_locks
 
@@ -952,6 +1034,7 @@ class TaskRuntime:
                         persisted_user_message_id=task.persisted_user_message_id,
                         fresh_user_session=task.fresh_user_session,
                         stream_event_sink=task.stream_event_sink,
+                        terminal_publications=self._terminal_publications,
                     )
                     await self._run_turn_handler_with_write_lock_bypass(
                         run,
@@ -1242,6 +1325,7 @@ class TaskRuntime:
     async def _mark_running(self, task: _RuntimeTask) -> None:
         async with self._state_lock:
             task.status = AgentTaskStatus.RUNNING
+            task.started = True
             self._remove_pending(task)
             self._running_by_session[task.envelope.session_key] = task
         await self._storage.update_agent_task(
@@ -1289,10 +1373,11 @@ class TaskRuntime:
             session_key = task.envelope.session_key
             # Drop cached routing and RR state only when both pending and
             # running work are gone, so later sends cannot reuse stale routing.
-            if (
-                not self._pending_by_session.get(session_key)
-                and self._running_by_session.get(session_key) is None
-            ):
+            has_followup = bool(
+                self._pending_by_session.get(session_key)
+                or self._running_by_session.get(session_key) is not None
+            )
+            if not has_followup:
                 self._last_envelope_by_session.pop(session_key, None)
                 agent_id = task.envelope.agent_id
                 active = self._agent_active_sessions.get(agent_id)
@@ -1395,6 +1480,13 @@ class TaskRuntime:
                     exc_info=True,
                 )
                 payload["terminal_message"] = error_message or "Agent error"
+        await self._publish_owed_terminal_frame(
+            task,
+            status,
+            terminal_reason=terminal_reason,
+            terminal_message=payload.get("terminal_message"),
+            error_class=error_class,
+        )
         try:
             await self._emit(task.envelope.session_key, f"task.{status.value}", payload)
         except Exception:
@@ -1414,6 +1506,7 @@ class TaskRuntime:
                 terminal_reason=terminal_reason,
                 error_class=error_class,
                 error_message=error_message,
+                has_followup=has_followup,
             )
         )
         task.done.set()
@@ -1424,6 +1517,44 @@ class TaskRuntime:
             error_class=error_class,
             error_message=error_message,
         )
+
+    async def _publish_owed_terminal_frame(
+        self,
+        task: _RuntimeTask,
+        status: AgentTaskStatus,
+        *,
+        terminal_reason: str,
+        terminal_message: str | None,
+        error_class: str | None,
+    ) -> None:
+        """Emit the run's terminal stream frame unless one was already emitted.
+
+        The turn stream emits ``done`` / ``error`` on a normal end; a cancel, a
+        crash or a hard deadline ends the run without one, and the stream frame
+        is what every client closes its live view on. Runs out here, after the
+        terminal status is persisted, so a client reacting to the frame reads
+        the final state. A task that never started had no stream to close.
+        """
+        owed, parked, _held_by = self._terminal_publications.take(task.task_id)
+        if not owed or not task.started:
+            return
+        event_name, frame = runtime_terminal_frame(
+            status.value,
+            task_id=task.task_id,
+            terminal_reason=terminal_reason,
+            terminal_message=terminal_message,
+            error_class=error_class,
+            parked=parked,
+        )
+        try:
+            await self._emit(task.envelope.session_key, event_name, frame)
+        except Exception:
+            log.warning(
+                "task_runtime.terminal_frame_emit_failed",
+                task_id=task.task_id,
+                status=status.value,
+                exc_info=True,
+            )
 
     async def _mark_unfinished_abandoned(self) -> None:
         async with self._state_lock:

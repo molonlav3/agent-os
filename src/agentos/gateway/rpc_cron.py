@@ -7,6 +7,7 @@ import shlex
 from dataclasses import asdict
 from typing import Any, TypeGuard
 
+from agentos.gateway.idempotency import run_idempotent
 from agentos.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
 from agentos.permissions import (
     configured_cron_default_elevated,
@@ -789,6 +790,11 @@ async def _handle_cron_status(params: dict | None, ctx: RpcContext) -> dict[str,
 
 @_d.method("cron.add")
 async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Add a cron job; a retried ``idempotency_key`` returns the job it added."""
+    return await run_idempotent("cron.add", params, lambda: _cron_add(params, ctx))
+
+
+async def _cron_add(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params required: schedule (object) or expression (string)")
     schedule_kind, schedule_value, schedule_tz = _schedule_from_params(params)

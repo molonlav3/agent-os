@@ -100,11 +100,11 @@ def _gate_env_set(name: str, approval_id: str | None) -> str | None:
     settings = queue.get_settings()
     new_id = queue.request(namespace=_ENV_APPROVAL_NAMESPACE, params=params)
     if settings.mode == "auto-approve":
-        queue.resolve(new_id, True)
+        queue.resolve(new_id, True, resolved_by="policy")
         queue.consume(new_id)
         return None
     if settings.mode == "auto-deny":
-        queue.resolve(new_id, False)
+        queue.resolve(new_id, False, resolved_by="policy")
         return _approval_envelope(
             "approval_denied", new_id, name, "Denied by the active approval policy."
         )

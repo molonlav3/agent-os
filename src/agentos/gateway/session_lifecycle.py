@@ -33,6 +33,9 @@ class TaskLifecycleEvent:
     terminal_reason: str | None = None
     error_class: str | None = None
     error_message: str | None = None
+    #: On a terminal event: the session still has queued or running work, so
+    #: the session as a whole is not idle (a steer's replacement turn).
+    has_followup: bool = False
 
 
 TaskLifecycleListener = Callable[[TaskLifecycleEvent], Awaitable[None]]

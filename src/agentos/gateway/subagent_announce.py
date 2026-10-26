@@ -179,6 +179,9 @@ async def announce_subagent_completion(
             # The parent stopped this child itself and already answered in
             # that turn; waking it again made it reply twice.
             return
+        if event.cancel_source in _PARENT_ABORT_CANCEL_SOURCES:
+            # Recorded on the parent above; the parent itself was aborted.
+            return
         await _send_parent_wake(
             event.parent_session_key,
             parent_task_id,
@@ -404,6 +407,10 @@ def _child_runtime_fields(row: Any) -> dict[str, Any]:
 _PARENT_STEER_CANCEL_SOURCES = frozenset({"acp_steer"})
 #: Cancel sources that are the parent agent stopping its own child.
 _AGENT_STOP_CANCEL_SOURCES = frozenset({"agent_tool_kill", "acp_tool_cancel", "acp_tool_close"})
+#: Cancel source of a child stopped because the user aborted its parent
+#: (``gateway.run_abort.PARENT_ABORT_SOURCE``): the parent was stopped too, so
+#: waking it to report would restart the very run the user ended.
+_PARENT_ABORT_CANCEL_SOURCES = frozenset({"parent_abort"})
 
 
 def _task_cancel_source(task_row: Any) -> str | None:

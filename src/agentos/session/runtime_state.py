@@ -20,7 +20,7 @@ import structlog
 log = structlog.get_logger(__name__)
 
 
-def evict_session_runtime_state(session_key: str) -> None:
+def evict_session_runtime_state(session_key: str, *, deleted: bool = True) -> None:
     """Drop in-memory per-session bookkeeping: every ``BoundedRegistry`` that
     knows how to identify a session, plus subagent, routing, and spawn-lock
     state.
@@ -34,11 +34,15 @@ def evict_session_runtime_state(session_key: str) -> None:
     already-evicted entry is the normal case rather than an error. A store
     that fails to import (partial install, trimmed distribution) must not
     block the deletion it is attached to.
+
+    ``deleted=False`` is the terminal path: the session still exists and may
+    run again, so state kept for its lifetime (its stream position and replay
+    buffer) stays until it is deleted.
     """
     try:
         from agentos.util.bounded_registry import drop_session_state
 
-        drop_session_state(session_key)
+        drop_session_state(session_key, deleted=deleted)
     except Exception:
         log.debug("session.runtime_state.bounded_registry_evict_failed", session_key=session_key)
     try:

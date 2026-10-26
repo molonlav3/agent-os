@@ -35,7 +35,7 @@ def _field(owner: object, name: str) -> BoundedRegistry:
 @pytest.mark.parametrize(
     "factory,fields",
     [
-        (SessionStreamRegistry, ["_seq_by_session", "_events_by_session"]),
+        (SessionStreamRegistry, ["_seq_by_session", "_events_by_session", "_live_runs"]),
         (StaleOutputCache, ["_entries"]),
         (SubagentRegistry, ["_archived"]),
         (PlanModeStore, ["_sessions"]),
@@ -227,3 +227,21 @@ def test_discord_sent_messages_growth_is_actually_capped() -> None:
     assert len(channel._sent_messages) == _MAX_CACHED_CHANNEL_CONTEXTS
     assert "0" not in channel._sent_messages
     assert str(_MAX_CACHED_CHANNEL_CONTEXTS + 499) in channel._sent_messages
+
+
+def test_a_finished_session_keeps_lifetime_state_until_it_is_deleted() -> None:
+    from agentos.session.runtime_state import evict_session_runtime_state
+
+    streams = SessionStreamRegistry()
+    plan = PlanModeStore()
+    streams.record("finished", "session.event.done", {})
+    plan.enable("finished")
+
+    evict_session_runtime_state("finished", deleted=False)
+
+    # The stream position outlives the finish; per-turn state does not.
+    assert streams.current_seq("finished") == 1
+    assert plan.is_enabled("finished") is False
+
+    evict_session_runtime_state("finished")
+    assert streams.current_seq("finished") == 0

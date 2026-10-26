@@ -111,6 +111,7 @@ class BoundedRegistry[KT, VT]:
         "__weakref__",
         "_entries",
         "_evictable",
+        "_keep_until_deleted",
         "_lock",
         "_max_entries",
         "_name",
@@ -133,6 +134,7 @@ class BoundedRegistry[KT, VT]:
         evictable: Callable[[VT], bool] | None = None,
         time_source: Callable[[], float] = time.monotonic,
         register: bool = True,
+        keep_until_deleted: bool = False,
     ) -> None:
         """Build a registry.
 
@@ -153,6 +155,11 @@ class BoundedRegistry[KT, VT]:
         exclusion it was protecting. Both the ceiling sweep and
         :meth:`discard_session` honour it; an explicit :meth:`discard` of a
         single key does not, because that caller owns the entry.
+
+        ``keep_until_deleted`` keeps a session's entries when the session only
+        *finished*: they go when it is deleted (or under the ceiling). For
+        state a finished session can still use, like the stream position a
+        later turn must continue from.
         """
 
         self._entries: OrderedDict[KT, tuple[VT, float]] = OrderedDict()
@@ -163,6 +170,7 @@ class BoundedRegistry[KT, VT]:
         self._ttl_seconds = ttl_seconds
         self._session_of = session_of
         self._evictable = evictable
+        self._keep_until_deleted = keep_until_deleted
         self._now = time_source
         self.evictions = 0
         self.expirations = 0
@@ -422,7 +430,7 @@ def _live_registries() -> list[BoundedRegistry[Any, Any]]:
         return list(_registries)
 
 
-def drop_session_state(session_key: str) -> int:
+def drop_session_state(session_key: str, *, deleted: bool = True) -> int:
     """Evict every registry's share of ``session_key``.
 
     This is the deterministic half of the contract: the gateway calls it once
@@ -430,12 +438,19 @@ def drop_session_state(session_key: str) -> int:
     session-scoped registry in the process drops that session immediately,
     rather than ageing out behind a ceiling. Returns the number of entries
     removed, for logging.
+
+    ``deleted=False`` is the session merely finishing (it can still take
+    another turn): registries built with ``keep_until_deleted`` keep it.
     """
 
     key = (session_key or "").strip()
     if not key:
         return 0
-    return sum(registry.discard_session(key) for registry in _live_registries())
+    return sum(
+        registry.discard_session(key)
+        for registry in _live_registries()
+        if deleted or not registry._keep_until_deleted
+    )
 
 
 def registry_stats() -> list[dict[str, Any]]:

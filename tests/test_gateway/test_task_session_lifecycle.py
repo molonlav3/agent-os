@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -150,12 +151,28 @@ async def test_task_timeout_terminalizes_running_session_and_broadcasts_change()
 
     assert record.status == "timeout"
     assert session.status == SessionStatus.TIMEOUT
+    # The handler raised without a stream terminal, so the runtime publishes
+    # the run's one terminal frame -- after persisting, before ``task.*``.
     assert [event_name for _, event_name, _ in events] == [
         "task.queued",
         "task.running",
+        "session.event.error",
         "task.timeout",
         "sessions.changed",
     ]
+    assert events[2] == (
+        session.session_key,
+        "session.event.error",
+        {
+            "run_id": handle.task_id,
+            "task_id": handle.task_id,
+            "terminal_reason": "timeout",
+            "state": "error",
+            "code": "TimeoutError",
+            "message": "The task timed out before it could finish.",
+            "terminal_message": "The task timed out before it could finish.",
+        },
+    )
     assert events[0] == (
         session.session_key,
         "task.queued",
@@ -171,7 +188,7 @@ async def test_task_timeout_terminalizes_running_session_and_broadcasts_change()
         "task.running",
         {"task_id": handle.task_id, "session_key": session.session_key},
     )
-    assert events[2] == (
+    assert events[3] == (
         session.session_key,
         "task.timeout",
         {
@@ -236,7 +253,7 @@ async def test_terminal_lifecycle_is_idempotent_for_already_terminal_session() -
 
 
 @pytest.mark.asyncio
-async def test_boot_lifecycle_listener_skips_subagent_tasks() -> None:
+async def test_boot_lifecycle_listener_leaves_child_rows_but_publishes_run_state() -> None:
     session = _make_session()
     manager = _SessionManager(session)
     events: list[tuple[str, str, dict[str, Any]]] = []
@@ -260,9 +277,115 @@ async def test_boot_lifecycle_listener_skips_subagent_tasks() -> None:
         )
     )
 
+    # The subagent announce owns the child row; the listener leaves it alone...
     assert manager.finish_calls == []
-    assert events == []
+    assert manager.update_calls == []
     assert session.status == SessionStatus.RUNNING
+    # ...but clients still learn the child run ended.
+    assert events == [
+        (
+            session.session_key,
+            "sessions.changed",
+            {
+                "schema_version": 1,
+                "key": session.session_key,
+                "reason": "task_terminal",
+                "run_status": "timeout",
+                "run_kind": "subagent",
+                "last_task": {
+                    "task_id": "task-1",
+                    "status": "timeout",
+                    "terminal_reason": "timeout",
+                    "terminal_message": "The task timed out before it could finish.",
+                },
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_kind", ["subagent", "acp"])
+async def test_child_run_cancel_publishes_cancelled_run_status(run_kind: str) -> None:
+    """A cancelled child run reaches clients as ``run_status: cancelled``.
+
+    The listener used to return early for child runs, so a coding-harness
+    child stopped with its parent kept reading "Working".
+    """
+    events: list[tuple[str, str, dict[str, Any]]] = []
+    child_key = "agent:main:acp:child-1"
+    manager = _SessionManager(_make_session(child_key))
+    release = asyncio.Event()
+
+    async def _blocked_handler(_run: Any) -> None:
+        await release.wait()
+
+    runtime = _make_runtime(_blocked_handler, session_manager=manager, events=events)
+    envelope = RouteEnvelope(
+        source_kind=SourceKind.SYSTEM,
+        source_name="test",
+        agent_id="main",
+        session_key=child_key,
+        input_provenance={"kind": "test"},
+        metadata={"parent_session_key": "agent:main:main"},
+    )
+    handle = await runtime.enqueue(envelope, "work", run_kind=run_kind)
+    for _ in range(50):
+        if any(name == "task.running" for _, name, _ in events):
+            break
+        await asyncio.sleep(0.01)
+
+    await runtime.cancel(session_key=child_key, source="test", reason="test")
+    await runtime.wait(handle.task_id, timeout=2.0)
+
+    changed = [payload for key, name, payload in events if name == "sessions.changed"]
+    assert [payload["run_status"] for payload in changed] == ["running", "cancelled"]
+    assert all(payload["key"] == child_key for payload in changed)
+    assert changed[-1]["last_task"]["status"] == "cancelled"
+    # Exactly one terminal stream frame, and it reads as a stop, not a failure.
+    terminals = [
+        (name, payload)
+        for _, name, payload in events
+        if name in ("session.event.done", "session.event.error")
+    ]
+    assert terminals == [
+        (
+            "session.event.done",
+            {
+                "run_id": handle.task_id,
+                "task_id": handle.task_id,
+                "terminal_reason": "cancelled",
+                "state": "aborted",
+                "reason": "aborted",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_child_terminal_with_followup_does_not_report_a_stop() -> None:
+    """A steered child: the replacement turn's ``running`` owns the state."""
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=_SessionManager(_make_session()),
+        event_emitter=_emit,
+    )
+    await listener(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key="agent:main:acp:child-1",
+            task_id="task-1",
+            task_status=AgentTaskStatus.CANCELLED,
+            run_kind="acp",
+            terminal_reason="cancelled",
+            has_followup=True,
+        )
+    )
+
+    assert events == []
 
 
 @pytest.mark.asyncio
@@ -282,10 +405,12 @@ async def test_task_running_reactivates_terminal_session_before_next_turn() -> N
     await runtime.wait(handle.task_id, timeout=2.0)
 
     assert session.status == SessionStatus.DONE
+    # The handler finished without streaming a ``done``: the runtime owes it.
     assert [event_name for _, event_name, _ in events] == [
         "task.queued",
         "task.running",
         "sessions.changed",
+        "session.event.done",
         "task.succeeded",
         "sessions.changed",
     ]
@@ -332,6 +457,16 @@ async def test_task_running_reactivates_terminal_session_before_next_turn() -> N
         },
     )
     assert events[3] == (
+        session.session_key,
+        "session.event.done",
+        {
+            "run_id": handle.task_id,
+            "task_id": handle.task_id,
+            "terminal_reason": "completed",
+            "state": "done",
+        },
+    )
+    assert events[4] == (
         session.session_key,
         "task.succeeded",
         {
@@ -382,3 +517,62 @@ async def test_task_runtime_persists_agent_task_timestamps_as_epoch_ms() -> None
     assert before_ms <= record.started_at <= after_ms
     assert before_ms <= record.finished_at <= after_ms
     assert record.finished_at >= record.started_at
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_turn_leaves_the_session_to_its_replacement() -> None:
+    """Under the interrupt queue mode a second message cancels the first.
+
+    The cancelled turn used to mark the row ``killed`` (and broadcast
+    ``cancelled``) while its replacement ran; the replacement's success could
+    no longer move the row, so nothing ever said the session finished.
+    """
+    session = _make_session(status=SessionStatus.DONE)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+    first_started = asyncio.Event()
+
+    async def _handler(run: Any) -> None:
+        if run.message == "first":
+            first_started.set()
+            await asyncio.sleep(30)
+
+    runtime = _make_runtime(_handler, session_manager=manager, events=events)
+    first = await runtime.enqueue(_make_envelope(), "first")
+    await asyncio.wait_for(first_started.wait(), 2)
+    second = await runtime.enqueue(_make_envelope(), "second", mode="interrupt")
+    await runtime.wait(first.task_id, timeout=2.0)
+    await runtime.wait(second.task_id, timeout=2.0)
+
+    changed = [payload for _, name, payload in events if name == "sessions.changed"]
+    assert [p["run_status"] for p in changed] == ["running", "idle"]
+    assert changed[-1]["last_task"]["task_id"] == second.task_id
+    assert session.status == SessionStatus.DONE
+
+
+@pytest.mark.asyncio
+async def test_a_run_ending_on_an_already_finished_row_is_still_announced() -> None:
+    session = _make_session(status=SessionStatus.KILLED)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(session_manager=manager, event_emitter=_emit)
+    await listener(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id="task-1",
+            task_status=AgentTaskStatus.CANCELLED,
+            run_kind="default",
+            terminal_reason="cancelled",
+        )
+    )
+
+    assert manager.update_calls == []
+    assert [(name, payload["run_status"]) for _, name, payload in events] == [
+        ("sessions.changed", "cancelled")
+    ]
+    assert "status" not in events[0][2]

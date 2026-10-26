@@ -763,6 +763,26 @@ class ConnectionRegistry:
                 except Exception:
                     pass
 
+    async def broadcast_control(self, event: str, payload: Any = None) -> None:
+        """Send to admitted Control connections, except an agent's own shell.
+
+        Channel and node connections never see these frames, nor a connection
+        that presented an agent token (the CLI an agent turn spawned). The
+        web console presents no operator secret, so it counts as *unbound*
+        under the agent surface's fail-safe rules; it still gets them, as it
+        can read the same list from ``GET /api/approvals``.
+        """
+        for conn in self.all():
+            access = conn.access
+            if not access.admitted or access.surface != ConnectionSurface.CONTROL:
+                continue
+            if access.agent is not None and access.agent.via == "token":
+                continue
+            try:
+                await conn.send_event(event, payload)
+            except Exception:
+                log.debug("ws.broadcast_control_failed", conn_id=conn.conn_id, event=event)
+
 
 class SubscriptionManager:
     """Track which connections are subscribed to session-level and message-level events."""
@@ -1713,5 +1733,7 @@ def _build_features(dispatcher: RpcDispatcher) -> Any:
         "health",
         "heartbeat",
         "cron",
+        "approval.requested",
+        "approval.resolved",
     ]
     return FeaturesInfo(methods=methods, events=events, capabilities=sorted(CAPABILITIES))

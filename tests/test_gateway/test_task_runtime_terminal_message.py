@@ -299,6 +299,7 @@ async def test_task_runtime_stream_error_emits_sanitized_terminal_message() -> N
                 "terminal_message": "The task timed out before it could finish.",
                 "terminal_reason": "timeout",
                 "error_message": "The task timed out before it could finish.",
+                "state": "error",
             },
         )
     ]

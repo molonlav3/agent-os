@@ -360,6 +360,54 @@ export function subscribeResultNeedsTerminalHistorySync(
 }
 
 /**
+ * The gateway's snapshot of a running turn (`in_flight_run` on
+ * `sessions.messages.subscribe` / `chat.history`): its identity and the text
+ * it has streamed through `through_stream_seq`. `null` on the wire means
+ * nothing runs.
+ */
+export interface InFlightRun {
+  run_id?: string | null
+  task_id?: string | null
+  status?: string
+  started_at?: number | null
+  through_stream_seq?: number
+  text?: string
+  text_truncated?: boolean
+  plan?: unknown
+  events?: unknown[]
+}
+
+/** What a (re)subscribing view does with the gateway's `in_flight_run`. */
+export type InFlightDecision =
+  /** The answer has no `in_flight_run`: an older gateway, keep inferring. */
+  | { kind: 'legacy' }
+  /** Nothing runs: drop any live view, whatever was reconstructed. */
+  | { kind: 'clear' }
+  /** The view already shows frames newer than the snapshot: leave it. */
+  | { kind: 'keep' }
+  /**
+   * Show the run with the snapshot's text; `rebuild` when the replay missed
+   * frames, so what the view pieced together cannot be trusted.
+   */
+  | { kind: 'adopt'; run: InFlightRun; text: string; rebuild: boolean }
+
+export function inFlightDecision(
+  answer: Record<string, unknown> | null | undefined,
+  viewHighWater: number,
+): InFlightDecision {
+  if (!answer || !Object.prototype.hasOwnProperty.call(answer, 'in_flight_run')) {
+    return { kind: 'legacy' }
+  }
+  const raw = answer.in_flight_run
+  if (!raw || typeof raw !== 'object') return { kind: 'clear' }
+  const run = raw as InFlightRun
+  const through = Number(run.through_stream_seq)
+  const rebuild = answer.replay_complete === false
+  if (!rebuild && Number.isFinite(through) && through < viewHighWater) return { kind: 'keep' }
+  return { kind: 'adopt', run, text: typeof run.text === 'string' ? run.text : '', rebuild }
+}
+
+/**
  * Read `?session=` from a search string (chat.js:1182-1187), pure over the
  * injected search rather than `window.location.search`. Returns the value or
  * `null` when absent / unparseable (legacy returns '' from `_readSessionFromUrl`;

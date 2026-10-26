@@ -514,6 +514,23 @@ class GatewayClient:
         if self._ws is None:
             raise ConnectionError(_CONNECTION_LOST)
 
+    async def _call_idempotent(self, method: str, params: dict[str, Any]) -> Any:
+        """:meth:`_call` for a request carrying an ``idempotency_key``.
+
+        If the socket drops before the answer arrives, the same request is
+        sent once more after the reconnect: a gateway that already accepted
+        it answers with the turn it started instead of starting a second one.
+        """
+        try:
+            return await self._call(method, params)
+        except GatewayRPCError:
+            raise
+        except ConnectionError:
+            if not self.auto_reconnect or self._connection_error is not None:
+                raise
+            # _call() waits for the reconnect before sending.
+            return await self._call(method, params)
+
     async def call(self, method: str, params: dict | None = None) -> Any:
         """Public thin wrapper for CLI commands that intentionally use RPC names."""
 
@@ -569,7 +586,27 @@ class GatewayClient:
         )
 
     async def abort_session(self, key: str) -> dict[str, Any]:
-        return cast(dict[str, Any], await self._call("sessions.abort", {"key": key}))
+        """Stop the session's run (and its child runs); waits for the end.
+
+        A cascade that did not finish within the gateway's bound is reported,
+        not raised: the session's own run is stopped either way, and the
+        caller (Ctrl-C, ``/abort``) has nothing better to do than say so.
+        """
+        try:
+            return cast(dict[str, Any], await self._call("sessions.abort", {"key": key}))
+        except GatewayRPCError as exc:
+            details = exc.data or {}
+            # ErrorDetailCode.ABORT_INCOMPLETE; the gateway package is too
+            # heavy to import into the CLI client for one string.
+            if details.get("code") != "ABORT_INCOMPLETE":
+                raise
+            return {
+                "key": key,
+                "aborted": details.get("aborted") or [],
+                "children_aborted": details.get("children_aborted") or [],
+                "still_running": details.get("still_running") or [],
+                "incomplete": True,
+            }
 
     async def rename_session(self, key: str, name: str | None) -> dict[str, Any]:
         """Set a session's display name; an empty/``None`` name clears it."""
@@ -750,6 +787,9 @@ class GatewayClient:
             "key": session_key,
             "message": message,
             "attachments": attachments or [],
+            # One per message: a gateway that already accepted it answers a
+            # resend with the same turn instead of starting another.
+            "idempotency_key": uuid.uuid4().hex,
             "_source": {
                 "caller_kind": "cli",
                 "channel_kind": "cli",
@@ -764,7 +804,7 @@ class GatewayClient:
         # Send the message (accepted immediately; agent runs async). The
         # response names the task that will run this turn, so a task-runtime
         # terminal for any other task on this session is not ours.
-        accepted = await self._call("sessions.send", params)
+        accepted = await self._call_idempotent("sessions.send", params)
         accepted_task_id = accepted.get("task_id") if isinstance(accepted, dict) else None
         if not isinstance(accepted_task_id, str) or not accepted_task_id:
             accepted_task_id = None
@@ -782,13 +822,17 @@ class GatewayClient:
             if (
                 accepted_task_id is not None
                 and not active_task_groups
-                and event_name.startswith("task.")
+                and (
+                    event_name.startswith("task.")
+                    or event_name in ("session.event.done", "session.event.error")
+                )
                 and isinstance(payload.get("task_id"), str)
                 and payload["task_id"] != accepted_task_id
             ):
                 # ``task.cancelled`` left over from the aborted previous turn,
-                # or a cron run's ``task.failed`` on this session: with no
-                # task group in flight, only our own task may end the turn.
+                # or a cron run's ``task.failed`` / terminal frame on this
+                # session: with no task group in flight, only our own task may
+                # end the turn.
                 continue
             if event_name == "session.event.error":
                 payload = _normalize_session_error_payload(payload)

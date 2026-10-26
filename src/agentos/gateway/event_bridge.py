@@ -40,14 +40,18 @@ class EventBridge:
             event_name: Event type (e.g. ``session.event.text_delta``,
                 ``sessions.changed``).
             payload: Event payload dict.
+
+        Replayable frames (``session.event.*``, ``task.*``,
+        ``sessions.changed``) are recorded in the session's replay buffer
+        first, so a client that subscribes late still receives them.
         """
         if self._subs is None:
             return
 
         try:
-            send_payload = payload or {}
-            if event_name.startswith("session.event."):
-                send_payload = get_session_streams().record(session_key, event_name, send_payload)
+            send_payload = get_session_streams().record_if_replayable(
+                session_key, event_name, payload
+            )
 
             subscriber_ids = self._subs.get_message_subscribers(session_key)
             if event_name.startswith("sessions."):

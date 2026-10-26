@@ -365,3 +365,48 @@ async def test_cli_client_reports_a_recovered_outage(
             assert statuses == ["reconnecting", "reconnected"]
         finally:
             await client.close()
+
+
+# ── a send lost with the socket ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("which", ["rpc", "cli"])
+async def test_a_send_lost_with_the_socket_is_resent_once_with_the_same_key(which: str) -> None:
+    """The gateway dedupes on the key: the resend returns the turn it started."""
+    async with _FakeGateway() as gateway:
+        gateway.hold_methods.add("sessions.send")
+        client: Any = _rpc_client() if which == "rpc" else _cli_client()
+        await client.connect(gateway.url)
+        try:
+            params = {"key": "agent:main:main", "message": "hi", "idempotency_key": "k-1"}
+            send = (
+                client.call_idempotent("sessions.send", dict(params))
+                if which == "rpc"
+                else client._call_idempotent("sessions.send", dict(params))
+            )
+            pending = asyncio.create_task(send)
+            await _until(lambda: any(m == "sessions.send" for m, _ in gateway.calls))
+            gateway.hold_methods.discard("sessions.send")
+            await gateway.connections[0].close(1012)
+
+            result = await asyncio.wait_for(pending, timeout=5.0)
+        finally:
+            await client.close()
+
+    sends = [p for m, p in gateway.calls if m == "sessions.send"]
+    assert len(sends) == 2
+    assert sends[0]["idempotency_key"] == sends[1]["idempotency_key"] == "k-1"
+    assert result == {"echo": "sessions.send"}
+
+
+async def test_call_idempotent_mints_a_key_when_the_caller_has_none() -> None:
+    async with _FakeGateway() as gateway:
+        client = _rpc_client()
+        await client.connect(gateway.url)
+        try:
+            await client.call_idempotent("sessions.send", {"key": "agent:main:main"})
+        finally:
+            await client.close()
+
+    sends = [p for m, p in gateway.calls if m == "sessions.send"]
+    assert isinstance(sends[0]["idempotency_key"], str) and sends[0]["idempotency_key"]

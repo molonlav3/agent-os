@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from agentos.artifacts import artifact_payload, strip_artifact_markers_from_text
+from agentos.chat.display_text import strip_assistant_text
 
 
 def transcript_entries_to_chat_messages(
@@ -46,10 +47,15 @@ def transcript_entries_to_chat_messages(
             content = "\n".join(t.replace("\\n", "\n") for t in texts) if texts else ""
             if not content.strip():
                 continue
+        role = getattr(entry, "role", "unknown")
+        if role == "assistant":
+            # Display-clean, as the live stream is: every surface shows the
+            # same text without re-implementing the strip.
+            content = strip_assistant_text(content)
         msg: dict[str, Any] = {
             "id": getattr(entry, "message_id", None),
             "message_id": getattr(entry, "message_id", None),
-            "role": getattr(entry, "role", "unknown"),
+            "role": role,
             "text": content,
             "timestamp": getattr(entry, "created_at", None),
             "provenance_kind": getattr(entry, "provenance_kind", None),
@@ -83,6 +89,24 @@ def transcript_entries_to_chat_messages(
                 msg["cost_usd"] = float(usage.get("cost_usd") or 0.0)
         tool_calls = getattr(entry, "tool_calls", None)
         if tool_calls:
-            msg["tool_calls"] = tool_calls
+            msg["tool_calls"] = (
+                _clean_text_segments(tool_calls) if role == "assistant" else tool_calls
+            )
         messages.append(msg)
     return messages
+
+
+def _clean_text_segments(segments: Any) -> Any:
+    """Strip the text segments of an interleaved assistant row, as its text is."""
+    if not isinstance(segments, list):
+        return segments
+    cleaned: list[Any] = []
+    for segment in segments:
+        if (
+            isinstance(segment, dict)
+            and segment.get("type") == "text"
+            and isinstance(segment.get("text"), str)
+        ):
+            segment = {**segment, "text": strip_assistant_text(segment["text"])}
+        cleaned.append(segment)
+    return cleaned

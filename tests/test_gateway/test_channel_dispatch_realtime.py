@@ -1496,7 +1496,9 @@ async def test_direct_streaming_fallback_sanitizes_queued_directive_tags() -> No
         config,
     )
 
-    assert channel.delivered_chunks == ["visible "]
+    # The display strip holds a chunk's trailing whitespace until the next
+    # chunk shows whether a marker (which takes the space with it) follows.
+    assert channel.delivered_chunks == ["visible"]
     assert channel.sent
     fallback = channel.sent[-1].content
     assert "[[reply_to_current]]" not in fallback

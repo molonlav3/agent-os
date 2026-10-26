@@ -48,6 +48,7 @@ from agentos.channels.artifact_delivery import (
 )
 from agentos.channels.stream_policy import resolve_channel_stream_policy
 from agentos.channels.types import IncomingMessage, OutgoingMessage
+from agentos.chat.display_text import AssistantTextStreamSanitizer, strip_assistant_text
 from agentos.compat.inspect_utils import accepts_keyword_arg
 from agentos.engine.start_turn import start_turn_via_runtime
 from agentos.engine.types import (
@@ -325,19 +326,33 @@ def _split_pending_internal_compaction_marker(content: str) -> tuple[str, str]:
 
 
 def _sanitize_outgoing_message(message: OutgoingMessage) -> OutgoingMessage:
-    cleaned = _strip_internal_compaction_markers(_strip_inline_directive_tags(message.content))
+    # The web console's display strip (directives, generated-artifact markers,
+    # leaked tool-protocol text), then the channel-only compaction markers.
+    cleaned = _strip_internal_compaction_markers(strip_assistant_text(message.content))
     if cleaned == message.content:
         return message
     return message.model_copy(update={"content": cleaned})
 
 
 class _DirectiveTagStreamSanitizer:
-    """Strip inline reply directives even when a tag is split across chunks."""
+    """Strip inline reply directives even when a tag is split across chunks.
+
+    The output then goes through the shared display strip
+    (:class:`agentos.chat.display_text.AssistantTextStreamSanitizer`), so a
+    streamed channel reply hides what the console hides.
+    """
 
     def __init__(self) -> None:
         self._pending = ""
+        self._display = AssistantTextStreamSanitizer()
 
     def clean(self, chunk: str) -> str:
+        return self._display.feed(self._clean_markers(chunk))
+
+    def flush(self) -> str:
+        return self._display.feed(self._flush_markers()) + self._display.flush()
+
+    def _clean_markers(self, chunk: str) -> str:
         text = self._pending + chunk
         self._pending = ""
         cleaned = _strip_internal_compaction_markers(_strip_inline_directive_tags(text))
@@ -357,7 +372,7 @@ class _DirectiveTagStreamSanitizer:
             return cleaned
         return cleaned
 
-    def flush(self) -> str:
+    def _flush_markers(self) -> str:
         pending = self._pending
         self._pending = ""
         return _strip_internal_compaction_markers(_strip_inline_directive_tags(pending))

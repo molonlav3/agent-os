@@ -6,6 +6,7 @@ import {
   ELEVATED_MODE_VERSION_KEY,
   approvalCommand,
   approvalDetail,
+  approvalFromEvent,
   approvalMeta,
   approvalsResolveUrl,
   approvalsSettingsUrl,
@@ -17,6 +18,7 @@ import {
   setBrowserElevated,
   useApprovals,
   type Approval,
+  type ApprovalEventSource,
 } from './approval-monitor'
 
 vi.mock('sonner', () => ({
@@ -27,8 +29,6 @@ vi.mock('sonner', () => ({
   },
 }))
 
-// A fetch that returns { pending, mode } once, then keeps returning the same
-// value on every subsequent poll (so the self-rescheduling loop stays fed).
 function okResponse(body: unknown, ok = true, status = 200) {
   return {
     ok,
@@ -41,11 +41,55 @@ function resetStore() {
   useApprovals.setState({ pending: [], count: 0, mode: 'prompt' })
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((r) => {
+    resolve = r
+  })
+  return { promise, resolve }
+}
+
+type Handler = (...args: unknown[]) => void
+
+// A stand-in for WsRpcClient: records subscriptions and lets a test push
+// frames and connection-state transitions the way the real client emits them.
+function fakeRpc(state: string = 'disconnected') {
+  const handlers = new Map<string, Set<Handler>>()
+  const rpc = {
+    state,
+    on(event: string, handler: Handler): () => void {
+      if (!handlers.has(event)) handlers.set(event, new Set())
+      handlers.get(event)!.add(handler)
+      return () => {
+        handlers.get(event)?.delete(handler)
+      }
+    },
+    emit(event: string, ...args: unknown[]): void {
+      handlers.get(event)?.forEach((h) => h(...args))
+    },
+    setState(next: string): void {
+      rpc.state = next
+      rpc.emit('_state', next)
+    },
+    listeners(): number {
+      let n = 0
+      handlers.forEach((set) => (n += set.size))
+      return n
+    },
+  }
+  return rpc
+}
+
+// Only the GET backfills (not resolve POSTs) — what the no-polling tests count.
+function backfillCalls(fetchMock: ReturnType<typeof vi.fn>): number {
+  return fetchMock.mock.calls.filter(([url]) => url === '/api/approvals').length
+}
+
 describe('approval-monitor service', () => {
   let fetchMock: ReturnType<typeof vi.fn>
   // Track every monitor a test creates so a failed assertion (which skips the
-  // test's own mon.stop()) can never leak a live focus/visibility listener or a
-  // scheduled poll into the next test.
+  // test's own mon.stop()) can never leak a live focus/visibility listener or
+  // an rpc subscription into the next test.
   const live: ApprovalMonitor[] = []
   function makeMonitor(): ApprovalMonitor {
     const mon = new ApprovalMonitor()
@@ -72,117 +116,363 @@ describe('approval-monitor service', () => {
     vi.unstubAllGlobals()
   })
 
-  // Drain the microtask queue between fake-timer advances so awaited fetch
-  // promises settle before we assert / advance again.
+  // Drain the microtask queue so awaited fetch / json promises settle before
+  // the test asserts.
   async function flush() {
-    await Promise.resolve()
-    await Promise.resolve()
-    await Promise.resolve()
+    for (let i = 0; i < 6; i++) await Promise.resolve()
   }
 
-  describe('polling + backoff', () => {
-    it('polls the root-absolute /api/approvals immediately on start (delay 0)', async () => {
+  describe('backfill on start + (re)connect', () => {
+    it('backfills once from the root-absolute /api/approvals when started without a client', async () => {
       const mon = makeMonitor()
       mon.start()
-      await vi.advanceTimersByTimeAsync(0)
       await flush()
       expect(fetchMock).toHaveBeenCalledTimes(1)
       expect(fetchMock).toHaveBeenCalledWith(
         '/api/approvals',
         expect.objectContaining({ cache: 'no-store' }),
       )
-      mon.stop()
     })
 
-    it('grows the backoff 1500→3000→6000… while the queue stays empty', async () => {
-      const mon = makeMonitor()
-      mon.start()
-      await vi.advanceTimersByTimeAsync(0)
+    it('backfills at once when the client is already connected', async () => {
+      const rpc = fakeRpc('connected')
+      makeMonitor().start(rpc)
       await flush()
-      expect(fetchMock).toHaveBeenCalledTimes(1) // initial poll (empty → backoff now 3000)
-
-      // Not yet due at 1500ms (backoff already grew past POLL_MS).
-      await vi.advanceTimersByTimeAsync(1500)
-      await flush()
-      expect(fetchMock).toHaveBeenCalledTimes(1)
-
-      // Due at 3000ms.
-      await vi.advanceTimersByTimeAsync(1500)
-      await flush()
-      expect(fetchMock).toHaveBeenCalledTimes(2) // empty again → backoff 6000
-
-      // 3rd poll is now due at 6000ms, not 3000ms (backoff doubled again).
-      await vi.advanceTimersByTimeAsync(5999)
-      await flush()
-      expect(fetchMock).toHaveBeenCalledTimes(2) // not yet
-      await vi.advanceTimersByTimeAsync(1)
-      await flush()
-      expect(fetchMock).toHaveBeenCalledTimes(3) // fired at 6000ms
-      mon.stop()
+      expect(backfillCalls(fetchMock)).toBe(1)
     })
 
-    it('clamps the backoff at 30000ms (does not grow without bound)', async () => {
-      const mon = makeMonitor()
-      mon.start()
-      await vi.advanceTimersByTimeAsync(0)
+    it('backfills at once when the client does not report a state', async () => {
+      const rpc = fakeRpc()
+      const source: ApprovalEventSource = { on: (event, handler) => rpc.on(event, handler) }
+      makeMonitor().start(source)
       await flush()
-      // Uncapped exponential growth from 1500ms would blow past 30s within a few
-      // polls; a clamped monitor keeps firing on a ≤30s cadence forever. Advance
-      // a long horizon (10 minutes) and assert the poll count matches the 30s
-      // clamp — an unclamped monitor would fire far fewer times over the same
-      // span (its delay would already exceed the whole window).
+      expect(backfillCalls(fetchMock)).toBe(1)
+    })
+
+    it('waits for the connection, then does exactly one GET per transition to connected', async () => {
+      const rpc = fakeRpc('disconnected')
+      makeMonitor().start(rpc)
+      await flush()
+      expect(fetchMock).not.toHaveBeenCalled()
+
+      rpc.setState('connecting')
+      await flush()
+      expect(fetchMock).not.toHaveBeenCalled()
+
+      rpc.setState('connected')
+      await flush()
+      expect(backfillCalls(fetchMock)).toBe(1)
+
+      // A drop and a reconnect: events were missed meanwhile, so one more.
+      rpc.setState('disconnected')
+      await flush()
+      expect(backfillCalls(fetchMock)).toBe(1)
+      rpc.setState('connected')
+      await flush()
+      expect(backfillCalls(fetchMock)).toBe(2)
+    })
+
+    it('never fetches on a timer: no GET fires long after start', async () => {
+      const rpc = fakeRpc('connected')
+      makeMonitor().start(rpc)
+      await flush()
+      expect(backfillCalls(fetchMock)).toBe(1)
+      // Well past the old 1.5s floor and the 30s backoff ceiling.
+      await vi.advanceTimersByTimeAsync(10 * 60_000)
+      await flush()
+      expect(backfillCalls(fetchMock)).toBe(1)
+    })
+
+    it('never fetches on a timer even with pending items or a failing endpoint', async () => {
+      fetchMock.mockResolvedValue(okResponse({}, false, 503))
+      makeMonitor().start()
+      await flush()
+      await vi.advanceTimersByTimeAsync(120_000)
+      await flush()
+      expect(backfillCalls(fetchMock)).toBe(1)
+
+      fetchMock.mockResolvedValue(okResponse({ pending: [{ id: 'a1' }], mode: 'prompt' }))
+      const rpc = fakeRpc('connected')
+      const other = makeMonitor()
+      other.start(rpc)
+      await flush()
+      await vi.advanceTimersByTimeAsync(120_000)
+      await flush()
+      expect(backfillCalls(fetchMock)).toBe(2)
+    })
+
+    it('start() is idempotent: a second call neither re-subscribes nor re-fetches', async () => {
+      const rpc = fakeRpc('connected')
+      const mon = makeMonitor()
+      mon.start(rpc)
+      mon.start(rpc)
+      await flush()
+      expect(backfillCalls(fetchMock)).toBe(1)
+      expect(rpc.listeners()).toBe(3)
+    })
+
+    it('stop() unsubscribes from the client and ignores later frames + reconnects', async () => {
+      const rpc = fakeRpc('connected')
+      const mon = makeMonitor()
+      mon.start(rpc)
+      await flush()
+      expect(rpc.listeners()).toBe(3)
+      mon.stop()
+      expect(rpc.listeners()).toBe(0)
       fetchMock.mockClear()
-      const horizonMs = 10 * 60_000
-      const step = 30_000
-      for (let elapsed = 0; elapsed < horizonMs; elapsed += step) {
-        await vi.advanceTimersByTimeAsync(step)
-        await flush()
+      rpc.emit('approval.requested', { id: 'late', namespace: 'exec' })
+      rpc.setState('disconnected')
+      rpc.setState('connected')
+      await flush()
+      expect(useApprovals.getState().pending).toEqual([])
+      expect(fetchMock).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('pushed events', () => {
+    it('approval.requested with the full item adds it verbatim', async () => {
+      const rpc = fakeRpc('disconnected')
+      makeMonitor().start(rpc)
+      const full: Approval = {
+        id: 'a1',
+        namespace: 'exec',
+        toolName: 'bash',
+        sessionKey: 'agent:main:1',
+        command: 'rm -rf /tmp/x',
+        warning: 'destructive',
+        argv: ['rm', '-rf', '/tmp/x'],
+        mode: 'prompt',
+        created_at: 1700000000,
+        title: 'Run a shell command',
       }
-      // At the 30s clamp the loop yields ~one poll per 30s window (≈20 over
-      // 10min). This is the discriminating assertion: an UNCLAMPED monitor's
-      // delay would race past the whole 10-minute horizon within a few polls,
-      // producing only a handful of calls — nowhere near one-per-window.
-      const windows = horizonMs / step
-      expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(windows - 1)
-      // Upper guard: the clamp floors the delay at 30s, so we can never exceed
-      // one poll per window plus a small boundary allowance from async timer
-      // realignment — but always far below the ~400 an uncapped 1500ms floor
-      // would give.
-      expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(windows + 3)
-      mon.stop()
+      rpc.emit('approval.requested', { id: 'a1', namespace: 'exec', approval: full })
+      const state = useApprovals.getState()
+      expect(state.pending).toEqual([full])
+      expect(state.count).toBe(1)
+      expect(fetchMock).not.toHaveBeenCalled()
     })
 
-    it('resets the backoff to 1500ms once the queue has pending items', async () => {
-      fetchMock.mockResolvedValue(
-        okResponse({ pending: [{ id: 'a1', namespace: 'exec' }], mode: 'prompt' }),
+    it('approval.requested without the full item builds one from the summary fields', () => {
+      const rpc = fakeRpc()
+      makeMonitor().start(rpc)
+      rpc.emit('approval.requested', {
+        id: 'p1',
+        namespace: 'plugin',
+        session_key: 's-9',
+        created_at: 1700000001,
+        expires_at: 1700000301,
+        summary: 'Plugin wants network access',
+        tool: 'web_fetch',
+        command: 'GET https://example.invalid',
+      })
+      expect(useApprovals.getState().pending).toEqual([
+        {
+          id: 'p1',
+          namespace: 'plugin',
+          sessionKey: 's-9',
+          toolName: 'web_fetch',
+          command: 'GET https://example.invalid',
+          warning: 'Plugin wants network access',
+          created_at: 1700000001,
+        },
+      ])
+      expect(useApprovals.getState().count).toBe(1)
+    })
+
+    it('a duplicate frame neither duplicates the item nor toasts again', () => {
+      const rpc = fakeRpc()
+      makeMonitor().start(rpc)
+      rpc.emit('approval.requested', { id: 'a1', namespace: 'exec' })
+      rpc.emit('approval.requested', { id: 'a1', namespace: 'exec' })
+      expect(useApprovals.getState().pending).toEqual([{ id: 'a1', namespace: 'exec' }])
+      expect(useApprovals.getState().count).toBe(1)
+      expect(toast.warning).toHaveBeenCalledTimes(1)
+      expect(toast.warning).toHaveBeenCalledWith(
+        'Approval required',
+        expect.objectContaining({ id: 'approval-required', duration: 2500 }),
       )
-      const mon = makeMonitor()
-      mon.start()
-      await vi.advanceTimersByTimeAsync(0)
-      await flush()
-      expect(fetchMock).toHaveBeenCalledTimes(1)
-      // Pending → backoff reset to POLL_MS, so the next poll is due at 1500ms.
-      await vi.advanceTimersByTimeAsync(1500)
-      await flush()
-      expect(fetchMock).toHaveBeenCalledTimes(2)
-      mon.stop()
     })
 
-    it('stop() clears the scheduled timer so no further polls fire', async () => {
+    it('keeps arrival order; a full repeat refreshes in place, a bare repeat changes nothing', () => {
+      const rpc = fakeRpc()
+      makeMonitor().start(rpc)
+      rpc.emit('approval.requested', {
+        id: 'a1',
+        namespace: 'exec',
+        approval: { id: 'a1', namespace: 'exec', command: 'ls', warning: 'from queue' },
+      })
+      rpc.emit('approval.requested', { id: 'a2', namespace: 'acp' })
+      rpc.emit('approval.requested', { id: 'a3', namespace: 'acp_elicitation' })
+      // A bare summary for a known id must not clobber the richer item.
+      rpc.emit('approval.requested', { id: 'a1', namespace: 'exec', summary: 'short' })
+      expect(useApprovals.getState().pending.map((p) => p.id)).toEqual(['a1', 'a2', 'a3'])
+      expect(useApprovals.getState().pending[0]!.warning).toBe('from queue')
+      // A full item for a known id replaces it without moving it.
+      rpc.emit('approval.requested', {
+        id: 'a2',
+        namespace: 'acp',
+        approval: { id: 'a2', namespace: 'acp', toolName: 'edit' },
+      })
+      const pending = useApprovals.getState().pending
+      expect(pending.map((p) => p.id)).toEqual(['a1', 'a2', 'a3'])
+      expect(pending[1]).toEqual({ id: 'a2', namespace: 'acp', toolName: 'edit' })
+      expect(toast.warning).toHaveBeenCalledTimes(3)
+    })
+
+    it('approval.resolved removes the item and updates the count', () => {
+      const rpc = fakeRpc()
+      makeMonitor().start(rpc)
+      rpc.emit('approval.requested', { id: 'a1', namespace: 'exec' })
+      rpc.emit('approval.requested', { id: 'a2', namespace: 'plugin' })
+      expect(useApprovals.getState().count).toBe(2)
+      rpc.emit('approval.resolved', {
+        id: 'a1',
+        namespace: 'exec',
+        decision: 'approved',
+        resolved_by: 'operator',
+        resolved_at: 1700000002,
+      })
+      expect(useApprovals.getState().pending).toEqual([{ id: 'a2', namespace: 'plugin' }])
+      expect(useApprovals.getState().count).toBe(1)
+      rpc.emit('approval.resolved', { id: 'a2', namespace: 'plugin', decision: 'expired' })
+      expect(useApprovals.getState().pending).toEqual([])
+      expect(useApprovals.getState().count).toBe(0)
+    })
+
+    it('ignores a resolved frame for an unknown id and frames without an id', () => {
+      const rpc = fakeRpc()
+      makeMonitor().start(rpc)
+      rpc.emit('approval.requested', { id: 'a1', namespace: 'exec' })
+      rpc.emit('approval.resolved', { id: 'nope', namespace: 'exec', decision: 'denied' })
+      rpc.emit('approval.requested', { namespace: 'exec' })
+      rpc.emit('approval.requested', null)
+      rpc.emit('approval.resolved', { namespace: 'exec', decision: 'denied' })
+      expect(useApprovals.getState().pending).toEqual([{ id: 'a1', namespace: 'exec' }])
+      expect(toast.warning).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('backfill vs. events', () => {
+    it('a backfill replaces pending wholesale', async () => {
+      const rpc = fakeRpc()
+      makeMonitor().start(rpc)
+      rpc.emit('approval.requested', { id: 'stale', namespace: 'exec' })
+      fetchMock.mockResolvedValue(
+        okResponse({ pending: [{ id: 'fresh', namespace: 'exec' }], mode: 'prompt' }),
+      )
+      rpc.setState('connected')
+      await flush()
+      expect(useApprovals.getState().pending).toEqual([{ id: 'fresh', namespace: 'exec' }])
+    })
+
+    it('an item requested while a backfill is in flight survives the older snapshot', async () => {
+      const gate = deferred<Response>()
+      fetchMock.mockReturnValueOnce(gate.promise)
+      const rpc = fakeRpc()
+      makeMonitor().start(rpc)
+      rpc.setState('connected')
+      await flush()
+      expect(backfillCalls(fetchMock)).toBe(1)
+
+      rpc.emit('approval.requested', { id: 'new', namespace: 'acp' })
+      expect(useApprovals.getState().pending.map((p) => p.id)).toEqual(['new'])
+
+      // The snapshot was taken before 'new' was queued.
+      gate.resolve(okResponse({ pending: [{ id: 'old', namespace: 'exec' }], mode: 'prompt' }))
+      await flush()
+      expect(useApprovals.getState().pending.map((p) => p.id)).toEqual(['old', 'new'])
+      expect(useApprovals.getState().count).toBe(2)
+    })
+
+    it('an item resolved while a backfill is in flight is not brought back by it', async () => {
+      const gate = deferred<Response>()
+      fetchMock.mockReturnValueOnce(gate.promise)
+      const rpc = fakeRpc()
+      makeMonitor().start(rpc)
+      rpc.emit('approval.requested', { id: 'a1', namespace: 'exec' })
+      rpc.setState('connected')
+      await flush()
+
+      rpc.emit('approval.requested', { id: 'a2', namespace: 'exec' })
+      rpc.emit('approval.resolved', { id: 'a1', namespace: 'exec', decision: 'denied' })
+      rpc.emit('approval.resolved', { id: 'a2', namespace: 'exec', decision: 'approved' })
+
+      gate.resolve(
+        okResponse({
+          pending: [
+            { id: 'a1', namespace: 'exec' },
+            { id: 'a2', namespace: 'exec' },
+            { id: 'a3', namespace: 'plugin' },
+          ],
+          mode: 'prompt',
+        }),
+      )
+      await flush()
+      expect(useApprovals.getState().pending.map((p) => p.id)).toEqual(['a3'])
+    })
+
+    it('the full item from a snapshot wins over the summary an event left behind', async () => {
+      const gate = deferred<Response>()
+      fetchMock.mockReturnValueOnce(gate.promise)
+      const rpc = fakeRpc()
+      makeMonitor().start(rpc)
+      rpc.setState('connected')
+      await flush()
+      rpc.emit('approval.requested', { id: 'a1', namespace: 'exec', summary: 'short' })
+      gate.resolve(
+        okResponse({
+          pending: [{ id: 'a1', namespace: 'exec', warning: 'full text', command: 'ls' }],
+          mode: 'prompt',
+        }),
+      )
+      await flush()
+      expect(useApprovals.getState().pending).toEqual([
+        { id: 'a1', namespace: 'exec', warning: 'full text', command: 'ls' },
+      ])
+    })
+
+    it('a backfill asked for while one is in flight runs once more after it', async () => {
+      const gate = deferred<Response>()
+      fetchMock
+        .mockReturnValueOnce(gate.promise)
+        .mockResolvedValue(okResponse({ pending: [{ id: 'b' }], mode: 'auto-deny' }))
       const mon = makeMonitor()
       mon.start()
-      await vi.advanceTimersByTimeAsync(0)
       await flush()
-      expect(fetchMock).toHaveBeenCalledTimes(1)
+      let settled = false
+      const asked = mon.pollNow().then(() => {
+        settled = true
+      })
+      const askedAgain = mon.pollNow()
+      await flush()
+      expect(backfillCalls(fetchMock)).toBe(1)
+      expect(settled).toBe(false)
+
+      gate.resolve(okResponse({ pending: [{ id: 'a' }], mode: 'prompt' }))
+      await asked
+      await askedAgain
+      // Two callers during one flight coalesce into a single extra fetch.
+      expect(backfillCalls(fetchMock)).toBe(2)
+      expect(useApprovals.getState().pending).toEqual([{ id: 'b' }])
+      expect(useApprovals.getState().mode).toBe('auto-deny')
+    })
+
+    it('a backfill that lands after stop() does not repopulate the cleared store', async () => {
+      const gate = deferred<Response>()
+      fetchMock.mockReturnValueOnce(gate.promise)
+      const mon = makeMonitor()
+      mon.start()
+      await flush()
       mon.stop()
-      await vi.advanceTimersByTimeAsync(60000)
+      gate.resolve(okResponse({ pending: [{ id: 'ghost' }], mode: 'prompt' }))
       await flush()
-      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(useApprovals.getState().pending).toEqual([])
+      expect(useApprovals.getState().count).toBe(0)
     })
   })
 
   describe('store updates', () => {
-    it('publishes pending + count to useApprovals on a successful poll', async () => {
+    it('publishes pending + count + mode to useApprovals on a successful backfill', async () => {
       const pending: Approval[] = [
         { id: 'a1', namespace: 'exec', command: 'rm -rf /' },
         { id: 'a2', namespace: 'plugin' },
@@ -190,13 +480,11 @@ describe('approval-monitor service', () => {
       fetchMock.mockResolvedValue(okResponse({ pending, mode: 'auto-approve' }))
       const mon = makeMonitor()
       mon.start()
-      await vi.advanceTimersByTimeAsync(0)
       await flush()
       const state = useApprovals.getState()
       expect(state.count).toBe(2)
       expect(state.pending).toEqual(pending)
       expect(state.mode).toBe('auto-approve')
-      mon.stop()
     })
 
     it('zeroes the badge but PRESERVES pending on a non-ok response (open prompt survives)', async () => {
@@ -207,11 +495,9 @@ describe('approval-monitor service', () => {
       fetchMock.mockResolvedValue(okResponse({}, false, 503))
       const mon = makeMonitor()
       mon.start()
-      await vi.advanceTimersByTimeAsync(0)
       await flush()
       expect(useApprovals.getState().count).toBe(0)
       expect(useApprovals.getState().pending).toEqual([{ id: 'x' }])
-      mon.stop()
     })
 
     it('zeroes the badge but PRESERVES pending when fetch throws', async () => {
@@ -220,19 +506,18 @@ describe('approval-monitor service', () => {
       fetchMock.mockRejectedValue(new Error('offline'))
       const mon = makeMonitor()
       mon.start()
-      await vi.advanceTimersByTimeAsync(0)
       await flush()
       expect(useApprovals.getState().count).toBe(0)
       expect(useApprovals.getState().pending).toEqual([{ id: 'x' }])
-      mon.stop()
     })
 
-    it('stop() clears the store', async () => {
+    it('stop() clears the store', () => {
       useApprovals.getState().setFromPoll([{ id: 'x' }], 'prompt')
       const mon = makeMonitor()
       mon.start()
       mon.stop()
       expect(useApprovals.getState().count).toBe(0)
+      expect(useApprovals.getState().pending).toEqual([])
     })
 
     it('zeroBadge() zeroes the count but leaves pending intact', () => {
@@ -241,51 +526,65 @@ describe('approval-monitor service', () => {
       expect(useApprovals.getState().count).toBe(0)
       expect(useApprovals.getState().pending).toEqual([{ id: 'x' }, { id: 'y' }])
     })
+
+    it('upsert() appends new ids and replaces known ones in place; remove() drops by id', () => {
+      const store = useApprovals.getState()
+      store.upsert({ id: 'x', command: 'one' })
+      store.upsert({ id: 'y' })
+      store.upsert({ id: 'x', command: 'two' })
+      expect(useApprovals.getState().pending).toEqual([{ id: 'x', command: 'two' }, { id: 'y' }])
+      expect(useApprovals.getState().count).toBe(2)
+      store.remove('x')
+      expect(useApprovals.getState().pending).toEqual([{ id: 'y' }])
+      expect(useApprovals.getState().count).toBe(1)
+      const before = useApprovals.getState()
+      store.remove('missing')
+      expect(useApprovals.getState()).toBe(before)
+    })
   })
 
   describe('toast on new pending', () => {
-    it('toasts once when a new pending count appears, and not again for the same count', async () => {
+    it('toasts when a backfill brings a new id, and not again when it only confirms it', async () => {
       fetchMock.mockResolvedValue(
         okResponse({ pending: [{ id: 'a1', namespace: 'exec' }], mode: 'prompt' }),
       )
       const mon = makeMonitor()
       mon.start()
-      await vi.advanceTimersByTimeAsync(0)
       await flush()
       expect(toast.warning).toHaveBeenCalledWith(
         'Approval required',
-        expect.objectContaining({ duration: 2500 }),
+        expect.objectContaining({ id: 'approval-required', duration: 2500 }),
       )
       expect(toast.warning).toHaveBeenCalledTimes(1)
-      // Same count on the next poll → no second toast.
-      await vi.advanceTimersByTimeAsync(1500)
-      await flush()
+      await mon.pollNow()
       expect(toast.warning).toHaveBeenCalledTimes(1)
-      mon.stop()
+      // A new id joins → toast again.
+      fetchMock.mockResolvedValue(
+        okResponse({ pending: [{ id: 'a1' }, { id: 'a2' }], mode: 'prompt' }),
+      )
+      await mon.pollNow()
+      expect(toast.warning).toHaveBeenCalledTimes(2)
+      // Shrinking the queue is not news.
+      fetchMock.mockResolvedValue(okResponse({ pending: [{ id: 'a2' }], mode: 'prompt' }))
+      await mon.pollNow()
+      expect(toast.warning).toHaveBeenCalledTimes(2)
     })
 
-    it('re-toasts when the count changes after dropping to zero', async () => {
-      fetchMock
-        .mockResolvedValueOnce(okResponse({ pending: [{ id: 'a1' }], mode: 'prompt' }))
-        .mockResolvedValueOnce(okResponse({ pending: [], mode: 'prompt' }))
-        .mockResolvedValue(okResponse({ pending: [{ id: 'a2' }], mode: 'prompt' }))
-      const mon = makeMonitor()
-      mon.start()
-      await vi.advanceTimersByTimeAsync(0) // count 1 → toast
+    it('a backfill that only confirms an item an event already brought stays quiet', async () => {
+      const rpc = fakeRpc()
+      makeMonitor().start(rpc)
+      rpc.emit('approval.requested', { id: 'a1', namespace: 'exec' })
+      expect(toast.warning).toHaveBeenCalledTimes(1)
+      fetchMock.mockResolvedValue(
+        okResponse({ pending: [{ id: 'a1', namespace: 'exec' }], mode: 'prompt' }),
+      )
+      rpc.setState('connected')
       await flush()
-      await vi.advanceTimersByTimeAsync(1500) // count 0 → reset lastToastCount
-      await flush()
-      await vi.advanceTimersByTimeAsync(30000) // count 1 again → toast
-      await flush()
-      expect(toast.warning).toHaveBeenCalledTimes(2)
-      mon.stop()
+      expect(toast.warning).toHaveBeenCalledTimes(1)
     })
   })
 
-  describe('focus + visibility re-poll', () => {
-    // These tests assert the *re-poll* triggered by the event alone. We clear
-    // the fetch spy after start()'s initial poll settles so the assertion is
-    // independent of any poll scheduled by the self-rescheduling loop.
+  describe('focus + visibility backfill', () => {
     function setVisibility(state: 'visible' | 'hidden') {
       Object.defineProperty(document, 'visibilityState', {
         configurable: true,
@@ -293,35 +592,33 @@ describe('approval-monitor service', () => {
       })
     }
 
-    it('re-polls immediately and resets backoff on window focus', async () => {
+    it('backfills exactly once on window focus, with no timer afterwards', async () => {
       const mon = makeMonitor()
-      mon.start()
-      await vi.advanceTimersByTimeAsync(0)
+      mon.start(fakeRpc('disconnected'))
       await flush()
-      fetchMock.mockClear()
+      expect(fetchMock).not.toHaveBeenCalled()
       window.dispatchEvent(new Event('focus'))
       await flush()
-      expect(fetchMock).toHaveBeenCalledTimes(1)
-      mon.stop()
+      expect(backfillCalls(fetchMock)).toBe(1)
+      await vi.advanceTimersByTimeAsync(60_000)
+      await flush()
+      expect(backfillCalls(fetchMock)).toBe(1)
     })
 
-    it('re-polls when the document becomes visible', async () => {
+    it('backfills when the document becomes visible', async () => {
       const mon = makeMonitor()
       mon.start()
-      await vi.advanceTimersByTimeAsync(0)
       await flush()
       fetchMock.mockClear()
       setVisibility('visible')
       document.dispatchEvent(new Event('visibilitychange'))
       await flush()
       expect(fetchMock).toHaveBeenCalledTimes(1)
-      mon.stop()
     })
 
-    it('does not re-poll when the document becomes hidden', async () => {
+    it('does not backfill when the document becomes hidden', async () => {
       const mon = makeMonitor()
       mon.start()
-      await vi.advanceTimersByTimeAsync(0)
       await flush()
       fetchMock.mockClear()
       setVisibility('hidden')
@@ -329,13 +626,11 @@ describe('approval-monitor service', () => {
       await flush()
       expect(fetchMock).not.toHaveBeenCalled()
       setVisibility('visible')
-      mon.stop()
     })
 
     it('detaches focus/visibility listeners on stop()', async () => {
       const mon = makeMonitor()
       mon.start()
-      await vi.advanceTimersByTimeAsync(0)
       await flush()
       mon.stop()
       fetchMock.mockClear()
@@ -346,11 +641,10 @@ describe('approval-monitor service', () => {
   })
 
   describe('pollNow', () => {
-    it('polls on demand without waiting for the scheduled tick', async () => {
+    it('backfills on demand', async () => {
       const mon = makeMonitor()
       // No start() — pollNow works standalone (approvals view calls it).
       await mon.pollNow()
-      await flush()
       expect(fetchMock).toHaveBeenCalledTimes(1)
     })
   })
@@ -358,13 +652,12 @@ describe('approval-monitor service', () => {
   describe('resolve', () => {
     const item: Approval = { id: 'a1', namespace: 'exec', command: 'ls' }
 
-    it('POSTs approve-once and re-polls', async () => {
+    it('POSTs approve-once and backfills', async () => {
       fetchMock
         .mockResolvedValueOnce(okResponse({ ok: true }))
         .mockResolvedValue(okResponse({ pending: [], mode: 'prompt' }))
       const mon = makeMonitor()
       await mon.resolve(item, 'once')
-      await flush()
       const [url, opts] = fetchMock.mock.calls[0]!
       expect(url).toBe('/api/approvals/resolve')
       expect(opts.method).toBe('POST')
@@ -378,15 +671,38 @@ describe('approval-monitor service', () => {
       })
       expect(body.elevatedMode).toBeUndefined()
       expect(toast.success).toHaveBeenCalledWith('Approval granted', expect.anything())
-      // Re-poll after resolve.
+      // Backfill after resolve.
       expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(fetchMock.mock.calls[1]![0]).toBe('/api/approvals')
+    })
+
+    it('drops the item from the store as soon as the POST succeeds, before the backfill lands', async () => {
+      useApprovals.getState().setFromPoll([item, { id: 'a2', namespace: 'exec' }], 'prompt')
+      const gate = deferred<Response>()
+      fetchMock.mockResolvedValueOnce(okResponse({ ok: true })).mockReturnValueOnce(gate.promise)
+      const mon = makeMonitor()
+      const done = mon.resolve(item, 'once')
+      await flush()
+      expect(backfillCalls(fetchMock)).toBe(1)
+      expect(useApprovals.getState().pending.map((p) => p.id)).toEqual(['a2'])
+      expect(useApprovals.getState().count).toBe(1)
+      gate.resolve(okResponse({ pending: [{ id: 'a2', namespace: 'exec' }], mode: 'prompt' }))
+      await done
+      expect(useApprovals.getState().pending.map((p) => p.id)).toEqual(['a2'])
+    })
+
+    it('keeps the item when the POST fails', async () => {
+      useApprovals.getState().setFromPoll([item], 'prompt')
+      fetchMock.mockResolvedValue(okResponse({}, false, 500))
+      const mon = makeMonitor()
+      await expect(mon.resolve(item, 'deny')).rejects.toThrow(/HTTP 500/)
+      expect(useApprovals.getState().pending).toEqual([item])
     })
 
     it('maps "always" to allowAlways + rememberIntent', async () => {
       fetchMock.mockResolvedValue(okResponse({ ok: true }))
       const mon = makeMonitor()
       await mon.resolve(item, 'always')
-      await flush()
       const body = JSON.parse(fetchMock.mock.calls[0]![1].body as string)
       expect(body.allowAlways).toBe(true)
       expect(body.rememberIntent).toBe(true)
@@ -397,7 +713,6 @@ describe('approval-monitor service', () => {
       fetchMock.mockResolvedValue(okResponse({ ok: true }))
       const mon = makeMonitor()
       await mon.resolve(item, 'bypass')
-      await flush()
       const body = JSON.parse(fetchMock.mock.calls[0]![1].body as string)
       expect(body.approved).toBe(true)
       expect(body.elevatedMode).toBe('bypass')
@@ -413,7 +728,6 @@ describe('approval-monitor service', () => {
       fetchMock.mockResolvedValue(okResponse({ ok: true }))
       const mon = makeMonitor()
       await mon.resolve(item, 'deny')
-      await flush()
       const body = JSON.parse(fetchMock.mock.calls[0]![1].body as string)
       expect(body.approved).toBe(false)
       expect(toast.warning).toHaveBeenCalledWith('Approval denied', expect.anything())
@@ -423,7 +737,6 @@ describe('approval-monitor service', () => {
       fetchMock.mockResolvedValue(okResponse({ ok: true }))
       const mon = makeMonitor()
       await mon.resolve({ id: 'x' }, 'once')
-      await flush()
       const body = JSON.parse(fetchMock.mock.calls[0]![1].body as string)
       expect(body.namespace).toBe('exec')
     })
@@ -445,7 +758,6 @@ describe('approval-monitor service', () => {
       sessionStorage.setItem('agentos.wsToken', 'tok-123')
       const mon = makeMonitor()
       await mon.pollNow()
-      await flush()
       const opts = fetchMock.mock.calls[0]![1]
       expect(opts.headers.Authorization).toBe('Bearer tok-123')
     })
@@ -453,7 +765,6 @@ describe('approval-monitor service', () => {
     it('omits the Authorization header when no token is stored', async () => {
       const mon = makeMonitor()
       await mon.pollNow()
-      await flush()
       const opts = fetchMock.mock.calls[0]![1]
       expect(opts.headers.Authorization).toBeUndefined()
     })
@@ -541,6 +852,48 @@ describe('approval-monitor pure helpers', () => {
       expect(canAlwaysAllow({ id: '1', namespace: 'exec', command: 'ls' })).toBe(true)
       expect(canAlwaysAllow({ id: '1', namespace: 'exec' })).toBe(false)
       expect(canAlwaysAllow({ id: '1', namespace: 'plugin', command: 'ls' })).toBe(false)
+    })
+  })
+
+  describe('approvalFromEvent', () => {
+    it('prefers the attached queue item, filling namespace from the frame when absent', () => {
+      expect(
+        approvalFromEvent({ id: 'a1', namespace: 'exec', approval: { id: 'a1', command: 'ls' } }),
+      ).toEqual({ id: 'a1', namespace: 'exec', command: 'ls' })
+    })
+    it('maps the summary fields when no queue item is attached', () => {
+      expect(
+        approvalFromEvent({
+          id: 'a1',
+          namespace: 'acp',
+          session_key: 's1',
+          tool: 'edit',
+          command: 'patch',
+          summary: 'Edit a file',
+          created_at: 5,
+          expires_at: 9,
+        }),
+      ).toEqual({
+        id: 'a1',
+        namespace: 'acp',
+        sessionKey: 's1',
+        toolName: 'edit',
+        command: 'patch',
+        warning: 'Edit a file',
+        created_at: 5,
+      })
+    })
+    it('falls back to the summary fields when the attached item has no id', () => {
+      expect(approvalFromEvent({ id: 'a1', namespace: 'exec', approval: {} })).toEqual({
+        id: 'a1',
+        namespace: 'exec',
+      })
+    })
+    it('returns null without a usable id', () => {
+      expect(approvalFromEvent(null)).toBeNull()
+      expect(approvalFromEvent('a1')).toBeNull()
+      expect(approvalFromEvent({ namespace: 'exec' })).toBeNull()
+      expect(approvalFromEvent({ id: '' })).toBeNull()
     })
   })
 

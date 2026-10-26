@@ -451,7 +451,7 @@ def _deny_quietly(queue: ApprovalQueue, approval_id: str) -> None:
     """Resolve a still-pending row as denied so no stale prompt lingers."""
     try:
         if not queue.get(approval_id).resolved:
-            queue.resolve(approval_id, False)
+            queue.resolve(approval_id, False, resolved_by="system")
     except (KeyError, ValueError):
         pass
     except Exception as exc:  # pragma: no cover - best effort
