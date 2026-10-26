@@ -17,25 +17,34 @@ import {
   Trash2Icon,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import { DisabledReason } from '@/components/DisabledReason'
 import { ModalShell } from '@/components/ModalShell'
 import { Button } from '@/components/ui/button'
-import { t } from '@/i18n'
+import { t, tPlural } from '@/i18n'
 import '@/i18n/en/cron'
 import { copyWithFallback } from '@/lib/clipboard'
+import { gate, requireConnection, requireScheduler, type Gate } from '@/lib/disabled-reason'
+import { RpcError } from '@/lib/ws-rpc'
+import { useRuntimeSignals } from '@/lib/runtime-signals'
+import { useConnection } from '@/stores/connection'
 import { MotionListItem } from '@/lib/motion'
 import { useRpc } from '@/app/providers'
 import { relTime } from '@/views/overview/logic'
 import { CronPanel } from './CronPanel'
 import {
   activeChatSessionKey,
+  CONCURRENCY_POLICIES,
+  concurrencyLabel,
   explainCron,
   filterJobs,
   humanCountdownPast,
   isOkStatus,
   isUpcomingRun,
   jobDotState,
+  jobConcurrency,
   jobCreatedFrom,
   jobElevated,
+  jobRuntimeHealth,
   jobKindClass,
   jobKindLabel,
   jobSchedule,
@@ -45,6 +54,7 @@ import {
   runRow,
   shortCronId,
   sortJobs,
+  type ConcurrencyPolicy,
   type CronDot,
   type DeliveryTargetMap,
   type RawJob,
@@ -309,6 +319,7 @@ function RunsDrawer({
 function JobCard({
   job,
   busy,
+  control,
   selected,
   onOpen,
   onToggle,
@@ -316,9 +327,12 @@ function JobCard({
   onEdit,
   onDelete,
   onCopyId,
+  onConcurrency,
 }: {
   job: RawJob
   busy: boolean
+  /** Run / pause / overlap need a connected gateway with a running scheduler. */
+  control: Gate
   selected: boolean
   onOpen: (id: string) => void
   onToggle: (job: RawJob) => void
@@ -326,6 +340,7 @@ function JobCard({
   onEdit: (job: RawJob) => void
   onDelete: (job: RawJob) => void
   onCopyId: (id: string) => void
+  onConcurrency: (job: RawJob, policy: ConcurrencyPolicy) => void
 }) {
   const id = String(job.id ?? '')
   const name = String(job.name || job.id || '')
@@ -343,11 +358,16 @@ function JobCard({
   const createdFrom = jobCreatedFrom(job)
   const elevated = jobElevated(job)
   const message = String(job.message || job.prompt || '').trim()
+  // Present only when the gateway reports them; absent means nothing is shown.
+  const health = jobRuntimeHealth(job)
+  const concurrency = jobConcurrency(job)
+  const failures = health ? tPlural('cron.cardFailures', health.consecutiveFailures) : ''
 
   return (
     <article
-      className={`panel cron-card ${dotTone(dot)}${selected ? ' is-selected' : ''}`}
+      className={`panel cron-card ${health?.degraded ? 'tone-danger' : dotTone(dot)}${selected ? ' is-selected' : ''}`}
       aria-label={t('cron.cardLandmark', { name })}
+      data-degraded={health?.degraded ? 'true' : undefined}
     >
       <header className="cron-card__head">
         <span
@@ -369,6 +389,15 @@ function JobCard({
             title={t('cron.cardElevatedTitle', { mode: elevated })}
           >
             {t('cron.cardElevated', { mode: elevated })}
+          </span>
+        ) : null}
+        {health?.degraded ? (
+          <span
+            className="cron-pill cron-pill--degraded tone-danger"
+            title={t('cron.cardDegradedTitle', { failures })}
+            data-testid="cron-degraded"
+          >
+            {t('cron.cardDegraded')}
           </span>
         ) : null}
       </header>
@@ -440,6 +469,49 @@ function JobCard({
             )}
           </dd>
         </div>
+        {health ? (
+          <div className="cron-card__health" data-testid="cron-health">
+            <dt className="t-label">{t('cron.cardHealth')}</dt>
+            <dd className="t-data">
+              <span
+                className={`cron-status ${health.degraded || health.consecutiveFailures ? 'tone-danger' : 'tone-ok'}`}
+              >
+                {health.consecutiveFailures ? failures : t('cron.cardHealthy')}
+              </span>
+            </dd>
+          </div>
+        ) : null}
+        {health?.lastError ? (
+          <div className="cron-card__message cron-card__error">
+            <dt className="t-label">{t('cron.cardLastError')}</dt>
+            <dd className="t-data">
+              {health.lastError.length > 240
+                ? health.lastError.slice(0, 240) + '…'
+                : health.lastError}
+            </dd>
+          </div>
+        ) : null}
+        {concurrency ? (
+          <div className="cron-card__concurrency">
+            <dt className="t-label">{t('cron.cardConcurrency')}</dt>
+            <dd>
+              <select
+                className="cron-select"
+                value={concurrency}
+                disabled={busy || control.disabled}
+                title={control.reason ?? concurrencyLabel(concurrency)}
+                aria-label={t('cron.cardConcurrencyAria', { name })}
+                onChange={(e) => onConcurrency(job, e.target.value as ConcurrencyPolicy)}
+              >
+                {CONCURRENCY_POLICIES.map((policy) => (
+                  <option key={policy} value={policy}>
+                    {concurrencyLabel(policy)}
+                  </option>
+                ))}
+              </select>
+            </dd>
+          </div>
+        ) : null}
         {message ? (
           <div className="cron-card__message">
             <dt className="t-label">{t('cron.cardPrompt')}</dt>
@@ -451,31 +523,33 @@ function JobCard({
       </dl>
 
       <footer className="cron-card__actions">
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          disabled={busy}
-          aria-label={t('cron.cardRunNow', { name })}
-          onClick={() => onRun(id)}
-        >
-          <SendIcon />
-          <span>{t('cron.cardRun')}</span>
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          disabled={busy}
-          aria-label={t('cron.cardToggleAria', {
-            action: enabled ? t('cron.cardPause') : t('cron.cardResume'),
-            name,
-          })}
-          onClick={() => onToggle(job)}
-        >
-          {enabled ? <SquareIcon /> : <SendIcon />}
-          <span>{enabled ? t('cron.cardPause') : t('cron.cardResume')}</span>
-        </Button>
+        <DisabledReason gate={control} className="cron-card__gate">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={busy || control.disabled}
+            aria-label={t('cron.cardRunNow', { name })}
+            onClick={() => onRun(id)}
+          >
+            <SendIcon />
+            <span>{t('cron.cardRun')}</span>
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={busy || control.disabled}
+            aria-label={t('cron.cardToggleAria', {
+              action: enabled ? t('cron.cardPause') : t('cron.cardResume'),
+              name,
+            })}
+            onClick={() => onToggle(job)}
+          >
+            {enabled ? <SquareIcon /> : <SendIcon />}
+            <span>{enabled ? t('cron.cardPause') : t('cron.cardResume')}</span>
+          </Button>
+        </DisabledReason>
         <Button
           type="button"
           size="sm"
@@ -544,9 +618,25 @@ function DeleteConfirm({
 }
 
 // ── Page ─────────────────────────────────────────────────────────────────────
+/** The scheduler refused with UNAVAILABLE: it is not running on this gateway. */
+function isSchedulerUnavailable(err: unknown): boolean {
+  return err instanceof RpcError && err.code === 'UNAVAILABLE'
+}
+
 export function CronPage() {
   const rpc = useRpc()
   const queryClient = useQueryClient()
+  const rpcState = useConnection((s) => s.state)
+  // Learned from the gateway's own answer (cron.list reads as empty either
+  // way) and tied to the connection it came from: the next connection may be
+  // a different gateway process, so it starts unknown again.
+  const connectedAt = useRuntimeSignals((s) => s.connectedAt)
+  const [schedulerDownAt, setSchedulerDownAt] = useState<number | null | undefined>(undefined)
+  const schedulerUnavailable = schedulerDownAt !== undefined && schedulerDownAt === connectedAt
+  const control = gate(requireConnection(rpcState), requireScheduler(schedulerUnavailable))
+  const noteSchedulerError = (err: unknown) => {
+    if (isSchedulerUnavailable(err)) setSchedulerDownAt(useRuntimeSignals.getState().connectedAt)
+  }
 
   const [search, setSearch] = useState('')
   const [sortCol, setSortCol] = useState<SortCol>('next_run')
@@ -638,8 +728,24 @@ export function CronPage() {
       void invalidate()
     },
     onError: (err) => {
+      noteSchedulerError(err)
       const message = err instanceof Error ? err.message : String(err)
       toast.error('Update failed: ' + message, { id: 'cron-toggle-err' })
+    },
+  })
+
+  // Overlap policy: only offered when the job payload carries `concurrency`.
+  const concurrencyMutation = useMutation({
+    mutationFn: (vars: { job: RawJob; policy: ConcurrencyPolicy }) =>
+      rpc.call('cron.update', { id: vars.job.id, concurrency: vars.policy }),
+    onSuccess: (_data, vars) => {
+      toast.info(t('cron.toastConcurrency', { policy: vars.policy }), { id: 'cron-concurrency' })
+      void invalidate()
+    },
+    onError: (err) => {
+      noteSchedulerError(err)
+      const message = err instanceof Error ? err.message : String(err)
+      toast.error(t('cron.toastConcurrencyFailed', { message }), { id: 'cron-concurrency-err' })
     },
   })
 
@@ -656,6 +762,7 @@ export function CronPage() {
       }
     },
     onError: (err) => {
+      noteSchedulerError(err)
       const message = err instanceof Error ? err.message : String(err)
       toast.error('Run failed: ' + message, { id: 'cron-run-err' })
     },
@@ -707,7 +814,11 @@ export function CronPage() {
   }
 
   const jobs = jobsQuery.data ?? []
-  const busy = toggleMutation.isPending || runMutation.isPending || removeMutation.isPending
+  const busy =
+    toggleMutation.isPending ||
+    runMutation.isPending ||
+    removeMutation.isPending ||
+    concurrencyMutation.isPending
 
   // cron.js:381-405 — summary stats.
   const total = jobs.length
@@ -882,6 +993,7 @@ export function CronPage() {
                   <JobCard
                     job={job}
                     busy={busy}
+                    control={control}
                     selected={selectedId === String(job.id)}
                     onOpen={(id) => setSelectedId((cur) => (cur === id ? null : id))}
                     onToggle={(j) => toggleMutation.mutate(j)}
@@ -889,6 +1001,7 @@ export function CronPage() {
                     onEdit={(j) => setPanel({ kind: 'edit', job: j })}
                     onDelete={(j) => setPendingDelete(j)}
                     onCopyId={(id) => void copyId(id)}
+                    onConcurrency={(j, policy) => concurrencyMutation.mutate({ job: j, policy })}
                   />
                 </MotionListItem>
               ))}

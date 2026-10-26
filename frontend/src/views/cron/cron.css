@@ -1048,3 +1048,39 @@
     transform: none;
   }
 }
+
+/* Job health (cron.list `health`, when the gateway sends it): a degraded job
+   carries a badge next to its name, and its last error reads like the prompt. */
+.cron-pill--degraded {
+  border-color: var(--tone, var(--danger));
+  color: var(--tone, var(--danger));
+  background: color-mix(in srgb, var(--tone, var(--danger)) 10%, transparent);
+}
+
+.cron-card__error dd {
+  color: var(--danger);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.75rem;
+}
+
+/* Overlap policy picker (cron.list `concurrency`). */
+.cron-select {
+  max-width: 100%;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-control);
+  background: var(--background);
+  color: var(--foreground);
+  font: inherit;
+  font-size: 0.75rem;
+}
+
+.cron-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* Run / pause keep their place when disabled; the reason sits under them. */
+.cron-card__gate {
+  flex: 1 1 auto;
+}

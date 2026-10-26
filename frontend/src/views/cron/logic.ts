@@ -202,6 +202,51 @@ export function isOkStatus(status: string | undefined | null): boolean {
   return status === 'ok' || status === 'success'
 }
 
+// ── Job health + overlap policy (cron.list `health` / `concurrency`) ─────────
+
+/** What `cron.list` reports about a job's recent runs, when the gateway sends it. */
+export interface JobRuntimeHealth {
+  consecutiveFailures: number
+  lastError: string
+  degraded: boolean
+}
+
+/**
+ * The job's `health` block, normalised (snake or camel case). Null when the
+ * gateway does not send one: an older engine says nothing, and nothing is
+ * what the card then shows, rather than a guessed "healthy".
+ */
+export function jobRuntimeHealth(job: RawJob): JobRuntimeHealth | null {
+  const raw = job.health
+  if (!raw || typeof raw !== 'object') return null
+  const h = raw as Record<string, unknown>
+  const failures = Number(h.consecutive_failures ?? h.consecutiveFailures ?? 0)
+  const lastError = h.last_error ?? h.lastError
+  return {
+    consecutiveFailures: Number.isFinite(failures) && failures > 0 ? Math.floor(failures) : 0,
+    lastError: typeof lastError === 'string' ? lastError.trim() : '',
+    degraded: h.degraded === true,
+  }
+}
+
+export type ConcurrencyPolicy = 'forbid' | 'replace' | 'allow'
+
+export const CONCURRENCY_POLICIES: readonly ConcurrencyPolicy[] = ['forbid', 'replace', 'allow']
+
+/** The job's overlap policy, or null when the payload has no (known) `concurrency`. */
+export function jobConcurrency(job: RawJob): ConcurrencyPolicy | null {
+  const raw = job.concurrency
+  return typeof raw === 'string' && (CONCURRENCY_POLICIES as readonly string[]).includes(raw)
+    ? (raw as ConcurrencyPolicy)
+    : null
+}
+
+export function concurrencyLabel(policy: ConcurrencyPolicy): string {
+  if (policy === 'forbid') return t('cron.concurrencyForbid')
+  if (policy === 'replace') return t('cron.concurrencyReplace')
+  return t('cron.concurrencyAllow')
+}
+
 // ── next-run text derivations (cron.js:362-377) ─────────────────────────────
 
 /**
