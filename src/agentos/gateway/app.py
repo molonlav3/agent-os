@@ -761,6 +761,7 @@ def create_gateway_app(
         config=config,
         dispatch_message=_hook_dispatch,
         wake=_hook_wake,
+        auth_guard=auth_guard,
     )
     from agentos.gateway.tools_invoke import register_tools_invoke_route  # noqa: PLC0415
 

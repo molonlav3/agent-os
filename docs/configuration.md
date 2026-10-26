@@ -1460,7 +1460,9 @@ pre_restart = []
 - `hooks.token` admits `POST /api/v1/hooks/agent`, `/wake` and `/<name>`
   (`Authorization: Bearer` or `X-AgentOS-Hook-Token`). The gateway token is
   refused there, and a hooks token equal to it disables the routes. Unset: the
-  routes answer `404`.
+  routes answer `404`. Wrong tokens are throttled by `[auth.rate_limit]` in a
+  budget of their own: a sender that keeps guessing is locked out of the hooks
+  (`429`), not out of the gateway.
 - A route's `template` fills `{{ payload.a.b }}` placeholders (dotted paths,
   list indexes like `commits.0.id`) from the posted JSON; no expressions. Empty:
   the body's `message`, else the JSON body itself. A route's `session_key` is

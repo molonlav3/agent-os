@@ -175,7 +175,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   in `[hooks.lifecycle]`, run after in-flight turns drain; a command that runs
   past the budget is killed with its whole process group (#3697).
 - Inbound webhooks `POST /api/v1/hooks/agent`, `/wake` and `/<name>` with their
-  own `[hooks] token` (the gateway token is refused), five-minute
+  own `[hooks] token` (the gateway token is refused; wrong tokens count
+  against `[auth.rate_limit]` in a budget separate from the gateway token's,
+  so a locked-out sender gets `429` without locking the gateway), five-minute
   `idempotency_key` dedupe (`409` for a reused key with another body), a
   per-hook rate limit (`429`), a fan-out cap per rolling hour, and
   `[hooks.routes.<name>]` agent / session / message template mapping (#3697).

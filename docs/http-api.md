@@ -314,7 +314,11 @@ minutes (`duplicate: true`), and the same key with a different body is `409`
 with `details.code = "REQUEST_CONFLICT"`; and `409` with `details.code =
 "FANOUT_LIMIT"` once the hook has delivered into `max_sessions_per_hook`
 (default 1) distinct sessions within the last hour. A malformed or wrong token
-is `401`, never an error page. Errors have the same typed shape as above. See
+is `401`, never an error page. Wrong tokens (the gateway token presented here
+included) count against `[auth.rate_limit]` like wrong gateway tokens, in a
+budget of their own: past it the address gets `429` with
+`details.code = "AUTH_RATE_LIMITED"` on the hooks, while the rest of the API
+is unaffected. Errors have the same typed shape as above. See
 [Configuration → Inbound webhooks](configuration.md#inbound-webhooks) and
 [Scheduling → Automation](scheduling.md#automation-from-outside).
 

@@ -220,6 +220,7 @@ def _hooks_client(
     recorder: _Recorder | None = None,
     guards: HookGuards | None = None,
     wake: bool = True,
+    auth_guard: Any = None,
 ) -> tuple[TestClient, _Recorder]:
     recorder = recorder or _Recorder()
     config = GatewayConfig(
@@ -233,6 +234,7 @@ def _hooks_client(
         dispatch_message=recorder.dispatch,
         wake=recorder.wake if wake else None,
         guards=guards,
+        auth_guard=auth_guard,
     )
     return TestClient(app), recorder
 
@@ -526,6 +528,77 @@ class TestHookAuthHardening:
         assert post("agent:main:hook:b") == 409
         now[0] = FANOUT_WINDOW_SECONDS + 1
         assert post("agent:main:hook:b") == 202
+
+    def test_wrong_hooks_tokens_lock_the_address_out_of_the_hooks_only(self) -> None:
+        """Guessing the hooks token is throttled like the gateway token, in a
+        budget of its own: a locked-out sender is refused even with the right
+        token, and the gateway token's budget is untouched."""
+        from agentos.gateway.auth_rate_limit import TOKEN_SCOPE, AuthGuard
+
+        guard = AuthGuard.from_config(
+            GatewayConfig(auth=AuthConfig(mode="token", token=GATEWAY_TOKEN))
+        )
+        client, recorder = _hooks_client(auth_guard=guard)
+        for _ in range(10):
+            wrong = client.post(
+                "/api/v1/hooks/agent", json={"message": "x"}, headers=_auth("guess")
+            )
+            assert wrong.status_code == 401
+        locked = client.post("/api/v1/hooks/agent", json={"message": "x"}, headers=_auth())
+        assert locked.status_code == 429
+        assert int(locked.headers["retry-after"]) > 0
+        assert locked.json()["code"] == "RATE_LIMITED"
+        assert locked.json()["details"]["code"] == "AUTH_RATE_LIMITED"
+        assert recorder.messages == []
+        assert guard.limiter.check("testclient", TOKEN_SCOPE).allowed
+
+    def test_the_gateway_token_on_a_hook_is_charged_too(self) -> None:
+        """Its distinct refusal must not be an unthrottled gateway-token oracle."""
+        from agentos.gateway.auth_rate_limit import AuthGuard
+
+        guard = AuthGuard.from_config(
+            GatewayConfig(auth=AuthConfig(mode="token", token=GATEWAY_TOKEN))
+        )
+        client, _ = _hooks_client(auth_guard=guard)
+        for _ in range(10):
+            refused = client.post(
+                "/api/v1/hooks/agent", json={"message": "x"}, headers=_auth(GATEWAY_TOKEN)
+            )
+            assert refused.status_code == 401
+            assert "hooks token" in refused.json()["error"]
+        again = client.post(
+            "/api/v1/hooks/agent", json={"message": "x"}, headers=_auth(GATEWAY_TOKEN)
+        )
+        assert again.status_code == 429
+
+    def test_a_missing_token_is_never_charged(self) -> None:
+        from agentos.gateway.auth_rate_limit import AuthGuard
+
+        guard = AuthGuard.from_config(
+            GatewayConfig(auth=AuthConfig(mode="token", token=GATEWAY_TOKEN))
+        )
+        client, _ = _hooks_client(auth_guard=guard)
+        for _ in range(12):
+            assert client.post("/api/v1/hooks/agent", json={"message": "x"}).status_code == 401
+        assert (
+            client.post("/api/v1/hooks/agent", json={"message": "x"}, headers=_auth()).status_code
+            == 202
+        )
+
+    def test_the_app_wires_its_failed_auth_limiter_into_the_hooks(self) -> None:
+        from agentos.gateway.app import create_gateway_app
+
+        config = GatewayConfig(
+            auth=AuthConfig(mode="token", token=GATEWAY_TOKEN),
+            hooks=HooksConfig(token=HOOK_TOKEN),
+        )
+        client = TestClient(create_gateway_app(config), base_url="http://localhost")
+        for _ in range(10):
+            client.post("/api/v1/hooks/agent", json={"message": "x"}, headers=_auth("guess"))
+        resp = client.post("/api/v1/hooks/agent", json={"message": "x"}, headers=_auth())
+        assert resp.status_code == 429
+        # The gateway token's own budget is separate.
+        assert client.get("/api/sessions", headers=_auth(GATEWAY_TOKEN)).status_code != 429
 
 
 class TestHookOrderingOnRestart:

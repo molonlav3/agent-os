@@ -13,7 +13,10 @@ reach the agent without a chat channel:
 They authenticate with their own bearer, ``[hooks] token`` (``Authorization:
 Bearer`` or ``X-AgentOS-Hook-Token``), never the gateway token -- presenting
 that one is refused, so a leaked webhook secret is not a Control credential
-and vice versa. With no hooks token configured the routes answer ``404``.
+and vice versa. With no hooks token configured the routes answer ``404``. A
+wrong hooks token counts against the gateway's failed-auth limiter
+(``[auth.rate_limit]``) in a budget of its own, so guessing it locks the
+address out of the hooks, not out of the gateway.
 
 Guard rails, per hook name: ``rate_limit_per_minute`` (default 60) answered
 with ``429``; ``idempotency_key`` (body) or an ``Idempotency-Key`` header
@@ -32,6 +35,7 @@ reason (:class:`~agentos.gateway.protocol.ErrorDetailCode`).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -46,12 +50,16 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from agentos.gateway.auth_rate_limit import AuthGuard, retry_after_seconds
 from agentos.gateway.config import GatewayConfig
 from agentos.gateway.protocol import ErrorCode, ErrorDetailCode, error_category
 
 log = structlog.get_logger(__name__)
 
 HOOKS_PREFIX = "/api/v1/hooks"
+#: Failed-auth budget the hooks token is guessed against, apart from the
+#: gateway token's so a misbehaving sender cannot lock the gateway itself.
+HOOKS_TOKEN_SCOPE = "hooks-token"
 IDEMPOTENCY_TTL_SECONDS = 300.0
 IDEMPOTENCY_MAX_ENTRIES = 2048
 RATE_WINDOW_SECONDS = 60.0
@@ -204,7 +212,13 @@ def _hooks_config(config: Any) -> Any:
 
 
 def _check_hook_token(config: Any, presented: str) -> JSONResponse | None:
-    """``None`` when ``presented`` is the hooks token, else the refusal to send."""
+    """``None`` when ``presented`` is the hooks token, else the refusal to send.
+
+    Every ``401`` is charged to the caller's failed-auth budget, the gateway
+    token presented here included: its distinct message must not make this
+    route an unthrottled oracle for the gateway token. ``404`` (no hooks
+    token configured) is not charged.
+    """
     from agentos.gateway.auth import token_matches
 
     hooks = _hooks_config(config)
@@ -275,22 +289,48 @@ def register_inbound_hook_routes(
     dispatch_message: Callable[[str, str, dict[str, Any]], Any],
     wake: Callable[[str], Any] | None = None,
     guards: HookGuards | None = None,
+    auth_guard: AuthGuard | None = None,
 ) -> None:
     """Register the hook routes.
 
     ``dispatch_message(session_key, message, provenance)`` enqueues a turn and
     returns its result dict (awaitable); ``wake(reason)`` nudges the heartbeat
-    and returns whether one is wired.
+    and returns whether one is wired. ``auth_guard`` is the app's failed-auth
+    limiter; wrong hooks tokens are counted in ``HOOKS_TOKEN_SCOPE``.
     """
+    from agentos.gateway.middleware import request_client_ip
     from agentos.session.keys import normalize_agent_id
 
     state = guards or HookGuards()
 
-    def authenticate(request: Request) -> JSONResponse | None:
+    async def authenticate(request: Request) -> JSONResponse | None:
         # ``token_matches`` compares UTF-8 bytes in constant time and never
         # raises: a header the client controls (any bytes, any length) must
         # not turn into an exception whose traceback carries the secrets.
-        return _check_hook_token(config, _presented_token(request))
+        presented = _presented_token(request)
+        limiter = auth_guard.limiter if auth_guard is not None else None
+        if limiter is None or not presented:
+            return _check_hook_token(config, presented)
+        client_ip = request_client_ip(request, config)
+        origin = request.headers.get("origin") or None
+        decision = limiter.check(client_ip, HOOKS_TOKEN_SCOPE, origin=origin)
+        if not decision.allowed:
+            return _json_error(
+                429,
+                ErrorCode.RATE_LIMITED,
+                "Too many failed authentication attempts",
+                ErrorDetailCode.AUTH_RATE_LIMITED,
+                headers={"Retry-After": str(retry_after_seconds(decision.retry_after_ms))},
+                retry_after_ms=decision.retry_after_ms,
+            )
+        refusal = _check_hook_token(config, presented)
+        if refusal is None:
+            limiter.record_success(client_ip, HOOKS_TOKEN_SCOPE, origin=origin)
+        elif refusal.status_code == 401:
+            decision = limiter.record_failure(client_ip, HOOKS_TOKEN_SCOPE, origin=origin)
+            if decision.delay_s > 0:
+                await asyncio.sleep(decision.delay_s)
+        return refusal
 
     async def read_body(request: Request) -> tuple[Any, JSONResponse | None]:
         raw = await request.body()
@@ -357,7 +397,7 @@ def register_inbound_hook_routes(
         hook: str,
         handler: Callable[[Any], Any],
     ) -> JSONResponse:
-        refusal = authenticate(request)
+        refusal = await authenticate(request)
         if refusal is not None:
             return refusal
         hooks = _hooks_config(config)
@@ -438,7 +478,7 @@ def register_inbound_hook_routes(
         route = routes.get(name)
         if route is None:
             # Authenticate first so an unauthenticated caller cannot map names.
-            refusal = authenticate(request)
+            refusal = await authenticate(request)
             return refusal if refusal is not None else _not_found()
 
         async def handle(body: Any) -> tuple[int, dict[str, Any]]:
@@ -474,6 +514,7 @@ def register_inbound_hook_routes(
 
 __all__ = [
     "HOOKS_PREFIX",
+    "HOOKS_TOKEN_SCOPE",
     "HookGuards",
     "default_hook_session",
     "register_inbound_hook_routes",
