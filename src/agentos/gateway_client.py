@@ -434,6 +434,27 @@ class GatewayRPCClient:
         self._subscriptions.note_call(method, params, payload)
         return {} if payload is None else payload
 
+    async def call_idempotent(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        """:meth:`call` for a side-effecting method, retried once across a reconnect.
+
+        The request carries an ``idempotency_key`` (one is minted when absent).
+        When the socket drops before the answer arrives, the same request goes
+        out once more on the new connection; a gateway that already acted on
+        it answers with that result instead of acting twice.
+        """
+        request = dict(params or {})
+        if not request.get("idempotency_key"):
+            request["idempotency_key"] = uuid.uuid4().hex
+        try:
+            return await self.call(method, request)
+        except GatewayRPCError:
+            raise
+        except ConnectionError:
+            if not self.auto_reconnect or self._connection_error is not None:
+                raise
+            # call() waits for the reconnect before sending.
+            return await self.call(method, request)
+
     async def _await_reconnect(self, method: str) -> None:
         task = self._reconnect_task
         if task is None or task.done():

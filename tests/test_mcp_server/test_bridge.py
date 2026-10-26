@@ -148,6 +148,10 @@ async def test_messages_send_subscribes_before_accepting_turn() -> None:
         "replay_gap_reason": None,
     }
     assert client.closed is True
+    # One key per message, so a resend after a dropped socket cannot start a
+    # second turn.
+    key = client.calls[1][1].pop("idempotency_key")
+    assert isinstance(key, str) and key
     assert client.calls == [
         ("sessions.messages.subscribe", {"key": "agent:main:main", "since_stream_seq": None}),
         (

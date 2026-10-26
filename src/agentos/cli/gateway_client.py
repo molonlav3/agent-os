@@ -514,6 +514,23 @@ class GatewayClient:
         if self._ws is None:
             raise ConnectionError(_CONNECTION_LOST)
 
+    async def _call_idempotent(self, method: str, params: dict[str, Any]) -> Any:
+        """:meth:`_call` for a request carrying an ``idempotency_key``.
+
+        If the socket drops before the answer arrives, the same request is
+        sent once more after the reconnect: a gateway that already accepted
+        it answers with the turn it started instead of starting a second one.
+        """
+        try:
+            return await self._call(method, params)
+        except GatewayRPCError:
+            raise
+        except ConnectionError:
+            if not self.auto_reconnect or self._connection_error is not None:
+                raise
+            # _call() waits for the reconnect before sending.
+            return await self._call(method, params)
+
     async def call(self, method: str, params: dict | None = None) -> Any:
         """Public thin wrapper for CLI commands that intentionally use RPC names."""
 
@@ -579,6 +596,8 @@ class GatewayClient:
             return cast(dict[str, Any], await self._call("sessions.abort", {"key": key}))
         except GatewayRPCError as exc:
             details = exc.data or {}
+            # ErrorDetailCode.ABORT_INCOMPLETE; the gateway package is too
+            # heavy to import into the CLI client for one string.
             if details.get("code") != "ABORT_INCOMPLETE":
                 raise
             return {
@@ -785,7 +804,7 @@ class GatewayClient:
         # Send the message (accepted immediately; agent runs async). The
         # response names the task that will run this turn, so a task-runtime
         # terminal for any other task on this session is not ours.
-        accepted = await self._call("sessions.send", params)
+        accepted = await self._call_idempotent("sessions.send", params)
         accepted_task_id = accepted.get("task_id") if isinstance(accepted, dict) else None
         if not isinstance(accepted_task_id, str) or not accepted_task_id:
             accepted_task_id = None

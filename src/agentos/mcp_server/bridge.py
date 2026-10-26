@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -111,13 +112,17 @@ class AgentOSMCPBridge:
         await client.connect(self.gateway_url)
         try:
             subscription = await self._subscribe_messages(client, key, since_stream_seq=None)
-            result = await client.call(
+            # Retried once across a reconnect under the same idempotency key,
+            # when the client can (a resend then returns the turn it started).
+            send = getattr(client, "call_idempotent", None) or client.call
+            result = await send(
                 "sessions.send",
                 {
                     "key": key,
                     "message": message,
                     "attachments": attachments or [],
                     "intent": intent,
+                    "idempotency_key": uuid.uuid4().hex,
                     "_source": {
                         "caller_kind": "cli",
                         "channel_kind": "cli",

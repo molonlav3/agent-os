@@ -103,8 +103,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Gateway: `chat.send`, `sessions.send`, `sessions.create`, `cron.add` and the
   approval resolves accept an `idempotency_key`; a retry with the same key gets
   the first answer instead of doing the work twice, also after a gateway
-  restart for messages. The web console and desktop app send one with every
-  message and resend it after a dropped connection (#3689).
+  restart for messages. The web console, the desktop app and the Python
+  clients (CLI, MCP bridge) send one with every message and resend it after a
+  dropped connection (#3689).
 - Gateway: `sessions.messages.subscribe` and `chat.history` report the running
   turn as `in_flight_run` (what it has written so far), or `null` when nothing
   runs; the web console and desktop app use it to restore or end the live
