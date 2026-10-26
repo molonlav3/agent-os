@@ -7,17 +7,6 @@ export class RpcError extends Error {
   details?: unknown
 }
 
-/**
- * What the console keeps of a refused handshake (the client emits the
- * RpcError itself as `_handshakeError`). A refused handshake is not retried
- * on its own (the same credentials would be refused again), so the console
- * needs to say so rather than "Connecting…".
- */
-export interface HandshakeError {
-  code: string
-  message: string
-}
-
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void }
 type Handler = (...args: unknown[]) => void
 

@@ -32,6 +32,7 @@ export const REQUIRED_METHODS: readonly string[] = [
   'channels.pairing.revoke',
   'channels.status',
   'chat.abort',
+  'chat.entry',
   'chat.history',
   'chat.send',
   'chat.suggestNext',

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   bindRuntimeSignals,
-  classifyHandshake,
+  handshakeFailure,
+  shutdownNotice,
   doctorErrorCount,
   normalizeDoctor,
   normalizeReady,
@@ -169,6 +170,17 @@ describe('bindRuntimeSignals', () => {
     off()
   })
 
+  it('records a shutdown notice and forgets it on the next connection', () => {
+    const rpc = new FakeRpc()
+    const off = bindRuntimeSignals(rpc, { now, fetchReady: null })
+    rpc.connect()
+    rpc.event('shutdown', { reason: 'restart:update', restart_expected_ms: 4000 })
+    expect(useRuntimeSignals.getState().shutdown).toMatchObject({ restartExpectedMs: 4000 })
+    rpc.emit('_state', 'connected')
+    expect(useRuntimeSignals.getState().shutdown).toBeNull()
+    off()
+  })
+
   it('counts failed attempts and resets them on a connection', () => {
     const rpc = new FakeRpc()
     const off = bindRuntimeSignals(rpc, { now, fetchReady: null })
@@ -190,7 +202,10 @@ describe('bindRuntimeSignals', () => {
   it('names a refused handshake and clears it on the next hello', () => {
     const rpc = new FakeRpc()
     const off = bindRuntimeSignals(rpc, { now, fetchReady: null })
-    rpc.emit('_handshake_error', { code: 'UNAUTHORIZED', message: 'Authentication failed' })
+    rpc.emit(
+      '_handshakeError',
+      Object.assign(new Error('Authentication failed'), { code: 'UNAUTHORIZED' }),
+    )
     expect(useRuntimeSignals.getState().handshake).toMatchObject({
       kind: 'auth_failed',
       code: 'UNAUTHORIZED',
@@ -263,12 +278,43 @@ describe('bindRuntimeSignals', () => {
 })
 
 describe('pure helpers', () => {
-  it('classifies refusals', () => {
-    expect(classifyHandshake({ code: 'UNAUTHORIZED', message: '' })).toBe('auth_failed')
+  it('reads the typed refusal: category code plus details.code', () => {
+    const typed = (code: string, details?: Record<string, unknown>, message = 'm') =>
+      Object.assign(new Error(message), { code, details })
+    expect(handshakeFailure(typed('UNAUTHORIZED'), 1).kind).toBe('auth_failed')
     expect(
-      classifyHandshake({ code: 'INVALID_REQUEST', message: 'Unsupported protocol version range' }),
+      handshakeFailure(
+        typed('UNAUTHORIZED', { code: 'AUTH_RATE_LIMITED', retry_after_ms: 30_000 }),
+        1,
+      ),
+    ).toMatchObject({ kind: 'auth_rate_limited', retryAfterMs: 30_000 })
+    expect(
+      handshakeFailure(
+        typed('INVALID_REQUEST', { code: 'PROTOCOL_MISMATCH', reload_required: true }),
+        1,
+      ),
+    ).toMatchObject({
+      kind: 'protocol_mismatch',
+      detailCode: 'PROTOCOL_MISMATCH',
+      reloadRequired: true,
+    })
+    // An older gateway without details: the message is the fallback.
+    expect(
+      handshakeFailure(typed('INVALID_REQUEST', undefined, 'Unsupported protocol version range'), 1)
+        .kind,
     ).toBe('protocol_mismatch')
-    expect(classifyHandshake({ code: 'INVALID_REQUEST', message: 'nope' })).toBe('refused')
+    expect(handshakeFailure(new Error('Handshake nonce mismatch'), 1).kind).toBe('refused')
+  })
+
+  it('reads a shutdown notice', () => {
+    expect(shutdownNotice({ reason: 'restart:safe', restart_expected_ms: 4000 }, 5)).toEqual({
+      reason: 'restart:safe',
+      restartExpectedMs: 4000,
+      at: 5,
+    })
+    expect(
+      shutdownNotice({ reason: 'shutdown', restart_expected_ms: null }, 5).restartExpectedMs,
+    ).toBe(null)
   })
 
   it('normalises doctor and ready payloads', () => {

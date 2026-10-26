@@ -35,6 +35,7 @@ export function useRuntimeTruth(host?: RuntimeTruthHost): RuntimeTruth {
       tickIntervalMs: s.tickIntervalMs,
       protocol: s.protocol,
       handshake: s.handshake,
+      shutdown: s.shutdown,
       doctor: s.doctor,
       doctorError: s.doctorError,
       ready: s.ready,

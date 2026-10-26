@@ -440,12 +440,6 @@ export function InboxPage() {
     document.title = t('inbox.documentTitle')
   }, [])
 
-  // The approval list is pushed by the always-running monitor; read it once
-  // on entry like the Approvals page does, so a stale list is not shown.
-  useEffect(() => {
-    void approvalMonitor.pollNow()
-  }, [])
-
   async function recheck(): Promise<void> {
     if (rechecking) return
     setRechecking(true)

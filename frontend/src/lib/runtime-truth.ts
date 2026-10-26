@@ -35,8 +35,10 @@ export type TruthReason =
   | 'disconnected'
   | 'never_connected'
   | 'auth_failed'
+  | 'auth_rate_limited'
   | 'protocol_mismatch'
   | 'handshake_refused'
+  | 'restarting'
   | 'stale'
   | 'doctor_errors'
   | 'safe_mode'
@@ -65,6 +67,7 @@ export type TruthSignals = Pick<
   | 'tickIntervalMs'
   | 'protocol'
   | 'handshake'
+  | 'shutdown'
   | 'doctor'
   | 'doctorError'
   | 'ready'
@@ -128,12 +131,11 @@ export function deriveRuntimeTruth(input: TruthInput, now: number): RuntimeTruth
   }
 
   if (rpcState !== 'connected' && signals.handshake) {
+    const kind = signals.handshake.kind
     const reason: TruthReason =
-      signals.handshake.kind === 'auth_failed'
-        ? 'auth_failed'
-        : signals.handshake.kind === 'protocol_mismatch'
-          ? 'protocol_mismatch'
-          : 'handshake_refused'
+      kind === 'auth_failed' || kind === 'auth_rate_limited' || kind === 'protocol_mismatch'
+        ? kind
+        : 'handshake_refused'
     return {
       ...base,
       state: 'blocked',
@@ -141,6 +143,25 @@ export function deriveRuntimeTruth(input: TruthInput, now: number): RuntimeTruth
       source: offlineSource,
       action: 'open_health',
       detail: signals.handshake.message || null,
+    }
+  }
+
+  // The gateway said it is restarting in place (`shutdown` with
+  // `restart_expected_ms`): it is on its way back, not gone. Past the time it
+  // gave (plus a minute of grace) this stops being believable.
+  const shutdown = signals.shutdown
+  if (
+    rpcState !== 'connected' &&
+    shutdown?.restartExpectedMs != null &&
+    now - shutdown.at <= shutdown.restartExpectedMs + 60_000
+  ) {
+    return {
+      ...base,
+      state: 'connecting',
+      reason: 'restarting',
+      source: offlineSource,
+      action: 'retry_connection',
+      detail: shutdown.reason || null,
     }
   }
 
@@ -282,6 +303,10 @@ export function truthReasonLabel(truth: RuntimeTruth): string {
       return t('shell.truthReasonNeverConnected')
     case 'auth_failed':
       return t('shell.truthReasonAuthFailed')
+    case 'auth_rate_limited':
+      return t('shell.truthReasonAuthRateLimited')
+    case 'restarting':
+      return t('shell.truthReasonRestarting')
     case 'protocol_mismatch':
       return t('shell.truthReasonProtocolMismatch')
     case 'handshake_refused':

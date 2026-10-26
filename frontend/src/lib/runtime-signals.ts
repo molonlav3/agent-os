@@ -24,7 +24,7 @@
 import { create } from 'zustand'
 import { apiUrl } from '@/lib/api-origin'
 import { authenticatedHeaders } from '@/lib/http-auth'
-import type { HandshakeError, RpcState } from '@/lib/ws-rpc'
+import type { RpcState } from '@/lib/ws-rpc'
 
 /** The protocol version this console speaks (the handshake asks for 3..3). */
 export const EXPECTED_PROTOCOL = 3
@@ -77,10 +77,31 @@ export interface ReadyProbe {
   fetchedAt: number
 }
 
-export type HandshakeKind = 'auth_failed' | 'protocol_mismatch' | 'refused'
+export type HandshakeKind = 'auth_failed' | 'auth_rate_limited' | 'protocol_mismatch' | 'refused'
 
-export interface HandshakeFailure extends HandshakeError {
+/**
+ * A refused handshake, from the RpcError the client emits as
+ * `_handshakeError`: the category `code` (UNAUTHORIZED, INVALID_REQUEST, …)
+ * and the specific reason in `details.code` (PROTOCOL_MISMATCH,
+ * AUTH_RATE_LIMITED, …).
+ */
+export interface HandshakeFailure {
   kind: HandshakeKind
+  code: string
+  detailCode: string
+  message: string
+  /** AUTH_RATE_LIMITED: when the gateway accepts another attempt. */
+  retryAfterMs: number | null
+  /** PROTOCOL_MISMATCH: the console is older than the gateway; a reload fixes it. */
+  reloadRequired: boolean
+  at: number
+}
+
+/** `shutdown {reason, restart_expected_ms}`: the gateway said it is going away. */
+export interface ShutdownNotice {
+  reason: string
+  /** In-place restart: when it expects to be back. Null for a terminal stop. */
+  restartExpectedMs: number | null
   at: number
 }
 
@@ -107,6 +128,8 @@ export interface RuntimeSignalsState {
   capabilities: string[] | null
   /** The last refused handshake; cleared by the next successful one. */
   handshake: HandshakeFailure | null
+  /** The last `shutdown` notice; cleared by the next connection. */
+  shutdown: ShutdownNotice | null
   doctor: DoctorSummary | null
   doctorError: string | null
   ready: ReadyProbe | null
@@ -136,6 +159,7 @@ const INITIAL = {
   methods: null,
   capabilities: null,
   handshake: null,
+  shutdown: null,
   doctor: null,
   doctorError: null,
   ready: null,
@@ -150,11 +174,48 @@ export const useRuntimeSignals = create<RuntimeSignalsState>((set) => ({
   reset: () => set({ ...INITIAL }),
 }))
 
-/** Name the refusal: bad credentials, an incompatible protocol, or neither. */
-export function classifyHandshake(err: HandshakeError): HandshakeKind {
-  if (err.code === 'UNAUTHORIZED' || /\bauth/i.test(err.message)) return 'auth_failed'
-  if (/protocol/i.test(err.message)) return 'protocol_mismatch'
-  return 'refused'
+/**
+ * Read the gateway's typed refusal (category `code` + `details.code`). The
+ * message is only a fallback for an older gateway that sends no details.
+ */
+export function handshakeFailure(raw: unknown, at: number): HandshakeFailure {
+  const err = (raw ?? {}) as { code?: unknown; message?: unknown; details?: unknown }
+  const details = (err.details && typeof err.details === 'object' ? err.details : {}) as Record<
+    string,
+    unknown
+  >
+  const code = typeof err.code === 'string' ? err.code : ''
+  const detailCode = typeof details.code === 'string' ? details.code : ''
+  const message = typeof err.message === 'string' ? err.message : ''
+  const retry = Number(details.retry_after_ms)
+  let kind: HandshakeKind = 'refused'
+  if (detailCode === 'PROTOCOL_MISMATCH' || (!detailCode && /protocol/i.test(message))) {
+    kind = 'protocol_mismatch'
+  } else if (detailCode === 'AUTH_RATE_LIMITED') {
+    kind = 'auth_rate_limited'
+  } else if (code === 'UNAUTHORIZED' || (!code && /\bauth/i.test(message))) {
+    kind = 'auth_failed'
+  }
+  return {
+    kind,
+    code,
+    detailCode,
+    message,
+    retryAfterMs: Number.isFinite(retry) && retry > 0 ? retry : null,
+    reloadRequired: details.reload_required === true,
+    at,
+  }
+}
+
+/** Read a `shutdown` event payload. */
+export function shutdownNotice(raw: unknown, at: number): ShutdownNotice {
+  const p = (raw ?? {}) as { reason?: unknown; restart_expected_ms?: unknown }
+  const ms = Number(p.restart_expected_ms)
+  return {
+    reason: typeof p.reason === 'string' ? p.reason : '',
+    restartExpectedMs: p.restart_expected_ms != null && Number.isFinite(ms) && ms > 0 ? ms : null,
+    at,
+  }
 }
 
 function numberRecord(raw: unknown): Record<string, number> {
@@ -312,6 +373,7 @@ export function bindRuntimeSignals(
         connectedAt: now(),
         lastFrameAt: now(),
         handshake: null,
+        shutdown: null,
       })
     }),
     rpc.on('_hello', (raw) => {
@@ -335,13 +397,8 @@ export function bindRuntimeSignals(
       ticks = 0
       refresh()
     }),
-    rpc.on('_handshake_error', (raw) => {
-      const err = (raw ?? {}) as HandshakeError
-      const failure: HandshakeError = {
-        code: typeof err.code === 'string' ? err.code : '',
-        message: typeof err.message === 'string' ? err.message : '',
-      }
-      store.setState({ handshake: { ...failure, kind: classifyHandshake(failure), at: now() } })
+    rpc.on('_handshakeError', (raw) => {
+      store.setState({ handshake: handshakeFailure(raw, now()) })
     }),
     rpc.on('_state_version', (raw) => {
       const next = numberRecord(raw)
@@ -358,6 +415,9 @@ export function bindRuntimeSignals(
       } else if (event === 'health') {
         refreshDoctor()
       }
+    }),
+    rpc.on('shutdown', (payload) => {
+      store.setState({ shutdown: shutdownNotice(payload, now()) })
     }),
   ]
 

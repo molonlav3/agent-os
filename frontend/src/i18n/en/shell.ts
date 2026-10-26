@@ -172,6 +172,9 @@ export const shell = defineNamespace('shell', {
   truthReasonDisconnected: 'Lost the gateway connection. What you see is the last snapshot.',
   truthReasonNeverConnected: 'The gateway has not answered yet.',
   truthReasonAuthFailed: 'The gateway refused this console’s credentials.',
+  truthReasonAuthRateLimited:
+    'Too many failed sign-in attempts; the gateway is refusing this console for now.',
+  truthReasonRestarting: 'The gateway is restarting and said it would be back shortly.',
   truthReasonProtocolMismatch: 'The gateway speaks a different protocol version than this console.',
   truthReasonHandshakeRefused: 'The gateway refused the connection.',
   truthReasonStale: 'No frame from the gateway for {age}. The view may be stale.',
@@ -198,6 +201,13 @@ export const shell = defineNamespace('shell', {
   issueAuthFailedDetail:
     'The handshake was refused ({message}). Check the gateway token, then retry.',
   issueProtocolMismatchTitle: 'Console and gateway protocol differ',
+  issueProtocolMismatchReload:
+    'This console is older than the gateway. Reload the page to load the matching one.',
+  issueAuthRateLimitedTitle: 'Gateway is refusing sign-in attempts',
+  issueAuthRateLimitedDetail:
+    'Too many failed attempts with a wrong token. The gateway accepts another in {age}; check the token first.',
+  issueAuthRateLimitedDetailBare:
+    'Too many failed attempts with a wrong token. Check the token, then retry in a while.',
   issueProtocolMismatchDetail:
     'The gateway answered “{message}”. Upgrade whichever side is older, then retry.',
   issueSafeModeTitle: 'Gateway in safe mode',

@@ -6,7 +6,25 @@ import {
   useDismissedIssues,
   type IssueInput,
 } from './runtime-issues'
-import type { DoctorFinding, DoctorSummary } from './runtime-signals'
+import type { DoctorFinding, DoctorSummary, HandshakeFailure } from './runtime-signals'
+
+function refusal(
+  kind: HandshakeFailure['kind'],
+  code: string,
+  message: string,
+  extra: Partial<HandshakeFailure> = {},
+): HandshakeFailure {
+  return {
+    kind,
+    code,
+    detailCode: '',
+    message,
+    retryAfterMs: null,
+    reloadRequired: false,
+    at: 1,
+    ...extra,
+  }
+}
 
 function doctor(findings: DoctorFinding[]): DoctorSummary {
   return { status: 'degraded', ready: true, counts: {}, findings, fetchedAt: 1 }
@@ -136,12 +154,7 @@ describe('deriveRuntimeIssues', () => {
       input(
         { rpcState: 'disconnected' },
         {
-          handshake: {
-            kind: 'auth_failed',
-            code: 'UNAUTHORIZED',
-            message: 'Authentication failed',
-            at: 1,
-          },
+          handshake: refusal('auth_failed', 'UNAUTHORIZED', 'Authentication failed'),
         },
       ),
     )
@@ -151,16 +164,82 @@ describe('deriveRuntimeIssues', () => {
       input(
         { rpcState: 'disconnected' },
         {
-          handshake: {
-            kind: 'protocol_mismatch',
-            code: 'INVALID_REQUEST',
-            message: 'Unsupported protocol version range',
-            at: 1,
-          },
+          handshake: refusal(
+            'protocol_mismatch',
+            'INVALID_REQUEST',
+            'Unsupported protocol version range',
+          ),
         },
       ),
     )
     expect(proto.map((i) => i.kind)).toEqual(['protocol_mismatch'])
+  })
+
+  it('maps the typed refusals: rate-limited sign-in, and a reload for an older console', () => {
+    const limited = deriveRuntimeIssues(
+      input(
+        { rpcState: 'disconnected' },
+        {
+          handshake: refusal('auth_rate_limited', 'UNAUTHORIZED', 'Too many', {
+            detailCode: 'AUTH_RATE_LIMITED',
+            retryAfterMs: 45_000,
+          }),
+        },
+      ),
+    )
+    expect(limited.map((i) => [i.kind, i.id])).toEqual([
+      ['rate_limited', 'issue:rate_limited:auth'],
+    ])
+    expect(limited[0]!.detail).toContain('45 s')
+    expect(limited[0]!.actions.map((a) => a.kind)).toEqual([
+      'open_settings',
+      'retry_connection',
+      'dismiss',
+    ])
+    const reload = deriveRuntimeIssues(
+      input(
+        { rpcState: 'disconnected' },
+        {
+          handshake: refusal('protocol_mismatch', 'INVALID_REQUEST', 'x', {
+            detailCode: 'PROTOCOL_MISMATCH',
+            reloadRequired: true,
+          }),
+        },
+      ),
+    )
+    expect(reload[0]!.detail).toMatch(/Reload the page/)
+  })
+
+  it('lists safe mode once when /ready and the doctor both report it', () => {
+    const issues = deriveRuntimeIssues(
+      input(
+        {},
+        {
+          ready: { ready: false, state: 'safe_mode', failing: ['safe_mode'], fetchedAt: 1 },
+          doctor: doctor([
+            {
+              id: 'gateway.safe_mode',
+              severity: 'warn',
+              title: 'Gateway is in safe mode',
+              detail: '4 unclean gateway boots in the last 300s',
+            },
+          ]),
+        },
+      ),
+    )
+    expect(issues.filter((i) => i.kind === 'safe_mode').map((i) => i.title)).toEqual([
+      'Gateway is in safe mode',
+    ])
+    // Without the doctor's word, /ready alone still raises it.
+    const bare = deriveRuntimeIssues(
+      input(
+        {},
+        { ready: { ready: false, state: 'safe_mode', failing: ['safe_mode'], fetchedAt: 1 } },
+      ),
+    )
+    expect(bare.map((i) => [i.kind, i.detail])).toEqual([
+      ['safe_mode', 'The gateway started in safe mode; some subsystems are off.'],
+    ])
   })
 
   it('reports safe mode from /ready and a failed update', () => {

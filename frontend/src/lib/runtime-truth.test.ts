@@ -10,7 +10,7 @@ import {
   type TruthInput,
   type TruthSignals,
 } from './runtime-truth'
-import type { DoctorSummary } from './runtime-signals'
+import type { DoctorSummary, HandshakeFailure } from './runtime-signals'
 
 const NOW = 10_000_000
 
@@ -22,6 +22,10 @@ const clean: DoctorSummary = {
   fetchedAt: NOW,
 }
 
+function refusal(kind: HandshakeFailure['kind'], code: string, message: string): HandshakeFailure {
+  return { kind, code, detailCode: '', message, retryAfterMs: null, reloadRequired: false, at: NOW }
+}
+
 function signals(over: Partial<TruthSignals> = {}): TruthSignals {
   return {
     everConnected: true,
@@ -29,6 +33,7 @@ function signals(over: Partial<TruthSignals> = {}): TruthSignals {
     tickIntervalMs: 30_000,
     protocol: 3,
     handshake: null,
+    shutdown: null,
     doctor: clean,
     doctorError: null,
     ready: null,
@@ -114,12 +119,7 @@ describe('deriveRuntimeTruth', () => {
     const truth = derive(
       { rpcState: 'disconnected' },
       {
-        handshake: {
-          kind: 'auth_failed',
-          code: 'UNAUTHORIZED',
-          message: 'Authentication failed',
-          at: NOW,
-        },
+        handshake: refusal('auth_failed', 'UNAUTHORIZED', 'Authentication failed'),
       },
     )
     expect(truth).toMatchObject({ state: 'blocked', reason: 'auth_failed', action: 'open_health' })
@@ -132,7 +132,7 @@ describe('deriveRuntimeTruth', () => {
       derive(
         { rpcState: 'disconnected' },
         {
-          handshake: { kind: 'protocol_mismatch', code: 'INVALID_REQUEST', message: 'x', at: NOW },
+          handshake: refusal('protocol_mismatch', 'INVALID_REQUEST', 'x'),
         },
       ).reason,
     ).toBe('protocol_mismatch')
@@ -140,6 +140,34 @@ describe('deriveRuntimeTruth', () => {
       state: 'blocked',
       reason: 'protocol_mismatch',
     })
+  })
+
+  it('is Blocked by a rate-limited sign-in, with the server words', () => {
+    const truth = derive(
+      { rpcState: 'disconnected' },
+      { handshake: refusal('auth_rate_limited', 'UNAUTHORIZED', 'Too many failed attempts') },
+    )
+    expect(truth).toMatchObject({ state: 'blocked', reason: 'auth_rate_limited' })
+    expect(truthReasonLabel(truth)).toMatch(/Too many failed sign-in attempts/)
+  })
+
+  it('reads an announced in-place restart as Connecting, not Offline', () => {
+    const shutdown = { reason: 'restart:update', restartExpectedMs: 4000, at: NOW - 2000 }
+    const truth = derive({ rpcState: 'disconnected' }, { shutdown })
+    expect(truth).toMatchObject({
+      state: 'connecting',
+      reason: 'restarting',
+      detail: 'restart:update',
+    })
+    // Long past the time it gave, it is just offline again.
+    expect(
+      derive({ rpcState: 'disconnected' }, { shutdown: { ...shutdown, at: NOW - 120_000 } }).state,
+    ).toBe('offline')
+    // A terminal stop (no restart time) is offline.
+    expect(
+      derive({ rpcState: 'disconnected' }, { shutdown: { ...shutdown, restartExpectedMs: null } })
+        .state,
+    ).toBe('offline')
   })
 
   it('lets the desktop see the process: stopped means Start gateway', () => {

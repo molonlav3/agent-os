@@ -103,6 +103,14 @@ export function classifyFinding(finding: DoctorFinding): IssueKind {
   return 'doctor_warning'
 }
 
+/** "45 s", "3 min" for a retry-after hint. */
+function formatSeconds(ms: number): string {
+  const seconds = Math.max(1, Math.round(ms / 1000))
+  return seconds < 60
+    ? t('shell.ageSeconds', { seconds })
+    : t('shell.ageMinutes', { minutes: Math.round(seconds / 60) })
+}
+
 function action(kind: IssueActionKind, extra: Partial<IssueAction> = {}): IssueAction {
   const labels: Record<IssueActionKind, string> = {
     restart_gateway: t('shell.issueActionRestart'),
@@ -206,7 +214,24 @@ export function deriveRuntimeIssues(input: IssueInput): RuntimeIssue[] {
   const handshake = signals.handshake
 
   if (input.rpcState !== 'connected') {
-    if (handshake?.kind === 'auth_failed') {
+    if (handshake?.kind === 'auth_rate_limited') {
+      issues.push({
+        ...synthetic(
+          'rate_limited',
+          t('shell.issueAuthRateLimitedTitle'),
+          handshake.retryAfterMs
+            ? t('shell.issueAuthRateLimitedDetail', { age: formatSeconds(handshake.retryAfterMs) })
+            : t('shell.issueAuthRateLimitedDetailBare'),
+          host,
+        ),
+        id: 'issue:rate_limited:auth',
+        actions: [
+          action('open_settings', { settings: 'connection' }),
+          action('retry_connection'),
+          action('dismiss'),
+        ],
+      })
+    } else if (handshake?.kind === 'auth_failed') {
       issues.push(
         synthetic(
           'auth_failed',
@@ -220,7 +245,9 @@ export function deriveRuntimeIssues(input: IssueInput): RuntimeIssue[] {
         synthetic(
           'protocol_mismatch',
           t('shell.issueProtocolMismatchTitle'),
-          t('shell.issueProtocolMismatchDetail', { message: handshake.message }),
+          handshake.reloadRequired
+            ? t('shell.issueProtocolMismatchReload')
+            : t('shell.issueProtocolMismatchDetail', { message: handshake.message }),
           host,
         ),
       )
@@ -238,25 +265,29 @@ export function deriveRuntimeIssues(input: IssueInput): RuntimeIssue[] {
       )
     }
   } else {
-    const ready = signals.ready
-    if (ready?.state === 'safe_mode') {
-      issues.push(
-        synthetic(
-          'safe_mode',
-          t('shell.issueSafeModeTitle'),
-          ready.failing.length
-            ? t('shell.issueSafeModeDetail', { failing: ready.failing.join(', ') })
-            : t('shell.issueSafeModeDetailBare'),
-          host,
-        ),
-      )
-    }
-    const seen = new Set(issues.map((i) => i.id))
+    const seen = new Set<string>()
     for (const finding of signals.doctor?.findings ?? []) {
       const issue = issueFromFinding(finding, host)
       if (!issue || seen.has(issue.id)) continue
       seen.add(issue.id)
       issues.push(issue)
+    }
+    // /ready says safe mode; the doctor usually says it too, in more words
+    // (why, and when it clears). Only when it does not is a synthetic issue
+    // added, so the inbox never lists safe mode twice.
+    const ready = signals.ready
+    if (ready?.state === 'safe_mode' && !issues.some((i) => i.kind === 'safe_mode')) {
+      const failing = ready.failing.filter((f) => f !== 'safe_mode')
+      issues.unshift(
+        synthetic(
+          'safe_mode',
+          t('shell.issueSafeModeTitle'),
+          failing.length
+            ? t('shell.issueSafeModeDetail', { failing: failing.join(', ') })
+            : t('shell.issueSafeModeDetailBare'),
+          host,
+        ),
+      )
     }
   }
 
