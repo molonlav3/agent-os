@@ -764,17 +764,19 @@ class ConnectionRegistry:
                     pass
 
     async def broadcast_control(self, event: str, payload: Any = None) -> None:
-        """Send to the operator's Control connections only.
+        """Send to admitted Control connections, except an agent's own shell.
 
-        Channel and node connections, and Control connections an agent holds
-        (``access.agent``), never see these frames: approval prompts are the
-        operator's to answer.
+        Channel and node connections never see these frames, nor a connection
+        that presented an agent token (the CLI an agent turn spawned). The
+        web console presents no operator secret, so it counts as *unbound*
+        under the agent surface's fail-safe rules; it still gets them, as it
+        can read the same list from ``GET /api/approvals``.
         """
         for conn in self.all():
             access = conn.access
             if not access.admitted or access.surface != ConnectionSurface.CONTROL:
                 continue
-            if access.agent is not None:
+            if access.agent is not None and access.agent.via == "token":
                 continue
             try:
                 await conn.send_event(event, payload)

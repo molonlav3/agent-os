@@ -218,7 +218,7 @@ class _FakeConn:
         self.events.append(event)
 
 
-async def test_only_operator_control_connections_receive_approval_frames() -> None:
+async def test_control_connections_receive_approval_frames_but_agent_shells_do_not() -> None:
     def access(surface: ConnectionSurface, *, admitted: bool = True, agent: Any = None):
         return AccessContext(
             surface=surface, admitted=admitted, credential_verified=True, agent=agent
@@ -227,6 +227,10 @@ async def test_only_operator_control_connections_receive_approval_frames() -> No
     registry = ConnectionRegistry()
     conns = {
         "operator": _FakeConn("operator", access(ConnectionSurface.CONTROL)),
+        # The web console presents no operator secret: bound "unbound".
+        "console": _FakeConn(
+            "console", access(ConnectionSurface.CONTROL, agent=AgentBinding(via="unbound"))
+        ),
         "agent": _FakeConn(
             "agent",
             access(
@@ -245,6 +249,7 @@ async def test_only_operator_control_connections_receive_approval_frames() -> No
 
     assert {name: conn.events for name, conn in conns.items()} == {
         "operator": [APPROVAL_REQUESTED],
+        "console": [APPROVAL_REQUESTED],
         "agent": [],
         "channel": [],
         "node": [],

@@ -132,9 +132,9 @@ bucket, because consoles read it on every reconnect, window focus and resolve
 `AGENTOS_RATE_WINDOW_SECONDS`, i.e. 300/min), which clears several open tabs.
 Raise it only if you run more consoles than that against one gateway.
 
-Queue changes are also pushed over the WebSocket to the operator's Control
-connections (never to channel, node or agent-held connections), for every
-namespace (`exec`, `plugin`, `acp`, `acp_elicitation`):
+Queue changes are also pushed over the WebSocket to Control connections (never
+to channel or node connections, nor to a connection holding an agent token),
+for every namespace (`exec`, `plugin`, `acp`, `acp_elicitation`):
 
 - `approval.requested` — `{id, namespace, session_key, created_at, expires_at,
   summary, tool, command, approval}` (fields that do not apply are omitted;
