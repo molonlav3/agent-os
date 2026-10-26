@@ -20,6 +20,7 @@ from starlette.websockets import WebSocket
 from agentos import __version__
 from agentos.application.approval_rpc import approval_display_title
 from agentos.gateway.approval_queue import get_approval_queue
+from agentos.gateway.auth_rate_limit import AuthGuard
 from agentos.gateway.config import GatewayConfig
 from agentos.gateway.control_ui import create_control_ui_routes
 from agentos.gateway.middleware import (
@@ -136,6 +137,9 @@ def create_gateway_app(
         diagnostics_state = DiagnosticsState.from_config(config)
 
     dispatcher = get_dispatcher()
+    # Failed-auth limiter and pre-auth socket budget, shared by the HTTP
+    # middleware and the WebSocket handshake of this app.
+    auth_guard = AuthGuard.from_config(config)
     _rpc_status_code = rpc_status_code
 
     # ── HTTP endpoint handlers ───────────────────────────────────────────────
@@ -571,6 +575,7 @@ def create_gateway_app(
             memory_stores=memory_stores,
             memory_retrievers=memory_retrievers,
             bind_is_loopback=bind_is_loopback,
+            auth_guard=auth_guard,
         )
 
     # ── Routes ───────────────────────────────────────────────────────────────
@@ -643,6 +648,7 @@ def create_gateway_app(
             AuthMiddleware,
             config=config,
             control_ui_base_path=config.control_ui.base_path,
+            auth_guard=auth_guard,
         ),
     ]
 
@@ -674,6 +680,7 @@ def create_gateway_app(
         lifespan=_lifespan,
     )
     app.state.diagnostics_state = diagnostics_state
+    app.state.auth_guard = auth_guard
 
     # Bridge upload endpoint: self-hosted multipart sink that
     # returns an opaque file_uuid the chat.send validator can resolve.

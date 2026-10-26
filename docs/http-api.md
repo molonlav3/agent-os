@@ -21,10 +21,11 @@ http://127.0.0.1:18791
 `auth.mode = "none"`, and a loopback peer is admitted as a Control connection,
 so `curl http://127.0.0.1:18791/api/...` works with no credentials.
 
-A token is only enforced when `auth.mode = "token"`. That mode is required
-before the gateway will bind to a public address (`0.0.0.0` / LAN): the startup
-guard refuses to serve an unauthenticated public bind, and a token is
-auto-generated when unset. See [`gateway.md`](gateway.md) for bind safety.
+A token is only enforced when `auth.mode = "token"`. A public address
+(`0.0.0.0` / LAN) needs that mode or `trusted-proxy`: the startup guard
+refuses to serve an unauthenticated public bind, and a token is
+auto-generated when unset. See [`gateway.md`](gateway.md) for bind safety and
+[`remote-access.md`](remote-access.md) for tunnels and reverse proxies.
 
 When auth is enabled, send the token via HTTP headers (checked in order):
 
@@ -39,6 +40,37 @@ The gateway implements exactly three auth modes — `none`, `token`, and
 `trusted-proxy`. Any other value (including the never-implemented `"password"`,
 or a typo like `"tokenn"`) is refused when the config loads rather than silently
 admitting every request; the startup error names the supported modes.
+
+`trusted-proxy` admits a request only when the transport peer is listed in
+`auth.trusted_proxy` (IP literals or CIDR blocks such as `10.0.0.0/8`,
+comma-separated). `X-Forwarded-For` is read only from such a peer and walked
+right to left, skipping trusted hops; an address naming the gateway host
+itself is ignored as spoofed.
+
+### Failed-auth rate limiting
+
+A *wrong* token counts against a per-client budget shared by HTTP and the
+WebSocket: ten failures within 60 seconds lock that client out for five
+minutes. A locked-out client gets `429` with `Retry-After` (seconds) and
+
+```json
+{"error": "Too many failed authentication attempts", "code": "RATE_LIMITED",
+ "details": {"code": "AUTH_RATE_LIMITED", "retry_after_ms": 299000}}
+```
+
+even when it presents the right token. A request with no token is a plain
+`401` and never counts. A loopback client without an `Origin` header is never
+locked out (each failure is answered after a delay growing from 250 ms to
+5 s); a browser request is keyed by its `Origin` and never exempt. Settings:
+
+```toml
+[auth.rate_limit]
+enabled = true
+max_failures = 10
+window_seconds = 60
+lockout_seconds = 300
+exempt_loopback = true
+```
 
 `/health` and `/ready` never require a token. Cross-origin browser requests are
 governed by CORS configuration regardless of auth mode.

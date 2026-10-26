@@ -16,8 +16,9 @@ from pydantic import ValidationError
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from agentos import __version__
-from agentos.gateway.access import ConnectionSurface
+from agentos.gateway.access import ConnectionSurface, resolve_client_ip
 from agentos.gateway.auth import AccessContext
+from agentos.gateway.auth_rate_limit import TOKEN_SCOPE, AuthGuard
 from agentos.gateway.config import GatewayConfig
 from agentos.gateway.protocol import (
     CAPABILITIES,
@@ -837,6 +838,7 @@ async def handle_ws_connection(
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
     bind_is_loopback: bool | None = None,
+    auth_guard: AuthGuard | None = None,
 ) -> None:
     """Main WebSocket connection handler."""
     conn_id = str(uuid.uuid4())
@@ -856,7 +858,34 @@ async def handle_ws_connection(
         return
 
     peer_ip = ws.client.host if ws.client is not None else None
-    hello = await _handshake(conn, config, dispatcher, peer_ip=peer_ip)
+    client_ip = resolve_client_ip(
+        peer_ip, ws.headers.get("x-forwarded-for"), config.auth.trusted_proxy
+    )
+    # Pre-auth budget: a peer may hold only so many sockets that have not
+    # finished the handshake. Refused before accept(): no timer, no buffer.
+    preauth = auth_guard.preauth if auth_guard is not None else None
+    if preauth is not None and not preauth.try_acquire(client_ip):
+        log.warning(
+            "ws.preauth_budget_exceeded",
+            conn_id=conn_id,
+            client_ip=client_ip,
+            limit=preauth.limit,
+        )
+        await ws.close(code=1013)  # try again later
+        return
+    try:
+        hello = await _handshake(
+            conn,
+            config,
+            dispatcher,
+            peer_ip=peer_ip,
+            client_ip=client_ip,
+            origin=origin,
+            auth_guard=auth_guard,
+        )
+    finally:
+        if preauth is not None:
+            preauth.release(client_ip)
     if hello is None:
         return
 
@@ -937,6 +966,9 @@ async def _handshake(
     dispatcher: RpcDispatcher,
     *,
     peer_ip: str | None,
+    client_ip: str,
+    origin: str | None,
+    auth_guard: AuthGuard | None,
 ) -> HelloOk | None:
     """``connect.challenge`` → ``connect`` → ``hello-ok``; ``None`` when refused.
 
@@ -1050,10 +1082,40 @@ async def _handshake(
         return None
     conn.client_info = params.client
 
-    # Step 4: Resolve binary admission and the fixed protocol surface.
+    # Step 4: Resolve binary admission and the fixed protocol surface. A
+    # presented gateway token counts against the failed-auth budget; a
+    # missing one never does.
     from agentos.gateway.auth import resolve_auth
 
     auth_params = params.auth or {}
+    limiter = auth_guard.limiter if auth_guard is not None else None
+    presented = config.auth.mode == "token" and bool(auth_params.get("token"))
+    if limiter is not None and presented:
+        decision = limiter.check(client_ip, TOKEN_SCOPE, origin=origin)
+        if not decision.allowed:
+            log.warning(
+                "auth.rate_limited",
+                conn_id=conn.conn_id,
+                client_ip=client_ip,
+                origin=origin,
+                retry_after_ms=decision.retry_after_ms,
+            )
+            await conn.send_res(
+                make_error_res(
+                    req_id,
+                    ErrorCode.UNAUTHORIZED,
+                    "Too many failed authentication attempts; retry later",
+                    retryable=True,
+                    details={
+                        "code": ErrorDetailCode.AUTH_RATE_LIMITED.value,
+                        "retry_after_ms": decision.retry_after_ms,
+                    },
+                    retry_after_ms=decision.retry_after_ms,
+                )
+            )
+            await conn.close(code=WS_CLOSE_POLICY_VIOLATION)
+            return None
+
     access = resolve_auth(
         config,
         auth_params=auth_params,
@@ -1061,9 +1123,15 @@ async def _handshake(
         peer_ip=peer_ip,
     )
     if access is None:
+        if limiter is not None and presented:
+            decision = limiter.record_failure(client_ip, TOKEN_SCOPE, origin=origin)
+            if decision.delay_s > 0:
+                await asyncio.sleep(decision.delay_s)
         await conn.send_res(make_error_res(req_id, ErrorCode.UNAUTHORIZED, "Authentication failed"))
         await conn.close(code=WS_CLOSE_POLICY_VIOLATION)
         return None
+    if limiter is not None and presented:
+        limiter.record_success(client_ip, TOKEN_SCOPE, origin=origin)
     # An agent's connection is marked as such for its whole life: the trading
     # handlers read this instead of trusting an ``initiator`` param.
     from agentos.gateway.agent_surface import get_agent_surface

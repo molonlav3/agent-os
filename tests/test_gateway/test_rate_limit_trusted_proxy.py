@@ -121,7 +121,10 @@ def test_trusted_proxy_honors_x_forwarded_for() -> None:
 
 
 def test_trusted_proxy_x_forwarded_for_multiple_ips() -> None:
-    """X-Forwarded-For with multiple IPs takes the first (client) IP."""
+    """X-Forwarded-For is walked right to left: trusted hops are skipped and
+    the first untrusted one is the client. With only 10.0.0.1 trusted, the
+    10.0.0.5 hop it received the request from is the client; the left-most
+    value is whatever the client wrote and is never taken on faith."""
     app, mw_holder = _create_app(
         max_requests=1,
         window_seconds=60,
@@ -136,8 +139,41 @@ def test_trusted_proxy_x_forwarded_for_multiple_ips() -> None:
         assert resp.status_code == 200
 
     mw = mw_holder[0]
-    assert "203.0.113.99" in _tracked_ips(mw)
+    assert _tracked_ips(mw) == ["10.0.0.5"]
     assert len(mw._windows) == 1
+
+
+def test_trusted_proxy_cidr_chain_reaches_the_real_client() -> None:
+    """A CIDR entry trusts every hop in the block, so a chain of internal
+    proxies resolves to the external client."""
+    app, mw_holder = _create_app(
+        max_requests=1,
+        window_seconds=60,
+        trusted_proxy="10.0.0.0/24",
+    )
+
+    with TestClient(app, client=("10.0.0.1", 50000)) as client:
+        resp = client.get(
+            "/api/test",
+            headers={"x-forwarded-for": "203.0.113.99, 10.0.0.5, 10.0.0.1"},
+        )
+        assert resp.status_code == 200
+
+    assert _tracked_ips(mw_holder[0]) == ["203.0.113.99"]
+
+
+def test_client_written_left_most_entry_cannot_rotate_the_bucket() -> None:
+    """A client behind a trusted proxy that appends cannot dodge its bucket by
+    rotating the X-Forwarded-For value it sends itself."""
+    app, mw_holder = _create_app(max_requests=1, window_seconds=60, trusted_proxy="10.0.0.1")
+
+    with TestClient(app, client=("10.0.0.1", 50000)) as client:
+        first = client.get("/api/test", headers={"x-forwarded-for": "1.1.1.1, 198.51.100.7"})
+        second = client.get("/api/test", headers={"x-forwarded-for": "2.2.2.2, 198.51.100.7"})
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert _tracked_ips(mw_holder[0]) == ["198.51.100.7"]
 
 
 def test_trusted_proxy_missing_or_blank_forwarded_for_falls_back_to_peer() -> None:

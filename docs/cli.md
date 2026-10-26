@@ -1763,7 +1763,12 @@ agentos migrate openclaw --skill-conflict rename --overwrite --json
 agentos reset --key <session-key>
 ```
 
-`agentos doctor` exits 1 when the install is not ready. `--deep` (the
+`agentos doctor` exits 1 when the install is not ready. Its `gateway`
+findings cover network exposure: a non-loopback bind without auth, wildcard
+`control_ui.allowed_origins`, CORS `*` with credentials off loopback,
+`trusted-proxy` mode without `auth.trusted_proxy`, failed-auth rate limiting
+off, and a token shorter than 24 characters (see
+[`remote-access.md`](remote-access.md)). `--deep` (the
 default) includes deeper memory diagnostics for `--agent` (default `main`);
 `--quick` runs the shallow checks only. `--gateway` (or
 `AGENTOS_GATEWAY_URL`) picks the gateway to ask, and `--config` names the

@@ -63,8 +63,30 @@ class ContextOverflowPolicy(StrEnum):
 # never-implemented ``"password"``, or a typo like ``"tokenn"`` — is rejected at
 # validation time so a mode can never silently no-op into an unauthenticated
 # gateway (#352). Enforced end-to-end is a stricter bar still: see
-# ``_mode_protects_public_bind``, which admits only ``token`` on a public bind.
+# ``_mode_protects_public_bind``, which admits ``token`` and ``trusted-proxy``
+# on a public bind.
 SUPPORTED_AUTH_MODES: tuple[str, ...] = ("none", "token", "trusted-proxy")
+
+
+class AuthRateLimitConfig(BaseSettings):
+    """``[auth.rate_limit]``: failed-credential throttling (``gateway.auth_rate_limit``).
+
+    ``max_failures`` wrong credentials inside ``window_seconds`` from one
+    client (a browser attempt: one ``Origin``) lock it out for
+    ``lockout_seconds``. A missing credential never counts. With
+    ``exempt_loopback`` a loopback peer without ``Origin`` is never locked
+    out; its failures are answered after a delay growing from 250 ms to 5 s.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AGENTOS_AUTH_RATE_LIMIT_", validate_assignment=True
+    )
+
+    enabled: bool = True
+    max_failures: int = Field(default=10, ge=1)
+    window_seconds: float = Field(default=60.0, gt=0)
+    lockout_seconds: float = Field(default=300.0, ge=0)
+    exempt_loopback: bool = True
 
 
 class AuthConfig(BaseSettings):
@@ -76,7 +98,9 @@ class AuthConfig(BaseSettings):
     # config that carries the value still loads.
     password: str | None = None
     mode: str = "none"  # none | token | trusted-proxy
+    # Comma-separated proxy addresses: IP literals or CIDR blocks.
     trusted_proxy: str | None = None
+    rate_limit: AuthRateLimitConfig = Field(default_factory=AuthRateLimitConfig)
 
     @field_validator("mode")
     @classmethod
@@ -2983,21 +3007,21 @@ def is_public_bind(host: str) -> bool:
 
 
 def _mode_protects_public_bind(auth: AuthConfig) -> bool:
-    """True if ``auth.mode`` actually enforces credentials end-to-end.
+    """True if ``auth.mode`` admits a non-loopback peer only on proof.
 
-    Only ``token`` qualifies today — it is validated in ``AuthMiddleware`` and
-    has a resolver in ``resolve_auth``. Every other mode is treated as
-    unauthenticated for the public-bind guard:
-
-    * ``password`` is refused outright by ``AuthConfig`` — it was advertised
-      but never implemented (#352).
-    * ``trusted-proxy`` only string-matches the client-supplied
-      ``X-Forwarded-For`` header (trivially spoofable) and has no resolver in
-      ``resolve_auth``, so it is not enforced end-to-end. Re-admit it here
-      only once it validates the real transport peer IP and ships a resolver.
-    * an unknown/typo mode has no resolver at all.
+    * ``token`` — every request and WebSocket handshake must present the
+      gateway token (``AuthMiddleware``, ``resolve_auth``).
+    * ``trusted-proxy`` — admission requires the *transport* peer to be one
+      of ``auth.trusted_proxy`` (``AuthMiddleware`` and ``resolve_auth``
+      both check the real peer address, never a header), so only the
+      configured proxy can reach the gateway; the proxy authenticates the
+      user. With no proxy configured nothing is admitted, which is closed,
+      not open — ``doctor`` reports it as ``gateway.trusted_proxy_unset``.
+    * ``none`` admits any loopback peer and nothing else, so it never
+      protects a public bind; ``password`` and typos are refused by
+      ``AuthConfig`` before they get here (#352).
     """
-    return auth.mode == "token"
+    return auth.mode in ("token", "trusted-proxy")
 
 
 def enforce_public_bind_auth_guard(config: GatewayConfig) -> None:
@@ -3015,7 +3039,8 @@ def enforce_public_bind_auth_guard(config: GatewayConfig) -> None:
         "Anyone who can reach this port would get full access to chat, sessions, "
         "and config with your provider credentials. Fix one of these: "
         '(1) enable enforced auth — set auth.mode="token" in agentos.toml '
-        "(a token is auto-generated at startup when unset); "
+        "(a token is auto-generated at startup when unset), or "
+        'auth.mode="trusted-proxy" with auth.trusted_proxy naming your reverse proxy; '
         '(2) bind loopback — remove the --listen/--bind flag or set host = "127.0.0.1".'
     )
 

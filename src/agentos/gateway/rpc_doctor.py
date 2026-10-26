@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any, cast
 
+from agentos.gateway.access import is_loopback_bind
 from agentos.gateway.config import GatewayConfig
 from agentos.gateway.rpc import RpcContext, get_dispatcher
 from agentos.gateway.rpc_channels import _handle_channels_status
@@ -27,6 +28,7 @@ from agentos.health.evaluator import (
     evaluate_sandbox,
     evaluate_search,
 )
+from agentos.health.gateway_security import evaluate_gateway_security
 from agentos.health.model import FixStep, HealthFinding, HealthSeverity, build_report
 from agentos.health.recovery_commands import command_with_config as _command_with_config
 from agentos.sandbox.status import status_payload as _sandbox_status_payload
@@ -532,6 +534,37 @@ def _control_ui_payload(ctx: RpcContext) -> dict[str, Any]:
     }
 
 
+def gateway_security_payload(config: Any) -> dict[str, Any]:
+    """What the evaluator needs, read from a live ``GatewayConfig``.
+
+    Never carries a secret: the token is reduced to its length.
+    """
+    auth = getattr(config, "auth", None)
+    rate_limit = getattr(auth, "rate_limit", None)
+    cors = getattr(config, "cors", None)
+    control_ui = getattr(config, "control_ui", None)
+    host = str(getattr(config, "host", "") or "")
+    token = getattr(auth, "token", None)
+    return {
+        "host": host,
+        "loopbackBind": is_loopback_bind(host),
+        "authMode": str(getattr(auth, "mode", "none") or "none"),
+        "tokenLength": len(token) if isinstance(token, str) else 0,
+        "trustedProxy": str(getattr(auth, "trusted_proxy", "") or ""),
+        "authRateLimitEnabled": bool(getattr(rate_limit, "enabled", True)),
+        "allowedOrigins": list(getattr(control_ui, "allowed_origins", []) or []),
+        "corsAllowedOrigins": list(getattr(cors, "allowed_origins", []) or []),
+        "corsAllowCredentials": bool(getattr(cors, "allow_credentials", False)),
+    }
+
+
+def _gateway_security_payload(ctx: RpcContext) -> dict[str, Any]:
+    config = getattr(ctx, "config", None)
+    if config is None:
+        raise RuntimeError("gateway config is not available")
+    return gateway_security_payload(config)
+
+
 async def _evaluate_collection(
     surface: str,
     collect: Collector,
@@ -592,6 +625,7 @@ async def _handle_doctor_status(params: dict | None, ctx: RpcContext) -> dict[st
         ),
         ("browser", lambda: _browser_payload(ctx), evaluate_browser),
         ("control_ui", lambda: _control_ui_payload(ctx), evaluate_control_ui),
+        ("gateway", lambda: _gateway_security_payload(ctx), evaluate_gateway_security),
     ]
 
     for surface, collect, evaluate in collectors:

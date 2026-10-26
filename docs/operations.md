@@ -2,7 +2,8 @@
 
 This guide covers day-two commands: sessions, cron, cost, diagnostics, replay,
 migration, durable agents, MCP, and install inventory. Use it after the first
-successful chat or gateway run.
+successful chat or gateway run. To operate a gateway on another machine, see
+[`remote-access.md`](remote-access.md).
 
 ## Sessions
 

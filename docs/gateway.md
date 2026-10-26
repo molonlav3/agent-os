@@ -78,7 +78,10 @@ agentos gateway run --listen 0.0.0.0 --port 18791
 ```
 
 Do not expose a gateway to an untrusted network without token auth and a network
-boundary you understand.
+boundary you understand. To reach a gateway from another machine, prefer
+keeping it on loopback and tunnelling in (SSH, Tailscale Serve) or putting an
+authenticating reverse proxy in front: see [`remote-access.md`](remote-access.md).
+`agentos doctor` flags risky exposure settings.
 
 ## Configuration Path
 
@@ -160,6 +163,7 @@ host and port.
 
 Read next:
 
+- [`remote-access.md`](remote-access.md)
 - [`http-api.md`](http-api.md)
 - [`web-ui.md`](web-ui.md)
 - [`configuration.md`](configuration.md)

@@ -73,16 +73,15 @@ class TestEnforcePublicBindAuthGuard:
     def test_allows_wildcard_bind_with_token_auth(self) -> None:
         enforce_public_bind_auth_guard(_config("0.0.0.0", auth_mode="token"))
 
-    @pytest.mark.parametrize("mode", ["password", "trusted-proxy", "tokenn", "on", ""])
+    @pytest.mark.parametrize("mode", ["password", "none", "tokenn", "on", ""])
     def test_refuses_public_bind_with_unenforced_auth_mode(self, mode: str) -> None:
-        """[P1b] Only token is enforced end-to-end. password/trusted-proxy are
-        not enforced on the HTTP surface, and a typo must never be read as
-        "auth is on".
+        """[P1b] ``password`` was never implemented, ``none`` admits without
+        proof, and a typo must never be read as "auth is on".
 
-        ``AuthConfig`` now refuses every one of these but ``trusted-proxy`` at
-        validation time (#352), so the unvalidated ``model_construct`` posture
-        is what actually exercises this guard — it must stay closed even if a
-        mode reaches it by some other path.
+        ``AuthConfig`` refuses every one of these but ``none`` at validation
+        time (#352), so the unvalidated ``model_construct`` posture is what
+        actually exercises this guard — it must stay closed even if a mode
+        reaches it by some other path.
         """
         config = GatewayConfig(
             host="0.0.0.0",
@@ -91,24 +90,28 @@ class TestEnforcePublicBindAuthGuard:
         with pytest.raises(ValueError, match="auth.mode"):
             enforce_public_bind_auth_guard(config)
 
-    def test_refuses_trusted_proxy_even_with_proxy_configured(self) -> None:
-        """[P1] AuthMiddleware only string-matches the client-controlled
-        X-Forwarded-For header — trivially spoofable — and resolve_auth has no
-        trusted-proxy resolver, so the mode is not enforced end-to-end. It must
-        not pass the public-bind guard until real peer-IP validation lands."""
-        with pytest.raises(ValueError, match="auth.mode"):
-            enforce_public_bind_auth_guard(
-                _config("0.0.0.0", auth_mode="trusted-proxy", trusted_proxy="10.0.0.1")
-            )
+    def test_allows_trusted_proxy_with_proxy_configured(self) -> None:
+        """trusted-proxy admits only a transport peer in ``auth.trusted_proxy``
+        (``AuthMiddleware`` and ``resolve_auth`` both check the real peer, never
+        a header), so it protects a public bind as ``token`` does."""
+        enforce_public_bind_auth_guard(
+            _config("0.0.0.0", auth_mode="trusted-proxy", trusted_proxy="10.0.0.1")
+        )
+
+    def test_trusted_proxy_without_proxy_still_passes_the_guard_closed(self) -> None:
+        """With no proxy configured nothing is admitted: closed, not open. The
+        guard lets it start; ``doctor`` reports ``gateway.trusted_proxy_unset``."""
+        enforce_public_bind_auth_guard(_config("0.0.0.0", auth_mode="trusted-proxy"))
 
     def test_error_message_only_recommends_enforced_modes(self) -> None:
         with pytest.raises(ValueError) as exc_info:
             enforce_public_bind_auth_guard(_config("0.0.0.0"))
         message = str(exc_info.value)
-        # Neither unimplemented/spoofable mode should be recommended.
+        # The unimplemented mode is never recommended; both enforced ones are.
         assert '"password"' not in message
-        assert "trusted-proxy" not in message
         assert '"token"' in message
+        assert '"trusted-proxy"' in message
+        assert "auth.trusted_proxy" in message
 
 
 class TestStartGatewayServerWiring:

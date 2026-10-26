@@ -663,8 +663,21 @@ cron_default_mode = "bypass"            # off | bypass | full
 # [auth]
 # mode = "none"         # none | token | trusted-proxy
 # token = ""
+# trusted_proxy = ""    # trusted-proxy mode: proxy IPs or CIDR blocks, comma-separated
 # Startup guard: with mode = "none" the gateway refuses to bind a non-loopback
-# host (0.0.0.0, a LAN IP, ...). Enable token auth or keep the loopback bind.
+# host (0.0.0.0, a LAN IP, ...). Enable token auth or keep the loopback bind
+# and tunnel in (docs/remote-access.md).
+
+# [auth.rate_limit]
+# Wrong tokens per client (HTTP and WebSocket share the budget): max_failures
+# within window_seconds lock the client out for lockout_seconds (HTTP 429 +
+# Retry-After). A missing token never counts. With exempt_loopback a loopback
+# peer without an Origin header is only slowed down, never locked out.
+# enabled = true
+# max_failures = 10
+# window_seconds = 60
+# lockout_seconds = 300
+# exempt_loopback = true
 
 # [control_ui]
 # On a loopback bind the WebSocket handshake, cross-origin HTTP requests, and

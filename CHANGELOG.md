@@ -15,6 +15,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `details.code`; existing codes keep working and map to a category. A
   protocol-version mismatch now says `PROTOCOL_MISMATCH` with both version
   ranges and whether a reload fixes it.
+- `agentos doctor` reports risky gateway exposure: `gateway.bind_no_auth`,
+  `gateway.allowed_origins_wildcard`, `gateway.cors_wildcard_with_credentials`,
+  `gateway.trusted_proxy_unset`, `gateway.auth_rate_limit_off` and
+  `gateway.token_short`, each with the command that fixes it.
+- Docs: `docs/remote-access.md` — SSH tunnel, Tailscale Serve, reverse proxy
+  with trusted-proxy mode, token rotation, and what never to do.
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up
@@ -28,6 +34,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   periodic refreshes are dropped with their `seq` consumed (the client sees
   the gap and resynchronizes); anything else closes the socket `1008 slow
   consumer`.
+- Gateway: `auth.mode = "trusted-proxy"` is accepted on a non-loopback bind
+  (admission checks the real transport peer), `auth.trusted_proxy` takes CIDR
+  blocks, and `X-Forwarded-For` is walked right to left skipping trusted hops
+  instead of trusting its left-most entry; a forwarded address naming the
+  gateway host itself is ignored as spoofed.
 - The web console and the desktop app send a `client` block `{id, version,
   platform, mode}` and an exact protocol range in `connect`; the challenge
   carries a timestamp and `hello-ok.auth` echoes its nonce.
@@ -42,6 +53,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   deeper in. The web console's old `client: {name}` shape is still accepted.
 - The web console reconnects when the socket drops in the middle of the
   handshake instead of staying disconnected.
+
+### Security
+- Gateway: wrong tokens are rate limited per client across HTTP and the
+  WebSocket (`[auth.rate_limit]`, on by default): 10 failures in 60 s lock
+  the client out for 5 minutes (HTTP `429` + `Retry-After`, WebSocket
+  `UNAUTHORIZED` with `details.code = "AUTH_RATE_LIMITED"`). A missing token
+  never counts; a loopback peer is slowed down (250 ms to 5 s) instead of
+  locked out; a browser attempt is keyed by its `Origin` and never exempt.
+- Gateway: at most 128 sockets per client address may wait in the handshake;
+  more are refused before `accept()`.
 
 ## [2026.10.25] - 2026-10-25
 
