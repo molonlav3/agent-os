@@ -35,8 +35,9 @@ _PUBLIC_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/startup
 
 # Routes that authenticate themselves with a credential other than the gateway
 # token, so AuthMiddleware lets them through to their own check: a ticketed
-# download carries a short-lived, connection-bound grant in its path.
-_SELF_AUTHENTICATED_PREFIXES: tuple[str, ...] = ("/api/v1/artifacts/download/",)
+# download carries a short-lived, connection-bound grant in its path, and the
+# inbound webhooks take the separate ``[hooks] token`` (never the gateway token).
+_SELF_AUTHENTICATED_PREFIXES: tuple[str, ...] = ("/api/v1/artifacts/download/", "/api/v1/hooks/")
 
 # The RPC/API surface the cross-origin guard exists to protect. A UI base_path
 # that overlaps this must NOT be trusted as an exemption prefix.

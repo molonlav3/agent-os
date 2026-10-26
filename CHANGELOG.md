@@ -156,7 +156,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   spawning/sending, scheduling, gateway control, outbound messages and trading
   tools answer `404` whatever the config says, unless `[tools.invoke] allow`
   names them (#3695).
-- `hello-ok.features.capabilities` advertises `artifact-tickets`, `tools-invoke` and `web-push`.
+- Config file hot reload (`[gateway] config_reload`, default on): edits of the
+  active config file are validated and applied while the gateway runs; keys
+  read only at startup are reported as pending (`config.changed` event,
+  `agentos doctor`), and an invalid edit keeps the last good config and logs
+  `config.reload_skipped` (#3697).
+- Lifecycle hooks `gateway:startup`, `gateway:shutdown` (5 s budget) and
+  `gateway:pre-restart` (10 s) for in-process code
+  (`lifecycle_hooks.register_lifecycle_hook`) and for file-only shell commands
+  in `[hooks.lifecycle]` (#3697).
+- Inbound webhooks `POST /api/v1/hooks/agent`, `/wake` and `/<name>` with their
+  own `[hooks] token` (the gateway token is refused), five-minute
+  `idempotency_key` dedupe, a per-hook rate limit (`429`) and fan-out cap, and
+  `[hooks.routes.<name>]` agent / session / message template mapping (#3697).
+- `hello-ok.features.capabilities` advertises `artifact-tickets`,
+  `config-reload`, `tools-invoke` and `web-push`.
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up

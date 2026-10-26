@@ -1438,13 +1438,72 @@ allow = []                        # tools lifted off POST /api/v1/tools/invoke's
 
 All three are read per request: no restart.
 
+## Inbound Webhooks
+
+```toml
+[hooks]
+token = "<long random secret, not the gateway token>"
+rate_limit_per_minute = 60        # per hook name; 429 beyond it
+max_sessions_per_hook = 1         # distinct sessions one hook may deliver into
+
+[hooks.routes.github]             # POST /api/v1/hooks/github
+agent = "main"
+session_key = ""                  # empty: agent:main:hook:github
+template = "PR {{ payload.pull_request.title }} was {{ payload.action }}"
+
+[hooks.lifecycle]                 # shell commands, run with a time budget
+startup = []
+shutdown = ["/usr/local/bin/backup-agentos"]
+pre_restart = []
+```
+
+- `hooks.token` admits `POST /api/v1/hooks/agent`, `/wake` and `/<name>`
+  (`Authorization: Bearer` or `X-AgentOS-Hook-Token`). The gateway token is
+  refused there, and a hooks token equal to it disables the routes. Unset: the
+  routes answer `404`.
+- A route's `template` fills `{{ payload.a.b }}` placeholders (dotted paths,
+  list indexes like `commits.0.id`) from the posted JSON; no expressions. Empty:
+  the body's `message`, else the JSON body itself. A route's `session_key` is
+  the only way to deliver into an existing conversation; a caller may only
+  choose a key under `agent:<agent>:hook:`.
+- `[hooks.lifecycle]` commands run through `/bin/sh -c` without the gateway's
+  credentials in their environment, with `AGENTOS_LIFECYCLE_EVENT` and
+  `AGENTOS_LIFECYCLE_REASON` set. Budgets: `startup` 10 s, `shutdown` 5 s,
+  `pre_restart` 10 s, shared by every command and in-process hook of that event.
+- `hooks.token` and `hooks.lifecycle` are file-only: `config.set`,
+  `config.patch` and `config.apply` refuse to set a token or add a command
+  (clearing them is allowed).
+
+Route names are 1-64 of `a-z 0-9 _ -` and cannot be `agent` or `wake`. Hooks
+settings apply on the next request. See [HTTP API → Inbound
+webhooks](http-api.md#inbound-webhooks).
+
 ## Raw Config Editing
 
 For advanced settings, inspect `agentos.toml.example` and edit the active
 config file directly. Use CLI commands for routine provider, router, search,
 channel, and sandbox changes because they avoid common key-shape mistakes.
 
-After changing files by hand, restart the gateway and run:
+### Editing the file while the gateway runs
+
+With `[gateway] config_reload = true` (the default) the gateway checks the
+active config file every 2 seconds and, once a change has been still for half
+a second, applies it like a config write from the console: validated, applied
+in place, hot settings live at once. Settings that are only read at startup
+(bind, channels, sandbox, memory backend, middleware, and anything not on the
+audited live list) are recorded as pending instead: `agentos doctor` reports
+`gateway.config.restart_pending` and the console gets a `config.changed`
+event listing `hot` and `restartRequired` paths. Restart to apply those.
+
+An edit that does not parse or validate never replaces the running config: the
+gateway keeps its last good settings, logs `config.reload_skipped`, sends
+`config.changed` with `status: "invalid"`, and `agentos doctor` reports
+`gateway.config.reload_skipped` until a good save. `--listen` / `--port`
+overrides and runtime-only secrets (an auto-generated token, keys from the
+environment) carry over a reload. The gateway's own writes are recognized and
+cause no reload.
+
+When `config_reload` is off, restart after changing the file. Either way, check:
 
 ```sh
 agentos doctor

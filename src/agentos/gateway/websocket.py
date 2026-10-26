@@ -1702,5 +1702,6 @@ def _build_features(dispatcher: RpcDispatcher) -> Any:
         "cron",
         "approval.requested",
         "approval.resolved",
+        "config.changed",
     ]
     return FeaturesInfo(methods=methods, events=events, capabilities=sorted(CAPABILITIES))

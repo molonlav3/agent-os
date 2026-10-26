@@ -442,8 +442,10 @@ def _has_unproven_live_change(changed_paths: set[str]) -> bool:
         "audio",
         "trading",
         "tools.invoke",
+        "hooks",
         "push",
         "artifacts",
+        "gateway.config_reload",
     )
     search_paths = {
         "search_provider",
@@ -567,6 +569,32 @@ def _assert_auth_credentials_unchanged(
             raise ValueError(
                 f"Path is read-only: {path}; provision gateway credentials through the CLI"
             )
+
+
+_LIFECYCLE_HOOK_EVENTS = ("startup", "shutdown", "pre_restart")
+
+
+def _assert_file_only_hooks_unchanged(payload: dict[str, Any], source: dict[str, Any]) -> None:
+    """Refuse an RPC write that adds a lifecycle command or sets a hooks token.
+
+    ``[hooks.lifecycle]`` holds shell commands the gateway runs itself, outside
+    the sandbox and the approval queue, and ``hooks.token`` admits the inbound
+    webhook routes. Both belong to whoever can edit ``agentos.toml``; a config
+    RPC (which an agent-bound connection may reach) can clear them but never
+    add to them.
+    """
+    for event in _LIFECYCLE_HOOK_EVENTS:
+        path = f"hooks.lifecycle.{event}"
+        new_value = _value_at_path(payload, path) or []
+        old_value = _value_at_path(source, path) or []
+        if not isinstance(new_value, list):
+            raise ValueError(f"Path is file-only: {path}; edit agentos.toml")
+        added = [cmd for cmd in new_value if cmd not in old_value]
+        if added:
+            raise ValueError(f"Path is file-only: {path}; edit agentos.toml to add a command")
+    new_token = _value_at_path(payload, "hooks.token") or ""
+    if new_token and new_token != (_value_at_path(source, "hooks.token") or ""):
+        raise ValueError("Path is file-only: hooks.token; set it in agentos.toml")
 
 
 def _preserve_readonly_values(payload: dict, config: Any) -> dict:
@@ -701,6 +729,7 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     restored_value, redacted_paths = _restore_redacted_values(value, source_value, path)
     _set_path(cfg_dict, path, restored_value)
     _assert_auth_credentials_unchanged(cfg_dict, source_cfg_dict)
+    _assert_file_only_hooks_unchanged(cfg_dict, source_cfg_dict)
     cfg_dict = _preserve_readonly_values(cfg_dict, ctx.config)
 
     # Re-validate full config
@@ -795,6 +824,7 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
         redacted_paths.update(merge_restored_paths)
         cfg_dict = _deep_merge(cfg_dict, patch_data)
     _assert_auth_credentials_unchanged(cfg_dict, source_cfg_dict)
+    _assert_file_only_hooks_unchanged(cfg_dict, source_cfg_dict)
     # Merge/nested patches can carry read-only fields without naming their dot
     # paths directly. Re-assert every runtime-owned value before validation.
     cfg_dict = _preserve_readonly_values(cfg_dict, ctx.config)
@@ -913,6 +943,7 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
     )
     config_payload, redacted_paths = _restore_redacted_values(config_payload, old_payload)
     _assert_auth_credentials_unchanged(config_payload, old_payload, only_present=True)
+    _assert_file_only_hooks_unchanged(config_payload, old_payload)
     config_payload = _preserve_readonly_values(config_payload, ctx.config)
 
     # Validate and persist the full replacement config

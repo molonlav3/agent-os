@@ -84,8 +84,10 @@ that carry an `Origin` header follow the gateway's origin policy on every bind
 on this machine — and CORS reflects only those origins, never `*`; see
 [Gateway → Browser origins](gateway.md#browser-origins).
 
-Ticketed downloads (`/api/v1/artifacts/download/...`) authenticate themselves
-instead of with the gateway token: the ticket is the credential.
+Two route families authenticate themselves instead of with the gateway token:
+ticketed downloads (`/api/v1/artifacts/download/...`, the ticket is the
+credential) and inbound webhooks (`/api/v1/hooks/...`, their own `[hooks]
+token`).
 
 ## Liveness and Readiness
 
@@ -273,6 +275,27 @@ any scheduler tool, `gateway`, and any `trade*`/`trading*` tool. Lift a single
 tool with `[tools.invoke] allow = ["write_file"]`. Tools run sandboxed in an
 unattended context; a connection the gateway recognizes as an agent's (an agent
 token or an open exec window) is refused with `403`.
+
+## Inbound webhooks
+
+External automation can reach the agent without a chat channel. These routes
+take their own bearer, `[hooks] token`, sent as `Authorization: Bearer <token>`
+or `X-AgentOS-Hook-Token`; the gateway token is refused there. Without a hooks
+token they answer `404`.
+
+| Method | Path | Body | Effect |
+| --- | --- | --- | --- |
+| `POST` | `/api/v1/hooks/agent` | `{message, agent?, session_key?}` | Enqueues `message` as a user message in `agent:<agent>:hook:agent`, or in `session_key` when it is under `agent:<agent>:hook:`. |
+| `POST` | `/api/v1/hooks/wake` | `{reason?}` | Asks the heartbeat to run now (`503` when there is none). |
+| `POST` | `/api/v1/hooks/<name>` | any JSON | Delivers to the agent and session of `[hooks.routes.<name>]`, message rendered from its `template`. |
+
+Delivery answers `202` with `sessionKey`. Per hook name: `429` past
+`rate_limit_per_minute` (default 60, with `Retry-After`); an `idempotency_key`
+in the body or an `Idempotency-Key` header replays the first answer for five
+minutes (`duplicate: true`); and `409 FANOUT_LIMIT` once the hook has
+delivered into `max_sessions_per_hook` (default 1) distinct sessions. See
+[Configuration → Inbound webhooks](configuration.md#inbound-webhooks) and
+[Scheduling → Automation](scheduling.md#automation-from-outside).
 
 ## Streaming (WebSocket)
 
@@ -468,7 +491,8 @@ The full route table is defined in `create_gateway_app`:
 list). File-and-media routes are registered just below it via
 `register_upload_routes`, `register_attachment_routes`,
 `register_artifact_routes`, `register_download_routes` and
-`register_audio_transcription_routes`; then `register_tools_invoke_route`.
+`register_audio_transcription_routes`; then `register_inbound_hook_routes`
+and `register_tools_invoke_route`.
 
 Read next:
 

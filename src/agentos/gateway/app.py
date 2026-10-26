@@ -287,8 +287,11 @@ def create_gateway_app(
                 if operator:
                     agent_auth["operatorSecret"] = operator
             access = get_agent_surface().attach(access, agent_auth)
+        return _rpc_ctx(access)
+
+    def _rpc_ctx(access: Any, conn_id: str = "http") -> RpcContext:
         return RpcContext(
-            conn_id="http",
+            conn_id=conn_id,
             access=access,
             session_manager=session_manager,
             config=config,
@@ -667,6 +670,11 @@ def create_gateway_app(
     @contextlib.asynccontextmanager
     async def _lifespan(_app: Starlette) -> AsyncIterator[None]:
         yield
+        # SIGTERM ends uvicorn without GatewayServer.close(); shutdown hooks
+        # still get their turn (once per process, whichever path is first).
+        from agentos.gateway.lifecycle_hooks import run_shutdown_hooks_once
+
+        await run_shutdown_hooks_once(config, "lifespan")
         _close_browser_sessions()
         _record_clean_shutdown(_app)
 
@@ -707,6 +715,48 @@ def create_gateway_app(
     from agentos.gateway.download_grants import register_download_routes  # noqa: PLC0415
 
     register_download_routes(app, config=config, session_manager=session_manager)
+    from agentos.gateway.inbound_hooks import register_inbound_hook_routes  # noqa: PLC0415
+
+    async def _hook_dispatch(
+        session_key: str, message: str, provenance: dict[str, Any]
+    ) -> dict[str, Any]:
+        # The hooks token is not a Control credential: the turn runs under an
+        # admitted but unbound context, which every operator-only check (the
+        # trading guardrails) treats as an agent's.
+        from agentos.gateway.access import ConnectionSurface
+        from agentos.gateway.agent_surface import AgentBinding
+        from agentos.gateway.auth import AccessContext
+
+        access = AccessContext(
+            surface=ConnectionSurface.CONTROL,
+            admitted=True,
+            credential_verified=True,
+            agent=AgentBinding(via="unbound"),
+        )
+        result = await dispatcher.dispatch(
+            "_hook",
+            "chat.send",
+            {"sessionKey": session_key, "message": message, "inputProvenance": provenance},
+            _rpc_ctx(access, conn_id="hook"),
+        )
+        if result.ok:
+            return dict(result.payload or {})
+        error = result.error
+        return {
+            "ok": False,
+            "error": error.message if error else "error",
+            "code": error.code if error else "INTERNAL_ERROR",
+        }
+
+    def _hook_wake(reason: str) -> bool:
+        if heartbeat_loop is None:
+            return False
+        heartbeat_loop.request_now(reason=reason)
+        return True
+
+    register_inbound_hook_routes(
+        app, config=config, dispatch_message=_hook_dispatch, wake=_hook_wake
+    )
     from agentos.gateway.tools_invoke import register_tools_invoke_route  # noqa: PLC0415
 
     register_tools_invoke_route(

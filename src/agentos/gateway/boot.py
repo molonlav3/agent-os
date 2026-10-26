@@ -1300,6 +1300,8 @@ class GatewayServer:
     _restarter: Any = field(default=None, repr=False)
     # Approval delivery wired at boot (Web Push listener); undone on close.
     _web_push: Any = field(default=None, repr=False)
+    # ``gateway.config_watcher.ConfigWatcher`` for the active config file.
+    _config_watcher: Any = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
     # Signal-driven shutdown (``install_signal_handlers``): the first SIGTERM
     # / SIGINT starts ``close()`` in ``_shutdown_task``; a second sets
@@ -1472,6 +1474,17 @@ class GatewayServer:
 
             if get_maintenance() is self._maintenance:
                 set_maintenance(None)
+        # Skills and operator commands get to flush first, while everything
+        # still works (bounded: 5 s total, never raises).
+        from agentos.gateway.lifecycle_hooks import run_shutdown_hooks_once
+
+        await run_shutdown_hooks_once(getattr(self, "config", None), reason)
+        if self._config_watcher is not None:
+            try:
+                await self._config_watcher.stop()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
+            self._config_watcher = None
         # Drain in-flight turns FIRST so replies are not lost.
         # task_runtime.shutdown() waits for all running turns to complete before
         # returning; only then do we stop channel delivery.
@@ -3387,6 +3400,20 @@ async def start_gateway_server(
 
     if run:
         server_handle._web_push = wire_approval_delivery(config)
+        if config.config_path:
+            from types import SimpleNamespace
+
+            from agentos.gateway.config_watcher import ConfigWatcher, broadcast_to_control
+
+            watcher = ConfigWatcher(
+                lambda: SimpleNamespace(config=config, provider_selector=svc.provider_selector),
+                emit=broadcast_to_control,
+            )
+            watcher.start()
+            server_handle._config_watcher = watcher
+        from agentos.gateway.lifecycle_hooks import STARTUP, run_lifecycle_hooks
+
+        create_background_task(run_lifecycle_hooks(STARTUP, config=config, reason="boot"))
         readiness.begin_sidecar(SIDECAR_ROUTER)
         create_background_task(_router_preload_sidecar(config, readiness, SIDECAR_ROUTER))
         # If the previous image restarted in place on request, tell the chat

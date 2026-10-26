@@ -246,6 +246,7 @@ Main `agentos.toml` sections (full commented reference:
 | `[updates]` | `notify` (default true) — the once-per-24h "new release available" notice |
 | `[artifacts]` | `legacy_session_key_urls` (default true): the deprecated `?sessionKey=` artifact/attachment URLs keep working this release; clients mint ticketed URLs with the `artifacts.download` RPC (5-minute, connection-bound `/api/v1/artifacts/download/<conn>/<ticket>`, no auth header) |
 | `[push]` | `web_enabled` (default true) — Web Push for approval prompts (the console's Settings toggle; VAPID keys in `<state_dir>/web_push_vapid.json`), `vapid_subject` |
+| `[hooks]` | inbound webhooks `POST /api/v1/hooks/agent\|wake\|<name>`: `token` (own bearer, never the gateway token; unset = routes 404), `rate_limit_per_minute` (60), `max_sessions_per_hook` (1), `[hooks.routes.<name>]` `agent`/`session_key`/`template` (`{{ payload.a.b }}`); `[hooks.lifecycle]` `startup`/`shutdown`/`pre_restart` shell commands (budgets 10/5/10 s). `token` and `lifecycle` are file-only (config RPCs refuse to set them) |
 | `[acp]` | ACP coding harnesses spawned with `sessions_spawn(runtime="acp")`: `allowed_cwds` (default `[]`) lists extra directories a harness may use as `cwd` besides the agent workspace and managed worktrees; the workspace suits read-only work in a read-only `harness_mode`, a harness that writes needs its project listed (`agentos config set acp.allowed_cwds '["~/Code/my-app"]'` replaces the whole list) or `worktree: true`. A finished `oneshot` child still takes `sessions_send` follow-ups (its harness session is resumed); only `acp close` / `subagents kill` end it. Gateway RPC: `acp.sessions` (live harnesses with `activity`, `activity_kind`, `turn_tool_calls`), `acp.status {session_key}` (any ACP session: `idle`, `closed`, `last_turn`, ...), `acp.cancel`, `acp.close` |
 | `[channels]` | messaging channels (`[[channels.channels]]` entries) |
 | `[auxiliary]` | model for work AgentOS runs itself, not the agent's turn (document analysis, image description): `provider`, `model`, `timeout_seconds`, `[auxiliary.tasks.<task>]`. Empty = reuse `[llm]` |
@@ -746,10 +747,11 @@ payload|error}` for an allowlist of reads and of methods that create, rename or
 send (a `chat.send` there runs a turn exactly as over WS); config writes,
 secrets, env, trading, restarts and deletes answer 403 `FORBIDDEN`),
 `POST /api/v1/tools/invoke` (run one tool, no model turn; `dry_run` returns
-the resolved policy),
-and `WS /ws` (primary RPC transport; `projects.*` CRUD lives there alongside
-`sessions.*`; `artifacts.download` mints ticketed file URLs, `push.web.*` manages approval
-push subscriptions). On loopback binds
+the resolved policy), `POST /api/v1/hooks/*` (inbound webhooks, `[hooks]
+token`), and `WS /ws` (primary RPC transport; `projects.*` CRUD lives there
+alongside `sessions.*`; `artifacts.download` mints ticketed file URLs,
+`push.web.*` manages approval push subscriptions, `config.changed` reports
+edits of the config file the gateway applied or skipped). On loopback binds
 auth is optional; on public binds the `[auth]` token gates every request
 (or, in `trusted-proxy` mode, only the listed reverse proxy is admitted).
 Full reference: `docs/http-api.md` (https://useagentos.dev/docs/http-api).

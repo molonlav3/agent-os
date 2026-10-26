@@ -728,6 +728,22 @@ cron_default_mode = "bypass"            # off | bypass | full
 # list (shell, file writes, session spawning/sending, cron, gateway, trading).
 # allow = ["create_pdf_report"]
 
+# [hooks]
+# Inbound webhooks: POST /api/v1/hooks/agent | wake | <name>. Their own bearer,
+# never the gateway token; unset = the routes answer 404.
+# token = "<long random secret>"
+# rate_limit_per_minute = 60
+# max_sessions_per_hook = 1
+# [hooks.routes.github]
+# agent = "main"
+# session_key = ""          # empty: agent:main:hook:github
+# template = "PR {{ payload.pull_request.title }} was {{ payload.action }}"
+# [hooks.lifecycle]
+# Shell commands on gateway events (file-only; budgets 10/5/10 s).
+# startup = []
+# shutdown = ["/usr/local/bin/backup-agentos"]
+# pre_restart = []
+
 # [channels]
 # [[channels.channels]]
 # name = "my-slack"

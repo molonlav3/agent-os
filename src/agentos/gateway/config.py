@@ -2342,6 +2342,60 @@ class PushConfig(BaseModel):
         return cleaned
 
 
+class HookRouteConfig(BaseModel):
+    """One named inbound webhook, ``[hooks.routes.<name>]``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str = "main"
+    # Empty: ``agent:<agent>:hook:<name>``. Set it to deliver into an
+    # existing conversation; only the operator can point a hook there.
+    session_key: str = ""
+    # ``{{ payload.path.to.value }}`` placeholders, filled from the JSON body.
+    # Empty: the body's ``message`` field, else the JSON body itself.
+    template: str = ""
+
+
+class LifecycleHooksConfig(BaseModel):
+    """Shell commands run on gateway lifecycle events (``[hooks.lifecycle]``).
+
+    File-only: config RPC writes cannot add or change them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    startup: list[str] = Field(default_factory=list)
+    shutdown: list[str] = Field(default_factory=list)
+    pre_restart: list[str] = Field(default_factory=list)
+
+
+class HooksConfig(BaseModel):
+    """Inbound webhooks and lifecycle hooks (``[hooks]``).
+
+    ``token`` is the bearer the ``/api/v1/hooks/*`` routes accept -- never
+    the gateway token, which those routes refuse. Unset disables them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = ""
+    rate_limit_per_minute: int = Field(default=60, ge=1)
+    max_sessions_per_hook: int = Field(default=1, ge=1)
+    routes: dict[str, HookRouteConfig] = Field(default_factory=dict)
+    lifecycle: LifecycleHooksConfig = Field(default_factory=LifecycleHooksConfig)
+
+    @field_validator("routes")
+    @classmethod
+    def _validate_route_names(cls, value: dict[str, HookRouteConfig]) -> dict[str, HookRouteConfig]:
+        for name in value:
+            if name in {"agent", "wake"} or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
+                raise ValueError(
+                    f"hooks.routes.{name}: a route name is 1-64 of a-z 0-9 _ - "
+                    "and cannot be 'agent' or 'wake'"
+                )
+        return value
+
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -2648,6 +2702,7 @@ class GatewayConfig(BaseSettings):
     gateway: GatewayServeConfig = Field(default_factory=GatewayServeConfig)
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     push: PushConfig = Field(default_factory=PushConfig)
+    hooks: HooksConfig = Field(default_factory=HooksConfig)
 
     # Component enable flags
     control_ui: ControlUiConfig = Field(default_factory=ControlUiConfig)
@@ -3257,6 +3312,7 @@ _OMIT_WHEN_DEFAULT_SECTIONS: tuple[tuple[str, type[BaseModel]], ...] = (
     ("gateway", GatewayServeConfig),
     ("artifacts", ArtifactsConfig),
     ("push", PushConfig),
+    ("hooks", HooksConfig),
 )
 
 

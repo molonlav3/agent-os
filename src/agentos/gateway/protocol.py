@@ -55,6 +55,7 @@ CAPABILITIES: frozenset[str] = frozenset(
         "artifact-tickets",
         "auth-rate-limit",
         "challenge-ts",
+        "config-reload",
         "idempotency-keys",
         "inflight-snapshot",
         "rpc-http",
