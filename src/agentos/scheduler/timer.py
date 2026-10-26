@@ -30,9 +30,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from typing import Any
 
 from .jobs import HandlerFn, _next_run, apply_reserved_result, execute_with_timeout
 from .persistence import JobStore
@@ -48,6 +50,9 @@ from .types import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: ``listener(job, execution)``: see :meth:`SchedulerTimer.add_run_listener`.
+RunListener = Callable[[CronJob | None, JobExecution], Awaitable[Any]]
 
 MIN_REFIRE_GAP_SECONDS = 2.0
 
@@ -191,6 +196,7 @@ class SchedulerTimer:
         self._started = False
         self._nudge_event = asyncio.Event()
         self.last_wake: WakeReport | None = None
+        self._run_listeners: list[RunListener] = []
 
     # ------------------------------------------------------------------
     # Handler registry
@@ -199,6 +205,36 @@ class SchedulerTimer:
     def register_handler(self, key: str, fn: HandlerFn) -> None:
         """Add a handler to the handlers dict."""
         self._handlers[key] = fn
+
+    # ------------------------------------------------------------------
+    # Run listeners: told once a run is on record
+    # ------------------------------------------------------------------
+
+    def add_run_listener(self, listener: RunListener) -> None:
+        """Call ``listener(job, execution)`` after each run is recorded.
+
+        "Recorded" means the run's execution row is saved and the job's
+        post-run state (status, failure streak, last error, next run) is
+        applied, so anything the listener publishes can be re-read and
+        matches. ``job`` is the row as stored then, or ``None`` when the run
+        deleted it (a one-shot job). A listener's failure is logged, never
+        raised into the scheduler.
+        """
+        self._run_listeners.append(listener)
+
+    async def publish_run_recorded(self, job_id: str, execution: JobExecution) -> None:
+        if not self._run_listeners:
+            return
+        try:
+            job = await self._store.get(job_id)
+        except Exception:
+            logger.exception("run_listener_job_read_failed id=%s", job_id)
+            job = None
+        for listener in list(self._run_listeners):
+            try:
+                await listener(job, execution)
+            except Exception:
+                logger.exception("run_listener_failed id=%s", job_id)
 
     # ------------------------------------------------------------------
     # Startup catchup
@@ -578,6 +614,8 @@ class SchedulerTimer:
         await apply_reserved_result(
             job.id, reservation.token, exe, self._store, now=self._clock.wall()
         )
+        # Only now: a client that re-reads the job on this news sees the run.
+        await self.publish_run_recorded(job.id, exe)
 
     async def _record_replaced_run(self, reservation: JobReservation) -> None:
         execution = JobExecution(

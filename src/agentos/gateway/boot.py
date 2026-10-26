@@ -3169,11 +3169,19 @@ async def start_gateway_server(
                     except Exception:
                         pass
 
+        from agentos.gateway.rpc_cron import _job_to_wire
+
         delivery_chain = DeliveryChain(
             channel_manager_ref=lambda: _cm_holder[0],
             ws_emitter=_cron_ws_emitter,
             session_forwarder=_session_forwarder,
+            job_serializer=lambda job: _job_to_wire(job, config),
         )
+        # cron.run.finished goes out once the run and the job's health are on
+        # record, so a client re-reading cron.list on it sees the new state.
+        add_run_listener = getattr(svc.cron_scheduler, "add_run_listener", None)
+        if callable(add_run_listener):
+            add_run_listener(delivery_chain.publish_run_finished)
 
         # Plug DeliveryChain.dispatch_failure_alert into execute_with_timeout
         # so every failed cron run (agent_run raise, system_event raise,

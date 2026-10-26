@@ -471,6 +471,14 @@ job keeps showing why. `degraded` turns on at 3 consecutive failures. A recurrin
 job is marked `failed` and stops after 5, and an authentication-class error
 (401/403, invalid key) disables it on the first failure.
 
+A WebSocket client subscribed to a job (`cron:<id>`, or `cron:*`) gets
+`cron.run.finished` once the run is on record: the run's history entry and the
+job's new `health` are already saved, so a re-read agrees with it. The event
+carries `runId`, `status` (`ok`/`error`), `error`, `durationMs`, the job's
+`health`, `lastStatus`, `nextRun`, and the job as `cron.list` renders it
+(`job`), so no re-read is needed. For a one-shot job its run deleted,
+`jobDeleted` is true and `health` is `null`.
+
 ## Sleep, Restarts, and Clock Changes
 
 The scheduler plans its next wake against both the wall clock and the system's

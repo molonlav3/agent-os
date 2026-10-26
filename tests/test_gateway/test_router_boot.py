@@ -585,10 +585,14 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
         def register_handler(self, key: str, fn: Any) -> None:
             self.registered[key] = fn
 
+        def add_run_listener(self, fn: Any) -> None:
+            self.run_listeners.append(fn)
+
         async def list_jobs(self) -> list:
             return []
 
     cron_sched = FakeCronScheduler()
+    cron_sched.run_listeners = []
 
     async def fake_build_services(**kwargs: Any) -> Any:
         async def close() -> None:
@@ -651,6 +655,20 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
             "static_message",
             "system_event",
         }
+        # cron.run.finished is published by the same chain, as a run
+        # listener: after the run and the job's health are on record.
+        (listener,) = cron_sched.run_listeners
+        assert getattr(listener, "__name__", "") == "publish_run_finished"
+        assert listener.__self__ is captured["dispatcher"].__self__
+        from agentos.scheduler.types import CronJob, JobExecution
+
+        payload = listener.__self__.run_finished_payload(
+            CronJob(id="j1", name="J", handler_key="static_message"),
+            JobExecution(job_id="j1", success=True),
+        )
+        # The event carries the job as cron.list renders it, health included.
+        assert payload["job"]["id"] == "j1"
+        assert payload["job"]["health"] == payload["health"]
     finally:
         await server.close()
 

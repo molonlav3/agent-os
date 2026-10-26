@@ -18,7 +18,10 @@ from agentos.scheduler.types import (
     DeliveryConfig,
     DeliveryMode,
     FailureDestination,
+    JobExecution,
     SessionTarget,
+    job_health,
+    preview_summary,
 )
 from agentos.session.keys import parse_agent_id
 from agentos.tools.ssrf import assert_not_metadata_endpoint
@@ -112,7 +115,10 @@ class DeliveryReport:
     """Result of the delivery pipeline."""
 
     channel_status: str = "skipped"  # "delivered" | "delivery_failed" | "skipped" | "origin_gone"
-    ws_status: str = "skipped"  # "delivered" | "no_subscribers" | "skipped"
+    #: "queued" when a WS emitter is wired: ``cron.run.finished`` goes out
+    #: after the run is recorded (:meth:`DeliveryChain.publish_run_finished`),
+    #: so at delivery time it can only be queued. "skipped" without one.
+    ws_status: str = "skipped"
     session_status: str = "skipped"  # "delivered" | "forward_failed" | "skipped" | "origin_gone"
     #: Why channel delivery failed, when it did. Empty otherwise.
     channel_detail: str = ""
@@ -122,7 +128,11 @@ class DeliveryChain:
     """Three-stage parallel delivery: Channel + WS + session forward.
 
     DB persistence is NOT part of this chain — the scheduler's existing
-    timer.py -> save_execution() pipeline owns execution records.
+    timer.py -> save_execution() pipeline owns execution records. The WS
+    ``cron.run.finished`` event is therefore not sent from :meth:`deliver`
+    (the run is not on record yet) but from :meth:`publish_run_finished`, a
+    scheduler run listener that fires once the record and the job's health
+    are committed.
     """
 
     def __init__(
@@ -130,10 +140,13 @@ class DeliveryChain:
         channel_manager_ref: Callable[[], Any] | None = None,
         ws_emitter: Callable[[str, str, dict], Awaitable[int]] | None = None,
         session_forwarder: Callable[..., Awaitable[bool | None]] | None = None,
+        job_serializer: Callable[[CronJob], dict[str, Any]] | None = None,
     ) -> None:
         self._channel_manager_ref = channel_manager_ref
         self._ws_emitter = ws_emitter
         self._session_forwarder = session_forwarder
+        #: Renders a job the way ``cron.list`` does, for the event's ``job``.
+        self._job_serializer = job_serializer
 
     @staticmethod
     def _is_script_job(job: CronJob) -> bool:
@@ -225,16 +238,9 @@ class DeliveryChain:
         result_text = strip_reply_directives(result_text) or ""
         summary = strip_reply_directives(summary)
         ch_coro = self._deliver_channel(job, result_text, envelope, session_key)
-        ws_coro = self._notify_ws(
-            job,
-            success=success,
-            summary=summary,
-            session_key=session_key,
-        )
         fwd_coro = self._forward_to_session(job, result_text, session_key)
-        ch_result, ws_result, fwd_result = await asyncio.gather(
+        ch_result, fwd_result = await asyncio.gather(
             ch_coro,
-            ws_coro,
             fwd_coro,
             return_exceptions=True,
         )
@@ -255,7 +261,8 @@ class DeliveryChain:
                 error_type=type(ch_result).__name__,
                 error=str(ch_result),
             )
-        report.ws_status = ws_result if isinstance(ws_result, str) else "skipped"
+        # The WS leg runs after the run is recorded (publish_run_finished).
+        report.ws_status = "queued" if self._ws_emitter else "skipped"
         report.session_status = fwd_result if isinstance(fwd_result, str) else "forward_failed"
         return report
 
@@ -602,31 +609,75 @@ class DeliveryChain:
             )
         return "skipped"
 
-    async def _notify_ws(
-        self,
-        job: CronJob,
-        success: bool,
-        summary: str | None,
-        session_key: str,
-    ) -> str:
+    def run_finished_payload(self, job: CronJob | None, execution: JobExecution) -> dict[str, Any]:
+        """The ``cron.run.finished`` payload for a recorded run.
+
+        ``job`` is the row as stored after the run (``None`` when the run
+        deleted it). Carries what a client needs without re-reading
+        ``cron.list``: the run (``runId``, ``status``, ``error``, times,
+        ``deliveryStatus``) and the job's post-run state (``health``,
+        ``lastResult``/``lastStatus``, ``jobStatus``, ``nextRun``, and the
+        full ``cron.list`` row as ``job`` when the gateway wired a serializer).
+        """
+        finished = execution.finished_at or datetime.now(UTC)
+        started = execution.started_at
+        payload: dict[str, Any] = {
+            "jobId": job.id if job is not None else execution.job_id,
+            "jobName": job.name if job is not None else "",
+            "success": bool(execution.success),
+            "summary": strip_reply_directives(preview_summary(execution.summary)),
+            "sessionKey": execution.session_key,
+            "finishedAt": finished.isoformat(),
+            "runId": execution.id,
+            "status": "ok" if execution.success else "error",
+            "error": execution.error,
+            "startedAt": started.isoformat() if started else None,
+            "durationMs": (
+                max(0, int((finished - started).total_seconds() * 1000)) if started else None
+            ),
+            "deliveryStatus": execution.delivery_status,
+            "jobDeleted": job is None,
+        }
+        if job is None:
+            payload["health"] = None
+            return payload
+        status = getattr(job.status, "value", str(job.status))
+        payload.update(
+            {
+                "health": job_health(job.consecutive_errors, job.last_error),
+                "lastResult": job.last_error,
+                "lastStatus": ("error" if job.last_error else ("ok" if job.last_run_at else None)),
+                "jobStatus": status,
+                "nextRun": job.next_run_at.isoformat() if job.next_run_at else None,
+            }
+        )
+        if self._job_serializer is not None:
+            try:
+                payload["job"] = self._job_serializer(job)
+            except Exception:  # noqa: BLE001 - the event still carries health
+                log.warning("delivery.job_serialize_failed", job_id=job.id, exc_info=True)
+        return payload
+
+    async def publish_run_finished(self, job: CronJob | None, execution: JobExecution) -> str:
+        """Send ``cron.run.finished`` for a run that is on record (a run listener).
+
+        Registered with :meth:`SchedulerEngine.add_run_listener`, so it runs
+        after the execution row and the job's health are committed: a client
+        that re-reads ``cron.list`` or ``cron.runs`` on the event sees this
+        run. Returns ``delivered`` / ``no_subscribers`` / ``skipped``.
+        """
         if not self._ws_emitter:
             return "skipped"
-        summary = strip_reply_directives(summary)
-        topic = job.delivery.ws_topic or f"cron:{job.id}"
-        payload = {
-            "jobId": job.id,
-            "jobName": job.name,
-            "success": success,
-            "summary": summary,
-            "sessionKey": session_key,
-            "finishedAt": datetime.now(UTC).isoformat(),
-        }
+        job_id = job.id if job is not None else execution.job_id
+        topic = (job.delivery.ws_topic if job is not None else "") or f"cron:{job_id}"
         try:
-            n = await self._ws_emitter(topic, "cron.run.finished", payload)
-            return "delivered" if n > 0 else "no_subscribers"
+            n = await self._ws_emitter(
+                topic, "cron.run.finished", self.run_finished_payload(job, execution)
+            )
         except Exception:
-            log.warning("delivery.ws_failed", job_id=job.id, exc_info=True)
+            log.warning("delivery.ws_failed", job_id=job_id, exc_info=True)
             return "skipped"
+        return "delivered" if n > 0 else "no_subscribers"
 
     async def _forward_to_session(
         self,

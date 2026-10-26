@@ -12,7 +12,7 @@ from .ops import SchedulerOps
 from .parser import CronExpression
 from .persistence import JobStore
 from .reaper import SessionReaper
-from .timer import SchedulerTimer
+from .timer import RunListener, SchedulerTimer
 from .types import (
     ConcurrencyPolicy,
     CronJob,
@@ -104,6 +104,14 @@ class SchedulerEngine:
     def register_handler(self, key: str, fn: HandlerFn) -> None:
         """Register an async callable for a handler key."""
         self._timer.register_handler(key, fn)
+
+    def add_run_listener(self, listener: RunListener) -> None:
+        """Call ``listener(job, execution)`` once each run is recorded.
+
+        Timer runs and :meth:`run_job_now` alike; see
+        :meth:`SchedulerTimer.add_run_listener`.
+        """
+        self._timer.add_run_listener(listener)
 
     def handler(self, key: str) -> Callable[[HandlerFn], HandlerFn]:
         """Decorator: @engine.handler('my_key')"""
@@ -258,6 +266,7 @@ class SchedulerEngine:
         exe = await execute_with_timeout(job, handler)
         await self._store.save_execution(exe)
         await apply_reserved_result(job.id, reservation.token, exe, self._store)
+        await self._timer.publish_run_recorded(job.id, exe)
         return ManualRunResult(status=ManualRunStatus.ACCEPTED, execution=exe)
 
     # ------------------------------------------------------------------

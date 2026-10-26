@@ -300,6 +300,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   tick intervals) is now dropped and reopened at once, instead of waiting
   out the browser's close handshake, and "Retry connection" forces a new
   socket when the current one still looks open but has gone silent.
+- Scheduler: `cron.run.finished` is published only after the run is recorded,
+  so a client that re-reads `cron.list` on it sees the new status, failure
+  streak and last error instead of the previous ones. The event now carries
+  the job's updated `health` (`consecutive_failures`, `last_error`,
+  `degraded`), `lastStatus`/`lastResult`, `nextRun`, the run (`runId`,
+  `status`, `error`, `durationMs`) and the job as `cron.list` renders it, so
+  no re-read is needed; runs that fail before delivery (a handler that raises
+  early, a timeout) now get the event too. A run's delivery status shows the
+  WebSocket leg as `ws:queued`. (#3699)
 - Gateway: SIGTERM — what `agentos gateway stop`, the desktop app, launchd
   and systemd send — now runs the same orderly shutdown as Ctrl+C: turns get
   up to 30 s to finish, channels stop, clients receive the `shutdown` event,

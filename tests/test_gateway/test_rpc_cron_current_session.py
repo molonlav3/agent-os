@@ -642,11 +642,29 @@ def test_delivery_sanitizes_reply_directives_across_cron_outputs() -> None:
     )
 
     assert report.channel_status == "delivered"
-    assert report.ws_status == "delivered"
+    # The WS event waits until the run is recorded (publish_run_finished).
+    assert report.ws_status == "queued"
+    assert ws_events == []
     assert report.session_status == "skipped"
     assert cm.adapter.sent[0].content == "Here is the scheduled reply"
-    assert ws_events[0][2]["summary"] == "Here is the scheduled reply"
     assert forward_calls == []
+
+    from agentos.scheduler.types import JobExecution
+
+    published = asyncio.run(
+        chain.publish_run_finished(
+            job,
+            JobExecution(
+                job_id=job.id,
+                success=True,
+                summary="[[reply_to_current]]Here is the scheduled reply",
+                session_key=CRON_SESSION_KEY,
+            ),
+        )
+    )
+    assert published == "delivered"
+    assert ws_events[0][:2] == ("cron:poem", "cron.run.finished")
+    assert ws_events[0][2]["summary"] == "Here is the scheduled reply"
 
     forward_job = CronJob(
         id="forward-poem",
