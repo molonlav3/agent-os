@@ -131,6 +131,19 @@ def test_an_unknown_level_name_falls_back_to_info_not_to_everything(
     assert cli_main._cli_log_level() == logging.INFO
 
 
+def test_a_level_name_a_library_registered_is_still_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """uvicorn registers ``TRACE`` (5) when it configures logging; a CLI process
+    that has started one must not read ``AGENTOS_LOG_LEVEL=trace`` as level 5."""
+    monkeypatch.setitem(logging._nameToLevel, "TRACE", 5)  # noqa: SLF001
+    monkeypatch.setitem(logging._levelToName, 5, "TRACE")  # noqa: SLF001
+    assert logging.getLevelName("TRACE") == 5
+    monkeypatch.setenv("AGENTOS_LOG_LEVEL", "trace")
+
+    assert cli_main._cli_log_level() == logging.INFO
+
+
 def test_unset_means_info(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AGENTOS_LOG_LEVEL", raising=False)
 

@@ -359,6 +359,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   longer stays "Working" (#3677).
 - A turn cancelled right after it was queued no longer leaves its task (and
   anything waiting on it) hanging.
+- Gateway on Windows: `[hooks.lifecycle]` shell commands, which need
+  `/bin/sh`, are logged as failed with a reason that says so instead of a
+  bare "file not found", and are never started; in-process lifecycle hooks
+  still run. Killing a hung command no longer assumes POSIX process groups.
+- CLI: `AGENTOS_LOG_LEVEL` accepts only the standard level names; `TRACE`
+  stays unknown (and falls back to INFO) even after uvicorn has registered it
+  in the same process.
 
 ### Security
 - Gateway: wrong tokens are rate limited per client address across HTTP and

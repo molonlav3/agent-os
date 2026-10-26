@@ -5,6 +5,7 @@ import platform
 import sys
 from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 from agentos.cli import gateway_cmd, gateway_lifecycle
@@ -849,6 +850,7 @@ def test_stop_sends_a_second_sigterm_before_sigkill(monkeypatch) -> None:
     assert sent == [_signal.SIGTERM, _signal.SIGTERM]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL is POSIX-only")
 def test_stop_falls_back_to_sigkill_when_the_forced_shutdown_hangs(monkeypatch) -> None:
     import signal as _signal
 
@@ -861,6 +863,23 @@ def test_stop_falls_back_to_sigkill_when_the_forced_shutdown_hangs(monkeypatch) 
 
     manager._terminate_pid(4242)  # noqa: SLF001
     assert sent == [_signal.SIGTERM, _signal.SIGTERM, _signal.SIGKILL]
+
+
+def test_stop_without_sigkill_reports_a_hung_gateway_instead_of_raising(monkeypatch) -> None:
+    """Windows has no ``signal.SIGKILL``: the stop gives up after the second
+    SIGTERM and reports that the gateway did not stop, instead of raising."""
+    import signal as _signal
+
+    sent: list[int] = []
+    manager = Manager(host="127.0.0.1", port=18791, shutdown_timeout=0.0)
+    manager.poll_interval = 0.0
+    monkeypatch.setattr(gateway_lifecycle, "FORCED_SHUTDOWN_GRACE_S", 0.0)
+    monkeypatch.setattr(gateway_lifecycle, "signal", SimpleNamespace(SIGTERM=_signal.SIGTERM))
+    monkeypatch.setattr(gateway_lifecycle.os, "kill", lambda pid, sig: sent.append(sig))
+    monkeypatch.setattr(Manager, "_pid_running", lambda self, pid: True)
+
+    assert manager._terminate_pid(4242) is False  # noqa: SLF001
+    assert sent == [_signal.SIGTERM, _signal.SIGTERM]
 
 
 def test_gateway_run_start_error_keeps_bracketed_config_names(tmp_path, monkeypatch) -> None:

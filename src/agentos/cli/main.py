@@ -39,6 +39,13 @@ class _CurrentStderr:
 #: Debug events are diagnostics for the gateway log, not terminal output for
 #: a command someone ran to read its result.
 _CLI_DEFAULT_LOG_LEVEL = "INFO"
+#: The stdlib's own level names. ``logging.getLevelName`` also answers names a
+#: library registered with ``addLevelName`` (uvicorn adds ``TRACE`` = 5 when it
+#: configures logging), so what counted as unknown depended on what the
+#: process had already imported.
+_STDLIB_LOG_LEVEL_NAMES = frozenset(
+    {"CRITICAL", "FATAL", "ERROR", "WARNING", "WARN", "INFO", "DEBUG", "NOTSET"}
+)
 
 
 def _cli_log_level() -> int:
@@ -52,8 +59,9 @@ def _cli_log_level() -> int:
     import os
 
     name = (os.environ.get("AGENTOS_LOG_LEVEL") or _CLI_DEFAULT_LOG_LEVEL).strip().upper()
-    level = logging.getLevelName(name)
-    return level if isinstance(level, int) else logging.INFO
+    if name not in _STDLIB_LOG_LEVEL_NAMES:
+        return logging.INFO
+    return int(getattr(logging, name))
 
 
 def _route_logs_to_stderr() -> None:

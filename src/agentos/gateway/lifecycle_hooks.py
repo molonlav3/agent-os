@@ -19,7 +19,9 @@ ever holds up or fails the gateway transition itself.
 Commands run with ``/bin/sh -c`` under the gateway's own environment minus
 its credentials (gateway token, operator secret, agent tokens), plus
 ``AGENTOS_LIFECYCLE_EVENT`` and ``AGENTOS_LIFECYCLE_REASON``. They are
-file-only: config RPC writes cannot add one.
+file-only: config RPC writes cannot add one. They are POSIX-only: on Windows
+each configured command is reported as failed without being started, while
+in-process hooks still run.
 """
 
 from __future__ import annotations
@@ -162,14 +164,31 @@ _KILL_GRACE_SECONDS = 0.2
 _TEARDOWN_RESERVE_SECONDS = 0.3
 
 
-def _kill_group(pid: int) -> None:
+#: Why a configured command is not started where there is no ``/bin/sh``.
+_NO_POSIX_SHELL = "lifecycle hook commands need /bin/sh and are not run on Windows"
+
+
+def _shell_commands_supported() -> bool:
+    return os.name != "nt"
+
+
+def _kill_group(process: asyncio.subprocess.Process) -> None:
+    """Kill the command's whole process group, or the process where there are none."""
     import signal
 
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pid, signal.SIGKILL)
+    killpg = getattr(os, "killpg", None)
+    sigkill = getattr(signal, "SIGKILL", None)
+    if killpg is not None and sigkill is not None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            killpg(process.pid, sigkill)
+        return
+    with contextlib.suppress(ProcessLookupError):
+        process.kill()
 
 
 async def _run_command(command: str, event: LifecycleEvent) -> None:
+    if not _shell_commands_supported():
+        raise RuntimeError(_NO_POSIX_SHELL)
     process = await asyncio.create_subprocess_exec(
         "/bin/sh",
         "-c",
@@ -186,7 +205,7 @@ async def _run_command(command: str, event: LifecycleEvent) -> None:
         # The command runs in its own session (start_new_session), so its
         # process group is everything it started: kill all of it, not just
         # the shell, or a ``sleep`` it spawned outlives the gateway.
-        _kill_group(process.pid)
+        _kill_group(process)
         with contextlib.suppress(Exception):
             await asyncio.wait_for(process.wait(), timeout=_KILL_GRACE_SECONDS)
         raise

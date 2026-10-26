@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+import structlog
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
@@ -32,6 +34,12 @@ from agentos.gateway.lifecycle_hooks import (
 
 HOOK_TOKEN = "hook-secret"
 GATEWAY_TOKEN = "gateway-secret"
+
+#: Configured commands run through ``/bin/sh``; Windows reports them as failed
+#: without starting them (``test_commands_are_not_started_without_a_posix_shell``).
+posix_shell = pytest.mark.skipif(
+    sys.platform == "win32", reason="lifecycle hook commands need /bin/sh"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -99,6 +107,7 @@ class TestLifecycleHooks:
         asyncio.run(run_lifecycle_hooks(STARTUP))
         assert calls == []
 
+    @posix_shell
     @pytest.mark.asyncio
     async def test_configured_command_runs_without_gateway_credentials(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -119,6 +128,7 @@ class TestLifecycleHooks:
         assert report.failed == [] and len(report.ran) == 1
         assert out.read_text() == "gateway:shutdown|stop|none"
 
+    @posix_shell
     @pytest.mark.asyncio
     async def test_timeout_kills_the_whole_process_group_within_budget(
         self, tmp_path: Path
@@ -147,6 +157,7 @@ class TestLifecycleHooks:
             os.kill(child, 9)
             pytest.fail("the command's child process outlived the budget")
 
+    @posix_shell
     @pytest.mark.asyncio
     async def test_failing_or_hanging_command_is_contained(self, tmp_path: Path) -> None:
         config = GatewayConfig(
@@ -155,6 +166,50 @@ class TestLifecycleHooks:
         report = await run_lifecycle_hooks(PRE_RESTART, config=config, budget=0.5)
         assert report.failed == ["command:exit 3"]
         assert report.timed_out == ["command:sleep 30"]
+
+    @pytest.mark.asyncio
+    async def test_commands_are_not_started_without_a_posix_shell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agentos.gateway import lifecycle_hooks
+
+        spawned: list[tuple[Any, ...]] = []
+
+        async def no_spawn(*argv: Any, **_kwargs: Any) -> Any:
+            spawned.append(argv)
+            raise AssertionError("a command was started")
+
+        monkeypatch.setattr(lifecycle_hooks, "_shell_commands_supported", lambda: False)
+        monkeypatch.setattr(lifecycle_hooks.asyncio, "create_subprocess_exec", no_spawn)
+        seen: list[str] = []
+        register_lifecycle_hook(SHUTDOWN, lambda event: seen.append(event.name), name="flush")
+        config = GatewayConfig(
+            hooks=HooksConfig(lifecycle=LifecycleHooksConfig(shutdown=["echo hi"]))
+        )
+        with structlog.testing.capture_logs() as logs:
+            report = await run_lifecycle_hooks(SHUTDOWN, config=config)
+        assert spawned == []
+        assert report.failed == ["command:echo hi"]
+        assert report.ran == ["flush"] and seen == [SHUTDOWN]
+        (failure,) = [e for e in logs if e["event"] == "gateway.lifecycle_hook_failed"]
+        assert "not run on Windows" in failure["error"]
+
+    def test_kill_falls_back_to_the_process_without_process_groups(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agentos.gateway import lifecycle_hooks
+
+        class _Process:
+            pid = 4242
+            killed = False
+
+            def kill(self) -> None:
+                self.killed = True
+
+        process = _Process()
+        monkeypatch.delattr(lifecycle_hooks.os, "killpg", raising=False)
+        lifecycle_hooks._kill_group(process)  # noqa: SLF001
+        assert process.killed
 
     def test_lifecycle_commands_are_file_only(self) -> None:
         from agentos.gateway.rpc_config import _assert_file_only_paths_unchanged

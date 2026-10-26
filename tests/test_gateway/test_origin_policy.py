@@ -10,6 +10,7 @@ resolution (with ``tailscale`` faked).
 from __future__ import annotations
 
 import socket
+import sys
 from collections.abc import Sequence
 
 import pytest
@@ -444,6 +445,9 @@ def test_new_default_sections_are_not_persisted() -> None:
     assert changed["gateway"]["bind"] == "lan"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="the stub is a /bin/sh script; the app path is macOS-only"
+)
 def test_tailnet_finds_the_macos_app_cli(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     from agentos.gateway import bind_modes
 
