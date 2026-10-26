@@ -48,10 +48,18 @@ CHANNEL_STATES = (
     "connected",
     "disconnected",
     "stuck",
+    "retrying",
+    "start_failed",
     "stopped",
     "terminal",
     "blocked",
 )
+
+#: :meth:`ChannelManager.restart_if_idle` outcomes. Only ``restarted`` means
+#: the channel runs again; ``failed`` means the start raised and a bounded
+#: retry loop took over (the channel reads ``retrying``, then ``stuck`` when
+#: the loop gives up, which the health sweep picks up again).
+RESTART_OUTCOMES = ("restarted", "failed", "busy", "terminal", "stopped", "unknown")
 
 
 #: Channel types whose send path takes a thread id as the address it delivers
@@ -105,7 +113,16 @@ class ChannelManager:
     _started_at: dict[str, float] = field(default_factory=dict)
     _last_event_at: dict[str, float] = field(default_factory=dict)
     _terminal_reasons: dict[str, str] = field(default_factory=dict)
+    # Channels whose last start raised a non-terminal error (network down,
+    # adapter not reachable yet). They read ``start_failed`` and stay eligible
+    # for an automatic restart; an operator stop clears the mark.
+    _start_failed: dict[str, str] = field(default_factory=dict)
     _clock: Callable[[], float] = field(default=time.time, repr=False)
+    # Bounded retry after a failed automatic restart (overridable for tests):
+    # the dispatch loop used to own retries; a restart that fails before a
+    # loop exists hands them to this instead.
+    _start_retry_attempts: int = 6
+    _sleep: Callable[[float], Any] = field(default=asyncio.sleep, repr=False)
     # Inner-loop retry policy (overridable for tests).
     _max_retries: int = 5
     _retry_backoff_initial: float = 1.0
@@ -265,19 +282,35 @@ class ChannelManager:
         statuses: dict[str, bool] = {}
         for name, result in zip(self._channels, results):
             if isinstance(result, BaseException):
-                self._start_errors[name] = {
-                    "error_type": type(result).__name__,
-                    "error": str(result),
-                    "exception": repr(result),
-                }
-                reason = terminal_reason_for(result)
-                if reason:
-                    self._terminal_reasons[name] = reason
+                self._note_start_failure(name, result)
                 statuses[name] = False
             else:
-                self._start_errors.pop(name, None)
+                self._note_start_success(name)
                 statuses[name] = True
         return statuses
+
+    def _note_start_failure(self, name: str, exc: BaseException) -> None:
+        self._start_errors[name] = {
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "exception": repr(exc),
+        }
+        reason = terminal_reason_for(exc)
+        if reason:
+            self._terminal_reasons[name] = reason
+            self._start_failed.pop(name, None)
+        else:
+            self._start_failed[name] = f"{type(exc).__name__}: {exc}"[:200]
+
+    def _note_start_success(self, name: str) -> None:
+        self._start_errors.pop(name, None)
+        self._start_failed.pop(name, None)
+
+    def failed_channels(self) -> dict[str, str]:
+        """Channels that are down for a reason: terminal, or their last start failed."""
+        failed = {name: reason for name, reason in self._start_failed.items()}
+        failed.update(self._terminal_reasons)
+        return {name: failed[name] for name in sorted(failed)}
 
     async def start_stopped(self) -> dict[str, bool]:
         """Start only the channels with no dispatch loop; running ones are left alone.
@@ -293,17 +326,10 @@ class ChannelManager:
             try:
                 await self._safe_start(name)
             except Exception as exc:  # noqa: BLE001 - reported per channel
-                self._start_errors[name] = {
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                    "exception": repr(exc),
-                }
-                reason = terminal_reason_for(exc)
-                if reason:
-                    self._terminal_reasons[name] = reason
+                self._note_start_failure(name, exc)
                 statuses[name] = False
             else:
-                self._start_errors.pop(name, None)
+                self._note_start_success(name)
                 statuses[name] = True
         return statuses
 
@@ -475,6 +501,12 @@ class ChannelManager:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        # A stopped channel is not "dead" or "retrying" any more: without
+        # this a logged-out channel would read ``stuck`` and be revived by
+        # the health sweep. ``restart_channel`` sets the state again.
+        if name in self._dispatch_states:
+            self._dispatch_states[name] = "stopped"
+        self._start_failed.pop(name, None)
         # Cancel and await all in-flight reply tasks for this channel.
         in_flight = self._in_flight_sets.pop(name, None)
         if in_flight is not None:
@@ -502,10 +534,9 @@ class ChannelManager:
         try:
             await self._safe_start(name)
         except Exception as exc:
-            reason = terminal_reason_for(exc)
-            if reason:
-                self._terminal_reasons[name] = reason
+            self._note_start_failure(name, exc)
             raise
+        self._note_start_success(name)
 
     async def start_channel(self, name: str) -> None:
         """Start one channel: a restart when it runs, a first start when it does not."""
@@ -518,23 +549,30 @@ class ChannelManager:
         count = getattr(in_flight, "active_count", None)
         return int(count()) if callable(count) else 0
 
-    async def restart_if_idle(self, name: str) -> bool:
-        """Restart ``name`` unless it is delivering a reply or is terminal.
+    async def restart_if_idle(self, name: str) -> str:
+        """Restart ``name`` unless it is busy, terminal or stopped by the operator.
 
         Used by the gateway's thaw handler and health sweep, never by an
-        operator: returns ``False`` (and does nothing) when the channel is
-        unknown, terminal, stopped by the operator, or busy, so the caller
-        retries on its next pass.
+        operator. Returns one of :data:`RESTART_OUTCOMES`. A restart whose
+        start raises a non-terminal error (the network is not back yet after
+        a wake) is not left stopped: a bounded retry loop takes over and the
+        channel reads ``retrying``; when that loop gives up the channel reads
+        ``stuck``, which the next eligible sweep restarts again. Only a
+        credential-class failure ends automatic restarts (``terminal``).
         """
         if name not in self._channels:
-            return False
+            return "unknown"
         if self._terminal_reasons.get(name):
-            return False
-        if name not in self._tasks and self._dispatch_states.get(name) != "dead":
-            return False
+            return "terminal"
+        if (
+            name not in self._tasks
+            and name not in self._start_failed
+            and self._dispatch_states.get(name) != "dead"
+        ):
+            return "stopped"
         if self.in_flight_count(name) > 0:
             log.info("channel.restart_deferred_busy", channel=name)
-            return False
+            return "busy"
         try:
             await self.restart_channel(name)
         except Exception as exc:  # noqa: BLE001 - the sweep logs and moves on
@@ -544,8 +582,47 @@ class ChannelManager:
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
-            return False
-        return True
+            if self._terminal_reasons.get(name):
+                return "terminal"
+            self._begin_start_retry(name)
+            return "failed"
+        return "restarted"
+
+    def _begin_start_retry(self, name: str) -> None:
+        self._dispatch_states[name] = "retrying"
+        self._tasks[name] = asyncio.create_task(
+            self._retry_start(name), name=f"channel-start-retry:{name}"
+        )
+
+    async def _retry_start(self, name: str) -> None:
+        """Retry a failed start with backoff; ``dead`` (read as ``stuck``) when out of tries."""
+        delay = self._retry_backoff_initial
+        for attempt in range(1, self._start_retry_attempts + 1):
+            await self._sleep(delay)
+            try:
+                await self._safe_start(name)
+            except Exception as exc:  # noqa: BLE001 - every outcome is recorded
+                self._note_start_failure(name, exc)
+                if self._terminal_reasons.get(name):
+                    log.error("channel.start_retry_terminal", channel=name, error=str(exc))
+                    self._dispatch_states[name] = "stopped"
+                    return
+                log.warning(
+                    "channel.start_retry_failed",
+                    channel=name,
+                    attempt=attempt,
+                    max_attempts=self._start_retry_attempts,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                delay = min(delay * 2, self._retry_backoff_max)
+                continue
+            # _safe_start replaced this task with the new dispatch loop.
+            self._note_start_success(name)
+            log.info("channel.start_recovered", channel=name, attempt=attempt)
+            return
+        self._dispatch_states[name] = "dead"
+        log.error("channel.start_retry_exhausted", channel=name)
 
     async def runtime_status(self) -> dict[str, dict[str, Any]]:
         """Per-channel runtime facts for the health sweep and ``channels.status``.
@@ -573,12 +650,14 @@ class ChannelManager:
                 terminal = terminal or f"blocked: {extra.get('blocked')}"
             elif terminal:
                 state = "terminal"
+            elif dispatch_state == "retrying" and task is not None and not task.done():
+                state = "retrying"
             elif dispatch_state == "dead" or (
-                task is not None and task.done() and dispatch_state == "running"
+                task is not None and task.done() and dispatch_state in {"running", "retrying"}
             ):
                 state = "stuck"
             elif task is None:
-                state = "stopped"
+                state = "start_failed" if name in self._start_failed else "stopped"
             elif not connected:
                 state = "disconnected"
             else:
@@ -591,6 +670,7 @@ class ChannelManager:
                 "started_at": self._started_at.get(name),
                 "last_event_at": self._last_event_at.get(name),
                 "terminal_reason": str(terminal) if terminal else None,
+                "start_error": self._start_failed.get(name),
                 "in_flight": self.in_flight_count(name),
             }
         return out

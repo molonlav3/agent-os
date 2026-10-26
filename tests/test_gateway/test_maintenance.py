@@ -268,7 +268,7 @@ async def test_tick_runs_the_safe_mode_reevaluation_hook() -> None:
 def test_policy_payload_names_what_is_never_restarted() -> None:
     payload = ChannelHealthPolicy().to_payload()
     assert payload["never_auto_restart"] == ["blocked", "terminal"]
-    assert payload["restart_states"] == ["disconnected", "stale-socket", "stuck"]
+    assert payload["restart_states"] == ["disconnected", "stale-socket", "start_failed", "stuck"]
     assert payload["sweep_interval_s"] == 300.0
     assert payload["startup_grace_s"] == 60.0
     assert payload["stale_after_s"] == 1800.0

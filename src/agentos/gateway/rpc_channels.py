@@ -44,6 +44,9 @@ def _status_for(*, connected: bool, enabled: bool, dispatch_state: str | None) -
         return "disabled"
     if dispatch_state in {"dead", "exhausted", "restarting"}:
         return dispatch_state
+    if dispatch_state == "retrying":
+        # A failed automatic restart the manager is retrying with backoff.
+        return "restarting"
     return _channel_status(connected)
 
 
@@ -131,7 +134,7 @@ def _runtime_fields(runtime: dict[str, Any] | None, *, now: float) -> dict[str, 
     from agentos.gateway.maintenance import ChannelHealthPolicy, classify, get_maintenance
 
     if not runtime:
-        return {"state": None, "last_event_at": None, "terminal_reason": None}
+        return {"state": None, "last_event_at": None, "terminal_reason": None, "start_error": None}
     maintenance = get_maintenance()
     policy = maintenance.policy if maintenance is not None else ChannelHealthPolicy()
     last_event = runtime.get("last_event_at")
@@ -139,6 +142,7 @@ def _runtime_fields(runtime: dict[str, Any] | None, *, now: float) -> dict[str, 
         "state": classify(runtime, now=now, policy=policy),
         "last_event_at": _iso_ts(last_event),
         "terminal_reason": runtime.get("terminal_reason"),
+        "start_error": runtime.get("start_error"),
     }
 
 

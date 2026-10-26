@@ -66,11 +66,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Sleep/thaw detection and a channel health sweep (#3691): a 30 s maintenance
   tick notices a machine that slept, restarts idle channels, wakes the
   scheduler and logs `gateway.thaw`; every 5 minutes it restarts channels that
-  are `disconnected`, `stuck` or `stale-socket` (no inbound event for 30
-  minutes), at most once per two sweeps, and never one stopped on bad
-  credentials or blocked. `channels.status` reports each channel's `state`,
-  `last_event_at` and `terminal_reason` plus the policy and the last
-  sweep/thaw; doctor flags a terminal channel with the fix.
+  are `disconnected`, `stuck`, `start_failed` or `stale-socket` (no inbound
+  event for 30 minutes), at most once per two sweeps, and never one stopped
+  on bad credentials or blocked. A restart whose start fails (no network yet
+  after a wake) is retried with backoff instead of leaving the channel
+  stopped. `channels.status` reports each channel's `state`, `last_event_at`,
+  `terminal_reason` and `start_error` plus the policy and the last sweep/thaw;
+  `agentos channels status` shows the state, the reason and safe mode;
+  `/ready` names down channels in `failing`; doctor flags a terminal channel
+  with the fix.
 - Cron jobs take a `concurrency` policy (`forbid` default, `replace`, `allow`)
   for a run that comes due while the previous one still runs
   (`agentos cron add|update --concurrency`, `cron.add`/`cron.update`), and

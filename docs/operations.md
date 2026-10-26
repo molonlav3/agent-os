@@ -133,10 +133,11 @@ agentos channels status --json
   then `agentos channels start --yes`, or let it clear by itself after five
   quiet minutes.
 - **Sleep.** After the machine wakes, the gateway restarts idle channels
-  (`gateway.thaw` in the log) and runs each overdue cron job once. A 5-minute
-  health sweep restarts channels that are `disconnected`, `stuck` or
-  `stale-socket`; one stopped on bad credentials (`terminal`) waits for you —
-  doctor shows the fix.
+  (`gateway.thaw` in the log; a restart that fails while the network comes
+  back is retried with backoff) and runs each overdue cron job once. A
+  5-minute health sweep restarts channels that are `disconnected`, `stuck`,
+  `start_failed` or `stale-socket`; one stopped on bad credentials
+  (`terminal`) waits for you — doctor shows the fix.
 - **Missed jobs.** Agent jobs missed while the gateway was down run
   `[scheduler] startup_agent_delay_seconds` (default 120) after boot; see
   [`scheduling.md`](scheduling.md).

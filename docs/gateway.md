@@ -153,13 +153,23 @@ the gateway logs `gateway.thaw`, restarts the channels that are idle (their
 sockets are stale after a sleep), wakes the scheduler and tells connected
 clients to refresh (`health` event). Every 5 minutes (after a 60 s start-up
 grace) it also sweeps channel health and restarts a channel that is
-`disconnected`, `stuck` (its retry loop gave up) or `stale-socket` (no inbound
-event for 30 minutes on a socket or polling transport), at most once per two
-sweeps each. A channel that failed on bad credentials (`terminal`) or that the
-platform `blocked` is never restarted automatically: doctor reports it with
-the fix. `agentos channels status --json` shows each channel's `state`,
-`last_event_at` and `terminal_reason`, and the policy plus the last sweep and
-thaw under `health_policy`.
+`disconnected`, `stuck` (its retry loop gave up), `start_failed` (its last
+start raised, e.g. no network at login) or `stale-socket` (no inbound event
+for 30 minutes on a socket or polling transport), at most once per two sweeps
+each.
+
+A restart that fails — the network is not back yet right after a wake — never
+leaves the channel stopped: the gateway retries the start with backoff
+(1 s, 2 s, 4 s, ... six times; the channel reads `retrying`), and if that
+runs out the channel reads `stuck` and the next sweep starts over. Only a
+channel that failed on bad credentials (`terminal`) or that the platform
+`blocked` is never restarted automatically: doctor reports it with the fix.
+A channel you stopped yourself (`agentos channels logout`) stays `stopped`.
+
+`agentos channels status` shows each channel's `state` and the reason it is
+down, and whether safe mode is on; `--json` adds `last_event_at`,
+`terminal_reason`, `start_error`, and the policy plus the last sweep and thaw
+(`restarted`, `failed`, `skipped` per channel) under `health_policy`.
 
 ## Host and Port
 

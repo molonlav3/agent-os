@@ -70,6 +70,7 @@ async def test_channels_status_includes_configured_channels_without_manager():
             "state": None,
             "last_event_at": None,
             "terminal_reason": None,
+            "start_error": None,
         }
     ]
     policy = rpc_res.payload["health_policy"]

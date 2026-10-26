@@ -674,12 +674,15 @@ running gateway. Without a name it starts every channel that is not running
 and, when the gateway is in safe mode (three unclean boots in five minutes),
 leaves it: cron and heartbeat resume too, and the recorded crashes stop
 counting. With a name it starts only that channel and keeps safe mode on for
-the rest. `agentos channels status --json` reports each channel's runtime
-`state` (`connected`, `disconnected`, `stale-socket`, `stuck`, `stopped`,
-`terminal`, `blocked`), `last_event_at` and `terminal_reason`, plus the
-gateway's automatic restart policy and its last health sweep and sleep/thaw
-under `health_policy`. A `terminal` channel (bad credentials) is never
-restarted automatically; fix it with `channels edit`, then `channels restart`.
+the rest. `agentos channels status` shows each channel's runtime `state`
+(`connected`, `disconnected`, `stale-socket`, `stuck`, `retrying`,
+`start_failed`, `stopped`, `terminal`, `blocked`), why it is down, and
+whether safe mode is on; `--json` adds `last_event_at`, `terminal_reason`,
+`start_error`, and the gateway's automatic restart policy with its last
+health sweep and sleep/thaw under `health_policy`. A failed automatic restart
+is retried with backoff (`retrying`) and later by the sweep; only a
+`terminal` channel (bad credentials) or a `blocked` one is never restarted
+automatically — fix it with `channels edit`, then `channels restart`.
 
 `native-commands` prints the native platform payload derived from the same
 channel command registry used for text `/command` dispatch. Telegram and

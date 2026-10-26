@@ -106,7 +106,7 @@ async def test_a_credential_failure_is_terminal_and_never_auto_restarted(
     status = (await manager.runtime_status())["tg"]
     assert status["state"] == "terminal"
     assert status["terminal_reason"].startswith("auth: RuntimeError: 401 Unauthorized")
-    assert await manager.restart_if_idle("tg") is False
+    assert await manager.restart_if_idle("tg") == "terminal"
     assert adapter.starts == 1
 
     # An operator restart after fixing the token is the way out.
@@ -143,14 +143,14 @@ async def test_restart_if_idle_restarts_running_and_dead_but_not_stopped(
     await manager.start_all()
     await manager.stop_channel("off")
     try:
-        assert await manager.restart_if_idle("tg") is True
+        assert await manager.restart_if_idle("tg") == "restarted"
         assert adapter.starts == 2
-        assert await manager.restart_if_idle("off") is False  # the operator stopped it
-        assert await manager.restart_if_idle("missing") is False
+        assert await manager.restart_if_idle("off") == "stopped"  # the operator stopped it
+        assert await manager.restart_if_idle("missing") == "unknown"
 
         manager._dispatch_states["tg"] = "dead"
         assert (await manager.runtime_status())["tg"]["state"] == "stuck"
-        assert await manager.restart_if_idle("tg") is True
+        assert await manager.restart_if_idle("tg") == "restarted"
     finally:
         await manager.stop_all()
 
@@ -166,10 +166,10 @@ async def test_restart_if_idle_defers_a_channel_with_replies_in_flight(
         token = object()
         assert manager._in_flight_sets["tg"].try_acquire(token)
         assert manager.in_flight_count("tg") == 1
-        assert await manager.restart_if_idle("tg") is False
+        assert await manager.restart_if_idle("tg") == "busy"
         assert adapter.starts == 1
         manager._in_flight_sets["tg"].release(token)
-        assert await manager.restart_if_idle("tg") is True
+        assert await manager.restart_if_idle("tg") == "restarted"
     finally:
         await manager.stop_all()
 

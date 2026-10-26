@@ -13,10 +13,15 @@ gives up (``dead``). One 30 s tick in the gateway handles it:
 * **Health sweep.** Every :attr:`~ChannelHealthPolicy.sweep_interval_s`
   (after a start-up grace) each channel is classified; ``stale-socket`` (no
   inbound event for :attr:`~ChannelHealthPolicy.stale_after_s` on a
-  socket/polling transport), ``disconnected`` and ``stuck`` channels are
-  restarted, at most once per :attr:`~ChannelHealthPolicy.restart_cooldown_sweeps`
-  sweeps each. ``terminal`` (bad credentials) and ``blocked`` channels are
-  never restarted automatically.
+  socket/polling transport), ``disconnected``, ``stuck`` and ``start_failed``
+  channels are restarted, at most once per
+  :attr:`~ChannelHealthPolicy.restart_cooldown_sweeps` sweeps each.
+  ``terminal`` (bad credentials) and ``blocked`` channels are never restarted
+  automatically.
+* **Failed restarts.** A restart whose start raises (the network is not back
+  yet after a wake) is never left stopped: the channel manager retries it with
+  backoff (``retrying``), and when it gives up the channel reads ``stuck``,
+  which the next eligible sweep restarts again.
 * **Safe mode.** The same tick re-evaluates the crash-loop breaker; while
   safe mode holds, no channel is touched.
 
@@ -38,9 +43,12 @@ import structlog
 log = structlog.get_logger(__name__)
 
 #: States the sweep restarts; everything else is left alone.
-RESTARTABLE_STATES = frozenset({"stale-socket", "disconnected", "stuck"})
+RESTARTABLE_STATES = frozenset({"stale-socket", "disconnected", "stuck", "start_failed"})
 #: States that are never restarted automatically, only by an operator.
 NEVER_AUTO_RESTART = frozenset({"terminal", "blocked"})
+#: States a thaw leaves alone besides the terminal ones: stopped by the
+#: operator, or already in the manager's own start-retry loop.
+_THAW_SKIP_STATES = NEVER_AUTO_RESTART | {"stopped", "retrying"}
 #: Transports that are push-only: a quiet webhook is not a stale socket.
 _PASSIVE_TRANSPORTS = frozenset({"webhook"})
 
@@ -114,6 +122,8 @@ class SweepReport:
     index: int
     states: dict[str, str] = field(default_factory=dict)
     restarted: list[str] = field(default_factory=list)
+    #: Restarts that raised; the manager's retry loop owns them now.
+    failed: list[str] = field(default_factory=list)
     skipped: dict[str, str] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
@@ -122,6 +132,7 @@ class SweepReport:
             "index": self.index,
             "states": dict(self.states),
             "restarted": list(self.restarted),
+            "failed": list(self.failed),
             "skipped": dict(self.skipped),
         }
 
@@ -132,6 +143,8 @@ class ThawReport:
     gap_s: float
     cpu_ratio: float
     restarted: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    skipped: dict[str, str] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -139,7 +152,18 @@ class ThawReport:
             "gap_s": round(self.gap_s, 1),
             "cpu_ratio": round(self.cpu_ratio, 4),
             "restarted": list(self.restarted),
+            "failed": list(self.failed),
+            "skipped": dict(self.skipped),
         }
+
+
+def _outcome(raw: Any) -> str:
+    """Normalise a ``restart_if_idle`` result (an outcome string, or a legacy bool)."""
+    if raw is True:
+        return "restarted"
+    if raw is False or raw is None:
+        return "busy"
+    return str(raw)
 
 
 def classify(status: dict[str, Any], *, now: float, policy: ChannelHealthPolicy) -> str:
@@ -258,11 +282,17 @@ class GatewayMaintenance:
         if callable(restart) and not self._safe_mode_active():
             statuses = await _runtime_status(manager)
             for name, status in statuses.items():
-                if status.get("state") in NEVER_AUTO_RESTART or status.get("state") == "stopped":
+                if status.get("state") in _THAW_SKIP_STATES:
                     continue
-                if await restart(name):
+                outcome = _outcome(await restart(name))
+                if outcome == "restarted":
                     report.restarted.append(name)
-                    self._last_restart_sweep[name] = self._sweep_index
+                elif outcome == "failed":
+                    report.failed.append(name)
+                else:
+                    report.skipped[name] = outcome
+                    continue
+                self._last_restart_sweep[name] = self._sweep_index
         scheduler = self._scheduler_ref()
         nudge = getattr(scheduler, "nudge", None)
         if callable(nudge):
@@ -302,12 +332,19 @@ class GatewayMaintenance:
             if not callable(restart):
                 report.skipped[name] = "unsupported"
                 continue
-            if await restart(name):
+            outcome = _outcome(await restart(name))
+            if outcome == "restarted":
                 report.restarted.append(name)
                 self._last_restart_sweep[name] = self._sweep_index
                 log.warning("gateway.channel_auto_restarted", channel=name, state=state)
+            elif outcome == "failed":
+                # Counted as an attempt: the cooldown applies, and the
+                # manager keeps retrying in the meantime.
+                report.failed.append(name)
+                self._last_restart_sweep[name] = self._sweep_index
+                log.warning("gateway.channel_auto_restart_failed", channel=name, state=state)
             else:
-                report.skipped[name] = "busy"
+                report.skipped[name] = outcome
         return report
 
     # ── surface ─────────────────────────────────────────────────────
