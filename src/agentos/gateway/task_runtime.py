@@ -462,6 +462,8 @@ class TaskRuntime:
         *,
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
+        idempotency_key: str | None = None,
+        idempotency_fingerprint: str | None = None,
     ) -> TaskHandle:
         if not self._admitting:
             raise TaskRuntimeNotAdmittingError()
@@ -515,6 +517,13 @@ class TaskRuntime:
                 "fresh_user_session": fresh_user_session,
             },
         )
+        if idempotency_key and isinstance(record.details, dict):
+            # On the task record, not the envelope: the cached envelope is
+            # reused by later runtime sends, which must not inherit the key.
+            # A retry after a restart finds the turn it already started here.
+            record.details["idempotency_key"] = idempotency_key
+            if idempotency_fingerprint:
+                record.details["idempotency_fingerprint"] = idempotency_fingerprint
         await self._storage.create_agent_task(record)
         runtime_task = _RuntimeTask(
             task_id=record.task_id,

@@ -14,6 +14,7 @@ from agentos.application.approval_rpc import (
     approval_snapshot_rpc_payload,
     approval_wait_decision_rpc_payload,
 )
+from agentos.gateway.idempotency import run_idempotent
 from agentos.gateway.rpc import RpcContext, get_dispatcher
 
 _d = get_dispatcher()
@@ -125,6 +126,12 @@ async def _handle_exec_approval_forget(params: dict | None, ctx: RpcContext) -> 
 
 @_d.method("exec.approval.resolve")
 async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    return await run_idempotent(
+        "exec.approval.resolve", params, lambda: _exec_approval_resolve(params)
+    )
+
+
+async def _exec_approval_resolve(params: dict | None) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
     if "approved" not in params:
@@ -188,6 +195,12 @@ async def _handle_plugin_approval_wait_decision(
 
 @_d.method("plugin.approval.resolve")
 async def _handle_plugin_approval_resolve(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    return await run_idempotent(
+        "plugin.approval.resolve", params, lambda: _plugin_approval_resolve(params)
+    )
+
+
+async def _plugin_approval_resolve(params: dict | None) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
     if "approved" not in params:

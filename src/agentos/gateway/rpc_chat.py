@@ -14,6 +14,7 @@ from agentos.chat.source import chat_source_metadata
 from agentos.gateway.access import CONTROL_AND_CHANNEL, CONTROL_ONLY
 from agentos.gateway.config import GatewayConfig
 from agentos.gateway.context_overflow import apply_context_overflow_policy
+from agentos.gateway.idempotency import get_idempotency_cache, idempotency_key, request_fingerprint
 from agentos.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
 from agentos.gateway.session_events import build_sessions_changed_payload
 from agentos.session.compaction import (
@@ -445,9 +446,35 @@ def _schedule_session_title(ctx: RpcContext, session_key: str, message: Any, ext
 
 @_d.method("chat.send")
 async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
+    """Send a chat message.
+
+    ``idempotency_key`` (a client-minted id per message) makes a retry safe:
+    within the dedupe window, and after a restart through the key recorded on
+    the turn's task, the same key returns the first answer and starts nothing.
+    """
     if not isinstance(params, dict) or "message" not in params:
         raise ValueError("params.message is required")
+    key = idempotency_key(params)
+    if key is None or ctx.session_manager is None:
+        return await _chat_send(params, ctx, idempotency=None)
+    fingerprint = request_fingerprint(params)
+    from agentos.gateway.rpc_sessions import _task_still_active
 
+    return await get_idempotency_cache().run(
+        "chat.send",
+        key,
+        fingerprint,
+        lambda: _chat_send(params, ctx, idempotency=(key, fingerprint)),
+        pinned=_task_still_active(ctx),
+    )
+
+
+async def _chat_send(
+    params: dict[str, Any],
+    ctx: RpcContext,
+    *,
+    idempotency: tuple[str, str] | None,
+) -> dict:
     message = params["message"]
     session_key = _canonical_webchat_session_key(params.get("sessionKey"))
     agent_id = parse_agent_id(session_key)
@@ -481,7 +508,12 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             except Exception as exc:
                 raise RpcUnavailableError(f"Failed to initialize chat session: {exc}") from exc
 
-        from agentos.gateway.rpc_sessions import _handle_sessions_send
+        from agentos.gateway.rpc_sessions import _handle_sessions_send, persisted_send_answer
+
+        if idempotency is not None:
+            persisted = await persisted_send_answer(ctx, session_key, *idempotency)
+            if persisted is not None:
+                return {"ok": True, "sessionKey": session_key, **persisted}
 
         incoming_source = params.get("_source")
         if not isinstance(incoming_source, dict):
@@ -524,6 +556,10 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
                 elevated=elevated_hint if isinstance(elevated_hint, str) else None,
             ),
         )
+        if idempotency is not None:
+            # Deduplicated here already; sessions.send only records the key on
+            # the turn's task (so a retry after a restart finds the turn).
+            send_params["_idempotency"] = {"key": idempotency[0], "fingerprint": idempotency[1]}
         result = await _handle_sessions_send(send_params, ctx)
         _schedule_session_title(ctx, session_key, message, extra)
         return {"ok": True, "sessionKey": session_key, **result}

@@ -35,6 +35,8 @@ async def start_turn_via_runtime(
     persisted_user_message_id: str | None = None,
     fresh_user_session: bool | None = None,
     stream_event_sink: Callable[[Any], Awaitable[None]] | None = None,
+    idempotency_key: str | None = None,
+    idempotency_fingerprint: str | None = None,
 ) -> TaskHandle:
     """Enqueue a turn. Exceptions propagate — recovery is surface-specific.
 
@@ -69,4 +71,9 @@ async def start_turn_via_runtime(
         kwargs["fresh_user_session"] = fresh_user_session
     if stream_event_sink is not None:
         kwargs["stream_event_sink"] = stream_event_sink
+    if idempotency_key:
+        # Recorded on the task so a retry after a gateway restart finds it.
+        kwargs["idempotency_key"] = idempotency_key
+        if idempotency_fingerprint:
+            kwargs["idempotency_fingerprint"] = idempotency_fingerprint
     return await runtime.enqueue(envelope, message, **kwargs)

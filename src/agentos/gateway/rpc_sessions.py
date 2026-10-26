@@ -16,6 +16,13 @@ from agentos.engine.start_turn import start_turn_via_runtime
 from agentos.gateway import attachment_ingest as _attachment_ingest
 from agentos.gateway.access import CONTROL_AND_CHANNEL, ConnectionSurface
 from agentos.gateway.agent_tasks import get_agent_task_registry
+from agentos.gateway.idempotency import (
+    get_idempotency_cache,
+    idempotency_key,
+    request_conflict,
+    request_fingerprint,
+    run_idempotent,
+)
 from agentos.gateway.input_normalization import (
     infer_normalized_input_from_attachments,
     materialize_generated_text_attachments,
@@ -862,6 +869,13 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
 
 @_d.method("sessions.create")
 async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
+    """Create a session; a retried ``idempotency_key`` returns the same one."""
+    return await run_idempotent(
+        "sessions.create", params, lambda: _sessions_create_impl(params, ctx)
+    )
+
+
+async def _sessions_create_impl(params: dict | None, ctx: RpcContext) -> dict:
     if not isinstance(params, dict):
         params = {}
     agent_id = normalize_agent_id(params.get("agentId", "main"))
@@ -932,8 +946,79 @@ async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
     return result
 
 
+def _task_still_active(ctx: RpcContext) -> Any:
+    """``pinned`` predicate for an idempotent send: its turn is still live."""
+
+    def _pinned(result: dict[str, Any]) -> bool:
+        task_runtime = getattr(ctx, "task_runtime", None)
+        probe = getattr(task_runtime, "is_task_active", None)
+        task_id = result.get("task_id") if isinstance(result, dict) else None
+        return bool(callable(probe) and isinstance(task_id, str) and probe(task_id))
+
+    return _pinned
+
+
+async def persisted_send_answer(
+    ctx: RpcContext,
+    session_key: str,
+    key: str,
+    fingerprint: str,
+) -> dict[str, Any] | None:
+    """The answer a send with this ``idempotency_key`` already got, from its task.
+
+    The in-memory cache does not survive a restart; the key recorded on the
+    task the send started does. Same key, different request: a conflict.
+    """
+    rows = await _list_task_rows(ctx, get_session_storage(ctx.session_manager), session_key)
+    for row in _sorted_task_rows(rows)[:_PERSISTED_IDEMPOTENCY_SCAN]:
+        details = getattr(row, "details", None)
+        if not isinstance(details, dict) or details.get("idempotency_key") != key:
+            continue
+        recorded = details.get("idempotency_fingerprint")
+        if recorded and recorded != fingerprint:
+            raise request_conflict(key)
+        return {"status": "accepted", "key": session_key, "task_id": getattr(row, "task_id", None)}
+    return None
+
+
+#: Recent tasks of a session searched for a send's recorded idempotency key.
+_PERSISTED_IDEMPOTENCY_SCAN = 50
+
+
+def _recorded_idempotency(params: dict[str, Any], field: str) -> str | None:
+    """The idempotency key / fingerprint to record on the turn's task.
+
+    Set by the deduplicating front of ``sessions.send`` / ``chat.send`` (an
+    internal ``_idempotency`` param), never read from the caller directly.
+    """
+    recorded = params.get("_idempotency")
+    value = recorded.get(field) if isinstance(recorded, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
 @_d.method("sessions.send")
 async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
+    """Start a turn; ``idempotency_key`` makes a retry return the first answer."""
+    key = idempotency_key(params)
+    if key is None or not isinstance(params, dict):
+        return await _sessions_send_impl(params, ctx)
+    fingerprint = request_fingerprint(params)
+    session_key = canonicalize_session_key(_require_key(params))
+
+    async def _send() -> dict[str, Any]:
+        persisted = await persisted_send_answer(ctx, session_key, key, fingerprint)
+        if persisted is not None:
+            return persisted
+        return await _sessions_send_impl(
+            {**params, "_idempotency": {"key": key, "fingerprint": fingerprint}}, ctx
+        )
+
+    return await get_idempotency_cache().run(
+        "sessions.send", key, fingerprint, _send, pinned=_task_still_active(ctx)
+    )
+
+
+async def _sessions_send_impl(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
     if not isinstance(params, dict) or "message" not in params:
         raise ValueError("params.message is required")
@@ -1191,6 +1276,8 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
                 semantic_message=semantic_message_text,
                 persisted_user_message_id=getattr(persisted_entry, "message_id", None),
                 fresh_user_session=fresh_user_session,
+                idempotency_key=_recorded_idempotency(params, "key"),
+                idempotency_fingerprint=_recorded_idempotency(params, "fingerprint"),
             )
         except Exception as exc:
             # Ensure the uuid eviction does NOT fire on this
