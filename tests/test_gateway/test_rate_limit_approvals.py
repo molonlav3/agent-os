@@ -4,8 +4,9 @@ The endpoint used to be exempt from rate limiting altogether, so anyone who
 could reach the gateway could loop it to enumerate every pending exec/plugin
 approval (command, argv, params) and to hold the SQLite read lock against the
 approval/chat pipeline. It is now counted — in a dedicated bucket, because the
-Control UI polls it every 1.5s and charging that to the shared ``/api/*`` cap
-would 429 the operator out of their own approval queue.
+Control UI reads it on every reconnect, focus and resolve (it used to poll it
+every 1.5s), and charging that to the shared ``/api/*`` cap would 429 the
+operator out of their own approval queue.
 """
 
 from __future__ import annotations
@@ -25,16 +26,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _APPROVAL_MONITOR_TS = _REPO_ROOT / "frontend" / "src" / "services" / "approval-monitor.ts"
 
 
-def _frontend_poll_ms() -> int:
-    """ApprovalMonitor's base poll delay, read from the TS source.
-
-    Read rather than duplicated so that lowering ``POLL_MS`` in the frontend
-    actually moves the drift guard below instead of leaving it asserting
-    against a stale copy of the number.
-    """
-    match = re.search(r"^const POLL_MS = (\d+)$", _APPROVAL_MONITOR_TS.read_text(), re.MULTILINE)
-    assert match is not None, f"POLL_MS declaration not found in {_APPROVAL_MONITOR_TS}"
-    return int(match.group(1))
+def _frontend_monitor_source() -> str:
+    """ApprovalMonitor's TS source, read so the guards below track the real client."""
+    return _APPROVAL_MONITOR_TS.read_text()
 
 
 def _build_app(
@@ -147,16 +141,21 @@ def test_disabled_rate_limit_still_bypasses_everything() -> None:
 
 
 def test_default_approvals_bucket_leaves_room_for_several_open_tabs() -> None:
-    """Drift guard: the default must not 429 a normally-polling operator.
+    """Drift guard: the default must not 429 an operator with several tabs open.
 
-    ApprovalMonitor polls every ``POLL_MS``; the default bucket has to clear
-    that rate for a handful of open Control UI tabs with slack left over. The
-    real per-tab rate runs a little above the steady-state figure — the monitor
-    re-polls on focus/visibility change and after each resolve — so the margin
-    here is deliberately more than the tab count implies.
+    ApprovalMonitor no longer polls on a timer: approvals arrive as WebSocket
+    events and ``GET /api/approvals`` is only a backfill (reconnect, focus,
+    visibility, after a resolve). Should an interval poll ever come back, this
+    fails so the bucket gets re-sized for it. The bucket must still clear the
+    old 1.5s poll rate for a handful of tabs, since older consoles still poll.
     """
+    source = _frontend_monitor_source()
+    assert "setInterval(" not in source
+    assert "setTimeout(" not in source
+    assert not re.search(r"^const POLL_MS = ", source, re.MULTILINE)
     defaults = RateLimitConfig()
-    per_tab_per_window = (defaults.window_seconds * 1000) // _frontend_poll_ms()
+    legacy_poll_ms = 1500
+    per_tab_per_window = (defaults.window_seconds * 1000) // legacy_poll_ms
     assert defaults.approvals_max_requests >= per_tab_per_window * 4
     # And it must still be a bound, not an exemption.
     assert defaults.approvals_max_requests > defaults.max_requests

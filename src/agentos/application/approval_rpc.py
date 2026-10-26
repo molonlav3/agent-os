@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from agentos.application.approval_events import approval_display_title
 from agentos.application.approval_queue import ApprovalQueue, ApprovalSettings
 
 
@@ -60,9 +61,9 @@ def approval_request_rpc_payload(
     request_params["approvalMode"] = settings.mode
     approval_id = queue.request(namespace=namespace, params=request_params)
     if settings.mode == "auto-approve":
-        queue.resolve(approval_id, True)
+        queue.resolve(approval_id, True, resolved_by="policy")
     elif settings.mode == "auto-deny":
-        queue.resolve(approval_id, False)
+        queue.resolve(approval_id, False, resolved_by="policy")
     return approval_status_rpc_payload(queue, approval_id, settings.mode)
 
 
@@ -139,27 +140,6 @@ def approval_resolve_rpc_payload(
         payload=payload,
     )
     return approval_status_rpc_payload(queue, approval_id, queue.get_settings().mode)
-
-
-def approval_display_title(namespace: str, params: dict[str, Any] | None) -> str:
-    """One readable line describing a pending approval, for any namespace.
-
-    ACP rows carry a precomputed ``displayTitle`` (``"Codex wants to run:
-    git push"``); exec and plugin rows are described from their own fields.
-    """
-
-    p = params if isinstance(params, dict) else {}
-    title = p.get("displayTitle")
-    if isinstance(title, str) and title.strip():
-        return title.strip()
-    if namespace == "plugin":
-        plugin = str(p.get("pluginId") or "plugin")
-        return f"Plugin {plugin} requests permissions"
-    tool = str(p.get("toolName") or p.get("action_kind") or namespace or "tool")
-    command = p.get("command")
-    if not command and isinstance(p.get("argv"), list):
-        command = " ".join(str(part) for part in p["argv"])
-    return f"{tool}: {command}" if command else tool
 
 
 def approval_pending_rpc_payload(

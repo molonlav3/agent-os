@@ -279,6 +279,7 @@ class ServiceContainer:
     log_retention_task: asyncio.Task | None = None
     otlp_trace_sink: Any = None
     _compaction_listener_remove: Callable[[], None] | None = None
+    _approval_broadcaster: Any = None
     turn_hooks: Sequence[Any] | None = None
     compaction_hooks: Sequence[Any] | None = None
     tool_hooks: Sequence[Any] | None = None
@@ -323,6 +324,14 @@ class ServiceContainer:
             except Exception:
                 pass
             self._compaction_listener_remove = None
+
+        approval_broadcaster = getattr(self, "_approval_broadcaster", None)
+        if approval_broadcaster is not None:
+            try:
+                approval_broadcaster.uninstall()
+            except Exception:
+                pass
+            self._approval_broadcaster = None
 
         # ── 1. Stop scheduled producers (no further writes after this) ──
         if self.heartbeat_watcher is not None:
@@ -2795,6 +2804,12 @@ async def start_gateway_server(
             emit_coro.close()
 
     svc._compaction_listener_remove = add_compaction_listener(_emit_runtime_compaction_event)
+
+    # Approval queue changes reach the consoles as ``approval.requested`` /
+    # ``approval.resolved`` instead of waiting for a REST poll.
+    from agentos.gateway.approval_broadcast import install_approval_broadcaster
+
+    svc._approval_broadcaster = install_approval_broadcaster()
 
     background_completion_manager = BackgroundCompletionManager(
         session_manager=svc.session_manager,

@@ -763,6 +763,24 @@ class ConnectionRegistry:
                 except Exception:
                     pass
 
+    async def broadcast_control(self, event: str, payload: Any = None) -> None:
+        """Send to the operator's Control connections only.
+
+        Channel and node connections, and Control connections an agent holds
+        (``access.agent``), never see these frames: approval prompts are the
+        operator's to answer.
+        """
+        for conn in self.all():
+            access = conn.access
+            if not access.admitted or access.surface != ConnectionSurface.CONTROL:
+                continue
+            if access.agent is not None:
+                continue
+            try:
+                await conn.send_event(event, payload)
+            except Exception:
+                pass
+
 
 class SubscriptionManager:
     """Track which connections are subscribed to session-level and message-level events."""
@@ -1713,5 +1731,7 @@ def _build_features(dispatcher: RpcDispatcher) -> Any:
         "health",
         "heartbeat",
         "cron",
+        "approval.requested",
+        "approval.resolved",
     ]
     return FeaturesInfo(methods=methods, events=events, capabilities=sorted(CAPABILITIES))

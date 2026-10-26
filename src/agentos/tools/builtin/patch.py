@@ -679,11 +679,11 @@ def _request_patch_approval(plan: _PatchApprovalPlan) -> dict[str, object] | Non
         params=plan.params,
     )
     if settings.mode == "auto-approve":
-        queue.resolve(approval_id, True)
+        queue.resolve(approval_id, True, resolved_by="policy")
         queue.consume(approval_id)
         return None
     if settings.mode == "auto-deny":
-        queue.resolve(approval_id, False)
+        queue.resolve(approval_id, False, resolved_by="policy")
         return _approval_payload(
             "approval_denied",
             approval_id,

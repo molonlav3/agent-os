@@ -82,14 +82,14 @@ export function AppProviders({ children }: { children: ReactNode }) {
     }
   }, [rpc])
 
-  // approval_monitor.js — the global approval monitor is a REST poller wired at
-  // app boot (independent of the WS connection). Start it once on mount and
-  // tear it down on unmount so it never outlives the app tree (legacy called
-  // ApprovalMonitor.start() at boot and stop() was never needed in the SPA).
+  // approval_monitor.js — the global approval monitor follows the gateway's
+  // pushed approval.requested / approval.resolved events on this client and
+  // backfills over REST each time it (re)connects. Start it once on mount and
+  // tear it down on unmount so it never outlives the app tree.
   useEffect(() => {
-    approvalMonitor.start()
+    approvalMonitor.start(rpc)
     return () => approvalMonitor.stop()
-  }, [])
+  }, [rpc])
 
   if (!bootstrap) return <div className="p-8 text-sm">{t('shell.connecting')}</div>
 
