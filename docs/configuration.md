@@ -1472,6 +1472,8 @@ pre_restart = []
   credentials in their environment, with `AGENTOS_LIFECYCLE_EVENT` and
   `AGENTOS_LIFECYCLE_REASON` set. Budgets: `startup` 10 s, `shutdown` 5 s,
   `pre_restart` 10 s, shared by every command and in-process hook of that event.
+  They need a POSIX shell: on Windows each one is logged as failed
+  (`gateway.lifecycle_hook_failed`) and not started.
 - `hooks.token` and `hooks.lifecycle` are file-only: `config.set`,
   `config.patch` and `config.apply` refuse to set a token or add a command
   (clearing them is allowed).
