@@ -132,12 +132,18 @@ Next to the state is the source and its age: `Live · 12 s` (age of the last
 frame the gateway sent), `Snapshot · 3 min` (the connection dropped; data is
 from before), or `Unavailable` (never connected). Press the badge for the
 reason and exactly one recovery action: **Retry connection** (reconnects at
-once, skipping the backoff), **Open attention inbox**, or **Open Health**.
+once, skipping the backoff, and opens a new socket when the current one still
+looks open but has gone silent), **Open attention inbox**, or **Open
+Health**. A connection with no frame for 2.5 tick intervals is dropped and
+reopened by itself.
 
 The badge refreshes from the connection itself: the hello, every event frame,
-the gateway's `tick` (every 30 s), `state_version` revisions, and a shallow
-`doctor.status` plus `GET /ready` read on connect and every fourth tick. It
-runs no polling timer of its own.
+the gateway's `tick` (every 30 s), and a shallow `doctor.status` plus
+`GET /ready` read on connect and every fourth tick (a `health` event or a
+`state_version` revision triggers an extra read, once the gateway sends
+them). It runs no polling timer of its own; a one-second display clock only
+ages the "Live · 12 s" readout. Screen readers hear the state when it
+changes, not the ageing freshness.
 
 ## Attention inbox
 
@@ -164,7 +170,10 @@ nav item:
   While the console is offline only the connection issue is listed; the
   last doctor report is not repeated as if it were current.
 
-An empty inbox says "Nothing needs you" only while the view is live.
+Approvals come from the same store as the Approvals page and the list
+updates when that store changes; the inbox adds no timer of its own (items
+show when they started waiting, "since 11:32"). An empty inbox says "Nothing
+needs you" only while the console is connected.
 
 ## Keyboard Shortcuts
 
@@ -383,17 +392,22 @@ browser for every new approval, even with the console closed (HTTPS or
 
 While the gateway connection is down the cards stay listed, with their
 buttons disabled and the reason shown, since an answer could not be
-delivered. The [attention inbox](#attention-inbox) lists the same approvals
-next to agent questions and runtime issues.
+delivered; the global approval prompt does the same. The prompt's **Answer
+later** swaps it for a small dock ("1 approval waiting", **Answer now**,
+**Open inbox**) so the rest of the console and its shortcuts stay usable; a
+new approval brings the prompt back. The [attention inbox](#attention-inbox)
+lists the same approvals next to agent questions and runtime issues.
 
 ## Cron job health
 
-When the gateway reports a job's run health (`health` on `cron.list`), the
-job card shows it: a **Degraded** badge, the consecutive failure count and
-the last error. When the job carries an overlap policy (`concurrency`), an
+A job that keeps failing is marked on its card: a **Degraded** badge, the
+consecutive failure count and the last error. They come from the `health`
+block on `cron.list` when the gateway sends one, and otherwise from the
+job's `consecutive_errors` and last error (the scheduler backs a job off
+from its first consecutive error). When the job carries an overlap policy (`concurrency`), an
 **Overlap** picker sets it (`forbid` skips a run while one is going,
 `replace` stops the running one, `allow` runs them side by side) through
-`cron.update`. Neither appears for a gateway that does not send them. **Run**
+`cron.update`; it does not appear when the job has no `concurrency`. **Run**
 and **Pause** are disabled, with the reason, while the gateway is offline or
 after the scheduler answered that it is not running.
 

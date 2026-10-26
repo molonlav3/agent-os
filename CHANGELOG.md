@@ -205,10 +205,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `protocol_mismatch`, `model_auth_required`, `rate_limited`,
   `channel_terminal`, `safe_mode`, `update_failed`, `doctor_warning`) with
   fix steps in place and a per-session dismiss.
-- Web UI: cron job cards show the run health the gateway reports
-  (Degraded badge, failure streak, last error) and an overlap policy picker
-  (`forbid`, `replace`, `allow`) when the job carries one. The desktop's job
-  detail shows the Degraded chip too.
+- Web UI: cron job cards mark a failing job Degraded, with its failure
+  streak and last error, read from the `health` block when the gateway
+  sends one and otherwise from `consecutive_errors` and the last error
+  (today's payload). An overlap policy picker (`forbid`, `replace`,
+  `allow`) appears only when the job carries `concurrency`. The desktop's
+  job detail shows the Degraded chip too.
 - A contract test (`tests/test_console_required_methods.py`) fails CI when
   the Web UI or the desktop app calls an RPC method the gateway does not
   advertise in `features.methods`.
@@ -277,8 +279,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   pending approvals; a pending approval blocks the update with the reason,
   and the update only starts once confirmed.
 - Web UI: controls that cannot be used right now stay visible, disabled,
-  with the reason (approval answers and cron Run/Pause while the gateway is
-  offline or the scheduler is not running), instead of failing silently.
+  with the reason (approval answers, in the Approvals page and the global
+  approval prompt, and cron Run/Pause while the gateway is offline or the
+  scheduler is not running), instead of failing silently.
+- Web UI: the global approval prompt has an "Answer later" button that
+  swaps it for a small dock ("1 approval waiting", Answer now, Open inbox),
+  so the rest of the console, its keyboard shortcuts and the status bar's
+  recovery action stay usable. A new approval brings the prompt back.
+
+### Fixed
+- Web UI and desktop app: a connection that goes silent (no frame for 2.5
+  tick intervals) is now dropped and reopened at once, instead of waiting
+  out the browser's close handshake, and "Retry connection" forces a new
+  socket when the current one still looks open but has gone silent. A
+  socket that drops during the handshake now reconnects by itself.
 
 ### Deprecated
 - `GET /api/v1/artifacts/{id}?sessionKey=` and
