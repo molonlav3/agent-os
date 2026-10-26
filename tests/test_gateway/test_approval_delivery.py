@@ -179,13 +179,18 @@ class TestWireFormat:
         )
 
     def test_vapid_keys_are_generated_once_with_0600(self, tmp_path: Path) -> None:
+        # Windows has no owner/group/other bits: chmod only toggles read-only,
+        # so the mode is asserted where it means something.
+        posix = os.name != "nt"
         first = VapidKeys.load_or_create(tmp_path)
         path = tmp_path / VAPID_FILENAME
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        if posix:
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
         os.chmod(path, 0o644)
         second = VapidKeys.load_or_create(tmp_path)
         assert second.public_key_b64 == first.public_key_b64
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        if posix:
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert len(b64url_decode(first.public_key_b64)) == 65
 
 

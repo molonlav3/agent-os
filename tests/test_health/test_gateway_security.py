@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from agentos.cli_quoting import quote_cli_arg
 from agentos.gateway.config import (
     AuthConfig,
     AuthRateLimitConfig,
@@ -152,7 +153,11 @@ def test_fix_commands_write_the_config_file(tmp_path) -> None:
     findings = evaluate_gateway_security(gateway_security_payload(config))
     commands = [step.command for f in findings for step in f.fix_steps if step.command]
     assert commands
-    assert all(f"--config '{path}'" in command for command in commands), commands
+    # Quoted for the shell the reader pastes into: single quotes on POSIX,
+    # double quotes on Windows (the path has a space).
+    expected = f"--config {quote_cli_arg(str(path))}"
+    assert " " in str(path) and expected.endswith(("'", '"'))
+    assert all(expected in command for command in commands), commands
 
 
 def test_fix_commands_default_to_the_user_config_without_a_loaded_file() -> None:

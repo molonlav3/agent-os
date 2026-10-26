@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -11,6 +12,19 @@ from agentos.cli import cron_cmd
 from agentos.cli.main import app
 
 runner = CliRunner()
+
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_BOX_DRAWING = re.compile(r"[\u2500-\u257f]")
+
+
+def _plain(output: str) -> str:
+    """Click's usage error as one line of text, whatever the terminal.
+
+    Under CI (``GITHUB_ACTIONS`` forces a terminal) rich colours the error,
+    boxes it and wraps it at the console width, so the message arrives split
+    across box rows with escape codes inside the option name.
+    """
+    return " ".join(_BOX_DRAWING.sub(" ", _ANSI.sub("", output)).split())
 
 
 @pytest.fixture
@@ -64,6 +78,6 @@ def test_an_unknown_policy_is_refused_before_any_call(calls) -> None:
         ["cron", "add", "--every", "5m", "--text", "ping", "--concurrency", "parallel"],
     )
 
-    assert result.exit_code != 0
-    assert "--concurrency must be one of forbid, replace, allow" in result.output
+    assert result.exit_code == 2, result.output
+    assert "--concurrency must be one of forbid, replace, allow" in _plain(result.output)
     assert calls == []

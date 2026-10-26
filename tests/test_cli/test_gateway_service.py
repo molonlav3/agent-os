@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import plistlib
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -20,6 +21,12 @@ from agentos.cli.main import app
 
 runner = CliRunner()
 PROGRAM = ["/opt/agentos/bin/agentos"]
+#: launchd plists and systemd units are POSIX artifacts (``:``-separated PATH,
+#: ``$HOME``-relative unit paths); on Windows ``gateway install`` is refused
+#: instead -- see ``test_cli_install_on_windows_is_refused``, which runs everywhere.
+posix_service = pytest.mark.skipif(
+    sys.platform == "win32", reason="service units are POSIX-only; Windows refuses install"
+)
 
 
 class ScriptedRunner:
@@ -59,6 +66,7 @@ def _spec(tmp_path: Path, platform: gs.ServicePlatform = "launchd", **kw) -> gs.
     )
 
 
+@posix_service
 def test_launchd_plist_carries_the_keep_alive_contract(tmp_path: Path) -> None:
     spec = _spec(tmp_path, config_path=str(tmp_path / "cfg.toml"))
     plist = plistlib.loads(gs.render_launchd_plist(spec).encode())
@@ -213,8 +221,9 @@ def test_program_resolution_prefers_the_running_script(tmp_path: Path) -> None:
     script.parent.mkdir()
     script.write_text("#!/bin/sh\n")
     assert gs.resolve_agentos_program(argv0=str(script), which=lambda _: None) == [str(script)]
+    # Made absolute, not resolved: on Windows that adds the current drive.
     assert gs.resolve_agentos_program(argv0="python", which=lambda _: "/opt/x/agentos") == [
-        "/opt/x/agentos"
+        str(Path("/opt/x/agentos").absolute())
     ]
     assert gs.resolve_agentos_program(argv0="", which=lambda _: None, executable="/py") == [
         "/py",
@@ -247,6 +256,7 @@ def _bind_runner(fn, fake):  # type: ignore[no-untyped-def]
     return _wrapped
 
 
+@posix_service
 def test_cli_install_status_deep_uninstall(cli_env: ScriptedRunner, tmp_path: Path) -> None:
     result = runner.invoke(app, ["gateway", "install", "--port", "18803", "--json"])
     assert result.exit_code == 0, result.output
@@ -300,6 +310,7 @@ def test_cli_status_deep_reports_the_service(tmp_path: Path, monkeypatch) -> Non
 # ── follow-ups: PATH carry-over, service env, port, stop hint, exit-78 backoff ──
 
 
+@posix_service
 def test_the_installing_shells_path_is_carried_after_the_standard_dirs(tmp_path: Path) -> None:
     spec = _spec(tmp_path, environ={"PATH": "/opt/nvm/versions/node/v22/bin:/usr/bin"})
     path = spec.env["PATH"].split(":")

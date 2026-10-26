@@ -186,10 +186,13 @@ async def test_rpc_client_reconnects_and_resubscribes_from_the_last_stream_seq()
             await gateway.wait_connections(2)
             await _until(lambda: client.reconnects == 1)
 
-            assert (
+            # ``reconnects`` counts the new socket before the resubscribe goes
+            # out on it; wait for the frame rather than racing it to the fake.
+            resubscribe = (
                 "sessions.messages.subscribe",
                 {"key": "agent:main:x", "since_stream_seq": 7},
-            ) in (gateway.calls)
+            )
+            await _until(lambda: resubscribe in gateway.calls)
             assert await client.call("status") == {"echo": "status"}
             # Seq numbering restarts on the new connection.
             await gateway.event(1, 1, {"session_key": "agent:main:x", "stream_seq": 8})
@@ -302,10 +305,11 @@ async def test_cli_client_reconnects_after_a_drop_and_after_a_gap(
             await gateway.connections[0].close(1012)
             await gateway.wait_connections(2)
             await _until(lambda: client.reconnects == 1)
-            assert (
+            resubscribe = (
                 "sessions.messages.subscribe",
                 {"key": "agent:main:cli", "since_stream_seq": 5},
-            ) in gateway.calls
+            )
+            await _until(lambda: resubscribe in gateway.calls)
             assert await client.call("status") == {"echo": "status"}
 
             await gateway.event(1, 1, {"n": 1})
