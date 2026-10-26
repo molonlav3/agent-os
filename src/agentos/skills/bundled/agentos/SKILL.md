@@ -126,7 +126,7 @@ than reading a version out of `uv tool list` or `pip show`.
 
 | Group | Subcommands |
 | --- | --- |
-| `gateway` | `run`, `start`, `status`, `stop`, `restart` (`--port`, `--bind`, `--listen`, `--config`, `--json`, `--debug`; `run`/`start` also `--bind-mode loopback\|lan\|tailnet\|custom`; `restart --force` cancels active turns; `status --deep` adds the installed service), `install` (`--port`, `--config`, `--no-start`, `--json`; macOS LaunchAgent / Linux systemd user unit that restarts the gateway; not on Windows), `uninstall` (`--json`). `restart` restarts a gateway it did not start (desktop app, launchd, systemd, terminal) in place over the `gateway.restart` RPC. `run` exits 78 on a config-class failure (bad TOML/config, failed migration, public bind without auth) |
+| `gateway` | `run`, `start`, `status`, `stop`, `restart` (`--port`, `--bind`, `--listen`, `--config`, `--json`, `--debug`; `--bind-mode loopback\|lan\|tailnet\|custom` on `run`/`start`/`status`/`stop`/`restart`; `restart --force` cancels active turns; `status --deep` adds the installed service), `install` (`--port`, `--config`, `--no-start`, `--json`; macOS LaunchAgent / Linux systemd user unit that restarts the gateway; not on Windows), `uninstall` (`--json`). `restart` restarts a gateway it did not start (desktop app, launchd, systemd, terminal) in place over the `gateway.restart` RPC. `run` exits 78 on a config-class failure (bad TOML/config, failed migration, public bind without auth) |
 | `config` | `get [key]` (empty key = show all), `set <dot.key> <value>` |
 | `env` | `list [--missing] [--category]`, `get <NAME> [--reveal] [-y]`, `set <NAME> --stdin`, `import <NAME>`, `unset <NAME> [-y]` |
 | `providers` | `list`, `status`, `configure <id> [-m MODEL] [-k API_KEY] [--base-url] [--proxy]` |
@@ -328,6 +328,7 @@ Default port **18791**, loopback bind. `--listen HOST` overrides
 `--bind` (use `--port PORT` to specify port, e.g. `--listen 0.0.0.0 --port 18791`).
 `--bind-mode lan|tailnet|loopback|custom` (or `[gateway] bind`) picks a listener
 without naming an address; `tailnet` fails rather than fall back to `0.0.0.0`.
+`status`/`stop`/`restart` follow the mode `start` recorded.
 `gateway status` (and `--json`) reports **both**
 the installed CLI version (`cliVersion`) and the running gateway's version
 (`gatewayVersion`); a `versionMismatch` diagnostic means the gateway is running

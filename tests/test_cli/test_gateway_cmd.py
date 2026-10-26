@@ -898,6 +898,7 @@ def test_gateway_run_reports_an_unavailable_bind_mode(tmp_path, monkeypatch) -> 
     recorded = Console(record=True, width=200)
     monkeypatch.setattr(gateway_cmd, "console", recorded)
     monkeypatch.setattr("agentos.gateway.bind_modes.shutil.which", lambda _name: None)
+    monkeypatch.setattr("agentos.gateway.bind_modes.MACOS_APP_CLI", "/nonexistent/Tailscale")
 
     with pytest.raises(typer.Exit) as excinfo:
         gateway_cmd.run_gateway(
@@ -911,3 +912,56 @@ def test_gateway_run_reports_an_unavailable_bind_mode(tmp_path, monkeypatch) -> 
 
     assert excinfo.value.exit_code == 2
     assert "tailscale" in recorded.export_text()
+
+
+def _tailnet_record(pid: int = 321, port: int = 18791) -> dict:
+    record = _record(pid=pid, port=port)
+    record["host"] = "100.101.102.103"
+    record["bindMode"] = "tailnet"
+    return record
+
+
+def test_gateway_status_follows_a_recorded_bind_mode(tmp_path, monkeypatch) -> None:
+    """After ``gateway start --bind-mode tailnet`` a plain ``gateway status``
+    must find the recorded gateway instead of reporting a target mismatch."""
+    monkeypatch.setenv("AGENTOS_STATE_DIR", str(tmp_path / "home"))
+    _write_pidfile(_tailnet_record())
+    _patch_pid_running(monkeypatch, True)
+    _patch_health(monkeypatch, True)
+
+    result = runner.invoke(app, ["gateway", "status", "--json"])
+
+    payload = _payload(result)
+    assert payload["state"] == "running"
+    assert payload["host"] == "100.101.102.103"
+
+
+def test_gateway_stop_follows_a_recorded_bind_mode(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENTOS_STATE_DIR", str(tmp_path / "home"))
+    _write_pidfile(_tailnet_record())
+    _patch_pid_running(monkeypatch, True)
+    _patch_health(monkeypatch, True)
+    terminated: list[int] = []
+    monkeypatch.setattr(Manager, "_terminate_pid", lambda self, pid: terminated.append(pid) or True)
+
+    result = runner.invoke(app, ["gateway", "stop", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert terminated == [321]
+
+
+def test_an_explicit_host_still_reports_the_mismatch(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENTOS_STATE_DIR", str(tmp_path / "home"))
+    _write_pidfile(_tailnet_record())
+    _patch_pid_running(monkeypatch, True)
+    _patch_health(monkeypatch, False)
+
+    result = runner.invoke(app, ["gateway", "status", "--listen", "10.0.0.9", "--json"])
+
+    assert _payload(result)["state"] == "target_mismatch"
+
+
+def test_gateway_start_records_the_bind_mode() -> None:
+    manager = Manager(host="100.101.102.103", port=18791, bind_mode="tailnet")
+    assert manager._record(1, [], "t")["bindMode"] == "tailnet"
+    assert "bindMode" not in Manager(host="127.0.0.1", port=18791)._record(1, [], "t")

@@ -806,6 +806,11 @@ def gateway_status(
         "--deep",
         help="Also report the installed launchd/systemd service (agentos gateway install).",
     ),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (default: what gateway start recorded)",
+    ),
 ) -> None:
     """Inspect the managed gateway process without mutating state."""
     from agentos.cli.gateway_cmd import status_gateway
@@ -818,6 +823,7 @@ def gateway_status(
         gateway_url=gateway_url,
         json_output=json_output,
         deep=deep,
+        bind_mode=bind_mode,
     )
 
 
@@ -877,6 +883,11 @@ def gateway_stop(
     config_path: str | None = typer.Option(None, "--config", help="Override config path."),
     shutdown_timeout: float = typer.Option(10.0, "--timeout", help="Shutdown wait timeout"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (default: what gateway start recorded)",
+    ),
 ) -> None:
     """Stop the recorded gateway process."""
     from agentos.cli.gateway_cmd import stop_gateway
@@ -888,6 +899,7 @@ def gateway_stop(
         config_path=config_path,
         shutdown_timeout=shutdown_timeout,
         json_output=json_output,
+        bind_mode=bind_mode,
     )
 
 
@@ -917,6 +929,11 @@ def gateway_restart(
         help="In-place restart only: cancel active turns instead of draining them",
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (default: what gateway start recorded)",
+    ),
 ) -> None:
     """Restart the gateway: the recorded process, or a healthy unmanaged one in place."""
     from agentos.cli.gateway_cmd import restart_gateway
@@ -930,6 +947,7 @@ def gateway_restart(
         shutdown_timeout=shutdown_timeout,
         force=force,
         json_output=json_output,
+        bind_mode=bind_mode,
     )
 
 

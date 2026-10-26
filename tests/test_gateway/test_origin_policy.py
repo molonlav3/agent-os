@@ -347,6 +347,7 @@ class TestBindModes:
 
     def test_tailnet_without_cli(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("agentos.gateway.bind_modes.shutil.which", lambda _name: None)
+        monkeypatch.setattr("agentos.gateway.bind_modes.MACOS_APP_CLI", "/nonexistent/Tailscale")
         with pytest.raises(BindResolutionError, match="tailscale CLI"):
             tailscale_ipv4()
 
@@ -441,3 +442,15 @@ def test_new_default_sections_are_not_persisted() -> None:
     assert "invoke" not in data["tools"]
     changed = GatewayConfig(gateway=GatewayServeConfig(bind="lan")).to_toml_dict()
     assert changed["gateway"]["bind"] == "lan"
+
+
+def test_tailnet_finds_the_macos_app_cli(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from agentos.gateway import bind_modes
+
+    app_cli = tmp_path / "Tailscale"
+    app_cli.write_text("#!/bin/sh\necho 100.64.1.2\n")
+    app_cli.chmod(0o755)
+    monkeypatch.setattr(bind_modes.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(bind_modes, "MACOS_APP_CLI", str(app_cli))
+    assert bind_modes.tailscale_cli() == str(app_cli)
+    assert bind_modes.tailscale_ipv4() == "100.64.1.2"

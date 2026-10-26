@@ -17,6 +17,7 @@ quietly exposing the gateway on every interface.
 from __future__ import annotations
 
 import ipaddress
+import os
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
@@ -62,17 +63,34 @@ def _default_runner(argv: Sequence[str]) -> tuple[int, str, str]:
     return completed.returncode, completed.stdout, completed.stderr
 
 
+#: Where the macOS app bundles its CLI when ``tailscale`` is not on PATH.
+MACOS_APP_CLI = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+
+
+def tailscale_cli() -> str | None:
+    """The tailscale CLI to run: on PATH, else the macOS app's bundled binary."""
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    if os.path.isfile(MACOS_APP_CLI) and os.access(MACOS_APP_CLI, os.X_OK):
+        return MACOS_APP_CLI
+    return None
+
+
 def tailscale_ipv4(runner: CommandRunner | None = None) -> str:
     """Return this machine's tailnet IPv4, or raise :class:`BindResolutionError`."""
+    cli = "tailscale"
     if runner is None:
-        if shutil.which("tailscale") is None:
+        located = tailscale_cli()
+        if located is None:
             raise BindResolutionError(
-                "bind mode 'tailnet' needs the tailscale CLI on PATH; install Tailscale "
-                "and log in, or use --bind-mode lan / loopback"
+                "bind mode 'tailnet' needs the tailscale CLI on PATH (or the Tailscale "
+                "app); install Tailscale and log in, or use --bind-mode lan / loopback"
             )
+        cli = located
         runner = _default_runner
     try:
-        code, stdout, stderr = runner(["tailscale", "ip", "-4"])
+        code, stdout, stderr = runner([cli, "ip", "-4"])
     except (OSError, subprocess.SubprocessError) as exc:
         raise BindResolutionError(f"bind mode 'tailnet': `tailscale ip -4` failed: {exc}") from exc
     if code != 0:

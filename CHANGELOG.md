@@ -121,7 +121,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and `agentos gateway run|start --bind-mode`. `tailnet` listens on the
   `tailscale ip -4` address and on `127.0.0.1` in one process, and fails to
   start instead of falling back to `0.0.0.0` when Tailscale is unavailable.
-  `--listen` / `--bind` keep working and count as `custom` (#3692).
+  `--listen` / `--bind` keep working and count as `custom`; `status`, `stop`
+  and `restart` follow the bind mode `start` recorded (#3692).
 - `[gateway] public_origin` declares the browser origin a public deployment is
   opened at. The gateway refuses to start the Control UI on a specific public
   address without it (or `control_ui.allowed_origins`), with the fix in the

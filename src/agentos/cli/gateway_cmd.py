@@ -416,6 +416,7 @@ def _lifecycle_manager(
             host = resolution.host
             run_bind_mode = resolution.mode
     resolved_port = port if port is not None else config.port
+    explicit_target = bool(listen) or (bind is not None and bind != "127.0.0.1") or bool(bind_mode)
     return GatewayLifecycleManager(
         host=host,
         port=resolved_port,
@@ -423,6 +424,7 @@ def _lifecycle_manager(
         health_timeout=health_timeout,
         shutdown_timeout=shutdown_timeout,
         bind_mode=run_bind_mode,
+        follow_record=not explicit_target,
     )
 
 
@@ -666,6 +668,11 @@ def status_gateway(
     gateway_url: str | None = typer.Option(None, "--gateway", help="Remote gateway URL"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
     deep: bool = False,
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (default: what gateway start recorded)",
+    ),
 ) -> None:
     """Inspect the managed gateway process without mutating state.
 
@@ -693,7 +700,13 @@ def status_gateway(
         )
         return
 
-    manager = _lifecycle_manager(port=port, bind=bind, listen=listen, config_path=config_path)
+    manager = _lifecycle_manager(
+        port=port,
+        bind=bind,
+        listen=listen,
+        config_path=config_path,
+        bind_mode=bind_mode if isinstance(bind_mode, str) else None,
+    )
     result = manager.status()
     version = None
     runtime = None
@@ -722,6 +735,11 @@ def stop_gateway(
     config_path: str | None = typer.Option(None, "--config", help="Override config path"),
     shutdown_timeout: float = typer.Option(10.0, "--timeout", help="Shutdown wait timeout"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (default: what gateway start recorded)",
+    ),
 ) -> None:
     """Stop the recorded gateway process."""
 
@@ -731,6 +749,7 @@ def stop_gateway(
         listen=listen,
         config_path=config_path,
         shutdown_timeout=shutdown_timeout,
+        bind_mode=bind_mode if isinstance(bind_mode, str) else None,
     )
     _emit_lifecycle_result(_with_service_hint(manager.stop()), json_output=json_output)
 
@@ -874,6 +893,11 @@ def restart_gateway(
         help="In-place restart only: cancel active turns instead of draining them",
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (default: what gateway start recorded)",
+    ),
 ) -> None:
     """Restart the gateway: the recorded process, or a healthy unmanaged one in place."""
 
@@ -884,6 +908,7 @@ def restart_gateway(
         config_path=config_path,
         health_timeout=health_timeout,
         shutdown_timeout=shutdown_timeout,
+        bind_mode=bind_mode if isinstance(bind_mode, str) else None,
     )
     status = manager.status()
     if status.state == "unmanaged":

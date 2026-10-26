@@ -229,7 +229,10 @@ agentos gateway run --listen 127.0.0.1 --port 18791
 ```
 
 `--listen` is an alias for the bind host and wins over `--bind` when both are
-provided; either one means bind mode `custom`. Precedence, highest first:
+provided; either one means bind mode `custom`. `gateway start` records the
+bind mode it used, so a plain `gateway status`, `gateway stop` or `gateway
+restart` finds that gateway again (`--bind-mode` is accepted there too). On
+macOS the Tailscale app's bundled CLI is used when `tailscale` is not on PATH. Precedence, highest first:
 `--listen`, `--bind`, `--bind-mode`, `AGENTOS_LISTEN`, `AGENTOS_GATEWAY_HOST`,
 `[gateway] bind`, the `host` key, `127.0.0.1`.
 
@@ -268,8 +271,8 @@ drive the gateway when its origin is:
 3. a loopback origin on another port (a dev server) when the connection itself
    comes from this machine and not through a proxy.
 
-Anything else is refused with `403` (HTTP) or close code `1008` (WebSocket),
-and CORS never answers `*`. On a loopback bind only loopback addresses count for
+Anything else is refused with `403` — for a WebSocket, at the handshake, before
+the upgrade — and CORS never answers `*`. On a loopback bind only loopback addresses count for
 rule 2. Requests without an `Origin` header — the CLI, `curl`, scripts — are not
 affected; token auth still applies.
 
