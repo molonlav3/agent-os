@@ -102,11 +102,13 @@ def is_loopback_bind(host: str | None) -> bool:
 
 
 def parse_trusted_proxy_set(trusted_proxy: str | None) -> frozenset[str]:
-    """Parse the ``auth.trusted_proxy`` CSV into a normalized IP set.
+    """Parse the ``auth.trusted_proxy`` CSV into a normalized entry set.
 
     Shared by the HTTP middleware (peer admission) and the RPC auth layer
     (per-connection admission) so the two gates cannot drift in how they
     normalize a configured proxy address (case, whitespace, IPv6 brackets).
+    An entry is an IP literal, a CIDR block (``10.0.0.0/8``, ``fd7a::/48``)
+    or, as before, any other string compared exactly.
     """
     if not trusted_proxy:
         return frozenset()
@@ -130,6 +132,16 @@ def _parsed_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | No
         return None
 
 
+def _parsed_network(value: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """The block a CIDR entry denotes (host bits ignored), else ``None``."""
+    if "/" not in value:
+        return None
+    try:
+        return ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return None
+
+
 def peer_is_trusted_proxy(trusted_proxy: str | None, peer_ip: str | None) -> bool:
     """True when the transport ``peer_ip`` is in the trusted-proxy set.
 
@@ -140,9 +152,12 @@ def peer_is_trusted_proxy(trusted_proxy: str | None, peer_ip: str | None) -> boo
     Comparison is on the address, not its spelling. One IPv6 address has many
     valid textual forms, and the operator writing the config and the ASGI
     server reporting the peer need not choose the same one, so ``::1`` was not
-    matching a peer reported as ``0:0:0:0:0:0:0:1``. An entry that is not an IP
-    literal — a hostname, or anything unparseable — keeps the exact string
-    comparison it had, so this only ever matches an address already configured.
+    matching a peer reported as ``0:0:0:0:0:0:0:1``. A CIDR entry admits every
+    address in its block, an IPv4 block also the IPv4-mapped form a
+    dual-stack listener reports (``::ffff:10.0.0.7``); an exact IPv4 entry
+    stays exact. An entry that is neither — a hostname,
+    or anything unparseable — keeps the exact string comparison it had, so
+    this only ever matches an address already configured.
     """
     peer = normalize_peer_ip(peer_ip)
     if not peer:
@@ -153,7 +168,139 @@ def peer_is_trusted_proxy(trusted_proxy: str | None, peer_ip: str | None) -> boo
     peer_address = _parsed_ip(peer)
     if peer_address is None:
         return False
-    return any(peer_address == entry for entry in map(_parsed_ip, configured) if entry is not None)
+    mapped = getattr(peer_address, "ipv4_mapped", None)
+    for entry in configured:
+        network = _parsed_network(entry)
+        if network is not None:
+            if peer_address.version == network.version and peer_address in network:
+                return True
+            # A dual-stack listener reports IPv4 peers as ``::ffff:a.b.c.d``.
+            if mapped is not None and network.version == 4 and mapped in network:
+                return True
+            continue
+        address = _parsed_ip(entry)
+        if address is not None and address == peer_address:
+            return True
+    return False
+
+
+# How long a discovered set of this host's own addresses is reused.
+_LOCAL_ADDRESS_TTL_S = 60.0
+_local_address_cache: tuple[float, frozenset[str]] | None = None
+
+
+def _discover_local_addresses() -> frozenset[str]:
+    """This host's primary outbound IPv4/IPv6 addresses, without DNS.
+
+    ``connect`` on a UDP socket sends nothing; it only asks the kernel which
+    local address would route to a public destination. No route (offline,
+    no IPv6) simply contributes nothing.
+    """
+    import socket
+
+    found: set[str] = set()
+    for family, target in (
+        (socket.AF_INET, ("192.0.2.1", 9)),
+        (socket.AF_INET6, ("2001:db8::1", 9)),
+    ):
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as sock:
+                sock.connect(target)
+                address = sock.getsockname()[0]
+        except OSError:
+            continue
+        parsed = _parsed_ip(normalize_peer_ip(str(address).split("%", 1)[0]))
+        if parsed is not None and not parsed.is_unspecified:
+            found.add(str(parsed))
+    return frozenset(found)
+
+
+def local_interface_addresses() -> frozenset[str]:
+    """This host's own non-loopback addresses (cached for a minute)."""
+    import time
+
+    global _local_address_cache
+    now = time.monotonic()
+    cached = _local_address_cache
+    if cached is not None and now - cached[0] < _LOCAL_ADDRESS_TTL_S:
+        return cached[1]
+    addresses = _discover_local_addresses()
+    _local_address_cache = (now, addresses)
+    return addresses
+
+
+def _forwarded_hop(value: str) -> str | None:
+    """One ``X-Forwarded-For`` entry as a normalized IP literal, or ``None``.
+
+    Tolerates the ``host:port`` and ``[v6]:port`` spellings some proxies use.
+    """
+    hop = value.strip()
+    if hop.startswith("[") and "]" in hop:
+        hop = hop[1 : hop.index("]")]
+    elif hop.count(":") == 1:
+        hop = hop.split(":", 1)[0]
+    hop = normalize_peer_ip(hop)
+    parsed = _parsed_ip(hop)
+    return str(parsed) if parsed is not None else None
+
+
+def _names_this_host(address: str, own: frozenset[str]) -> bool:
+    parsed = _parsed_ip(address)
+    if parsed is None:
+        return False
+    mapped = getattr(parsed, "ipv4_mapped", None)
+    if parsed.is_loopback or (mapped is not None and mapped.is_loopback):
+        return True
+    return any(parsed == other for other in map(_parsed_ip, own) if other is not None)
+
+
+def resolve_client_ip(
+    peer_ip: str | None,
+    forwarded_for: str | None,
+    trusted_proxy: str | None,
+    *,
+    local_addresses: frozenset[str] | None = None,
+) -> str:
+    """The client address a request is attributed to (rate limits, lockouts).
+
+    ``X-Forwarded-For`` is read only when the transport peer is a trusted
+    proxy. A proxy *appends* the address it received the request from, so
+    the header is walked right to left: trusted hops are skipped and the
+    first untrusted one is the client. Taking the left-most entry instead
+    would trust the one value the client wrote itself. An entry that is not
+    an IP literal stops the walk at the last trusted hop.
+
+    A forwarded address that names this host — loopback, or one of its own
+    interface addresses — cannot be a remote client and is treated as a
+    spoof: the header is ignored and the proxy's own address is used, so no
+    one obtains a loopback client's exemptions through a proxy.
+    """
+    peer = normalize_peer_ip(peer_ip)
+    if not peer:
+        return "unknown"
+    if not forwarded_for or not peer_is_trusted_proxy(trusted_proxy, peer):
+        return peer
+    candidate = peer
+    for raw_hop in reversed(forwarded_for.split(",")):
+        if not raw_hop.strip():
+            continue
+        hop = _forwarded_hop(raw_hop)
+        if hop is None:
+            break
+        candidate = hop
+        if not peer_is_trusted_proxy(trusted_proxy, hop):
+            break
+    if candidate == peer:
+        return peer
+    own = local_addresses if local_addresses is not None else local_interface_addresses()
+    if _names_this_host(candidate, own):
+        import structlog
+
+        structlog.get_logger(__name__).warning(
+            "gateway.forwarded_for_spoof_rejected", peer=peer, forwarded_client=candidate
+        )
+        return peer
+    return candidate
 
 
 __all__ = [
@@ -166,7 +313,9 @@ __all__ = [
     "is_loopback_address",
     "is_loopback_bind",
     "normalize_audiences",
+    "local_interface_addresses",
     "normalize_peer_ip",
     "parse_trusted_proxy_set",
     "peer_is_trusted_proxy",
+    "resolve_client_ip",
 ]

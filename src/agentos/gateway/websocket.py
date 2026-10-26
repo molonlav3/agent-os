@@ -3,32 +3,50 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
+from pydantic import ValidationError
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from agentos import __version__
-from agentos.gateway.access import ConnectionSurface
+from agentos.gateway.access import ConnectionSurface, resolve_client_ip
 from agentos.gateway.auth import AccessContext
+from agentos.gateway.auth_rate_limit import TOKEN_SCOPE, AuthGuard
 from agentos.gateway.config import GatewayConfig
 from agentos.gateway.protocol import (
+    CAPABILITIES,
+    MAX_BUFFERED_BYTES,
+    MAX_PREAUTH_PAYLOAD_BYTES,
     PREAUTH_TIMEOUT_MS,
-    PROTOCOL_VERSION,
+    WS_CLOSE_MESSAGE_TOO_BIG,
+    WS_CLOSE_POLICY_VIOLATION,
     WS_CLOSE_SERVICE_RESTART,
+    ClientInfo,
+    ConnectParams,
+    ErrorCode,
+    ErrorDetailCode,
     HelloOk,
     PolicyInfo,
+    ReqFrame,
     ResFrame,
     ServerInfo,
     SnapshotInfo,
     make_error_res,
     make_event,
+    negotiate_protocol,
+    protocol_mismatch_details,
+    validation_error_details,
 )
 from agentos.gateway.rpc import RpcContext, RpcDispatcher
+from agentos.gateway.ws_transport import raise_message_limit
+from agentos.session.keys import canonicalize_session_key
 
 log = structlog.get_logger(__name__)
 
@@ -139,9 +157,9 @@ def is_allowed_ws_origin(
 # When the per-connection writer queue is enabled, every outbound frame
 # (events, RPC responses, ticks) is enqueued from any producer task and
 # drained sequentially by a dedicated writer task. WS-frame ``seq`` is
-# minted by the writer at DEQUEUE time so that lossy drops never consume
-# a seq number — the frontend at ``frontend/src/lib/ws-rpc.ts`` closes the socket
-# on any seq gap.
+# minted by the writer at DEQUEUE time so that a depth-based lossy drop
+# never consumes a seq number — the frontend at ``frontend/src/lib/ws-rpc.ts``
+# closes the socket on any seq gap.
 #
 # ``_LOSSY_EVENTS`` is intentionally narrow: the lossy event MUST NOT be
 # routed through ``SessionStreamRegistry.record()`` upstream, otherwise a
@@ -154,9 +172,56 @@ def is_allowed_ws_origin(
 # upstream invariant.
 _LOSSY_EVENTS: frozenset[str] = frozenset({"tick"})
 
+# Byte-based slow-consumer policy. Each queued frame is serialized at enqueue
+# and its size counted; once more than ``MAX_BUFFERED_BYTES`` (the value
+# ``hello-ok.policy.max_buffered_bytes`` advertises) wait for the writer, a
+# frame in ``_DROPPABLE_EVENTS`` is dropped and its ``seq`` still consumed, so
+# the client sees the gap and resynchronizes (reconnect + replay). Anything
+# else closes the socket 1008 ``slow consumer``: losing a state-bearing frame
+# silently is never an option. Like ``_LOSSY_EVENTS``, these are periodic
+# refreshes that no session stream records.
+_DROPPABLE_EVENTS: frozenset[str] = _LOSSY_EVENTS | frozenset({"presence", "health"})
+
 # Sentinel pushed into the outbox by ``_stop_writer`` to wake a writer
 # blocked in ``await self._outbox.get()`` and exit cleanly.
 _SENTINEL_STOP: Any = object()
+
+
+@dataclass(slots=True)
+class _Flush:
+    """Queued by :meth:`WsConnection.flush`; resolved once the writer reaches it."""
+
+    done: asyncio.Future[None]
+
+
+@dataclass(slots=True)
+class _SeqSkip:
+    """Queued in place of frames dropped under the byte budget.
+
+    The writer consumes ``count`` seqs when it reaches it, so the gap shows
+    exactly where the frames were dropped. Consecutive drops share one.
+    """
+
+    count: int = 1
+
+
+# ``EventFrame.model_dump_json()`` ends with these fields, in this order. An
+# event is serialized at enqueue with ``seq=0`` and the writer swaps in the
+# real seq, so a frame is serialized exactly once.
+_EVENT_SEQ_PLACEHOLDER_SUFFIX = ',"seq":0,"state_version":null}'
+
+
+def _event_wire_template(event: str, payload: Any, meta: dict[str, Any] | None) -> str:
+    return make_event(event, payload, seq=0, meta=meta).model_dump_json()
+
+
+def _event_wire_with_seq(template: str, seq: int) -> str:
+    if template.endswith(_EVENT_SEQ_PLACEHOLDER_SUFFIX):
+        head = template[: -len(_EVENT_SEQ_PLACEHOLDER_SUFFIX)]
+        return f'{head},"seq":{seq},"state_version":null}}'
+    frame = json.loads(template)
+    frame["seq"] = seq
+    return json.dumps(frame, separators=(",", ":"), ensure_ascii=False)
 
 
 @dataclass(slots=True)
@@ -165,7 +230,9 @@ class _OutboundFrame:
 
     ``seq`` is deliberately absent — it is minted by ``_writer_loop`` at
     dequeue time. ``kind`` is used by same-kind eviction; for events it is
-    ``f"event:{event_name}"``, for RPC responses it is ``"res"``.
+    ``f"event:{event_name}"``, for RPC responses it is ``"res"``. ``wire`` is
+    the serialized frame (an event's carries a placeholder seq) and ``size``
+    its length, counted against the byte budget while the frame is queued.
     """
 
     kind: str
@@ -175,6 +242,8 @@ class _OutboundFrame:
     res_frame: ResFrame | None
     meta: dict[str, Any] | None = None
     raw_text: str | None = None
+    wire: str | None = None
+    size: int = 0
 
 
 def _payload_field(payload: Any, key: str) -> Any:
@@ -198,13 +267,23 @@ class WsConnection:
         )
     )
     connected_at: int = field(default_factory=lambda: int(time.time() * 1000))
+    #: The nonce sent in this connection's ``connect.challenge``, kept for a
+    #: signed-connect flow and echoed in ``hello-ok.auth``.
+    challenge_nonce: str | None = None
+    #: The ``client`` block the peer sent in ``connect`` (informational).
+    client_info: ClientInfo | None = None
     _seq: int = field(default=0, init=False)
+    # Seqs consumed by frames dropped under the byte budget; added to the next
+    # minted seq so the client sees the gap.
+    _seq_skips: int = field(default=0, init=False, repr=False)
     _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     # Writer-queue state.
     # ``_queue_enabled`` mirrors the kill-switch config at registration time;
     # once a connection starts in legacy mode it stays in legacy mode for life.
     _queue_enabled: bool = field(default=False, init=False, repr=False)
     _writer_queue_maxsize: int = field(default=512, init=False, repr=False)
+    _max_buffered_bytes: int = field(default=MAX_BUFFERED_BYTES, init=False, repr=False)
+    _buffered_bytes: int = field(default=0, init=False, repr=False)
     _outbox: asyncio.Queue[Any] | None = field(default=None, init=False, repr=False)
     _writer_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _closing: bool = field(default=False, init=False, repr=False)
@@ -214,8 +293,14 @@ class WsConnection:
     def authenticated(self) -> bool:
         return self.access.admitted
 
+    @property
+    def buffered_bytes(self) -> int:
+        """Approximate bytes queued for the writer and not yet sent."""
+        return self._buffered_bytes
+
     def next_seq(self) -> int:
-        self._seq += 1
+        self._seq += 1 + self._seq_skips
+        self._seq_skips = 0
         return self._seq
 
     # ------------------------------------------------------------------
@@ -233,6 +318,11 @@ class WsConnection:
         # ``_force_close`` cannot flip ``_closing`` mid-flight (asyncio is
         # single-threaded; only awaits yield).
         if self._queue_enabled and self._outbox is not None and not self._closing:
+            try:
+                wire = _event_wire_template(event, payload, meta)
+            except Exception:  # noqa: BLE001 - one bad payload must not kill the writer
+                log.warning("gateway.ws_event_serialize_failed", conn_id=self.conn_id, event=event)
+                return
             classification = "lossy" if event in _LOSSY_EVENTS else "control"
             frame = _OutboundFrame(
                 kind=f"event:{event}",
@@ -241,40 +331,48 @@ class WsConnection:
                 event_name=event,
                 res_frame=None,
                 meta=meta,
+                wire=wire,
+                size=len(wire),
             )
             self._enqueue_frame(frame)
             return
-        # Legacy direct-send path (pre-auth, kill-switch off, or post-stop).
+        if self._queue_enabled:
+            # The writer is being torn down (overflow or disconnect): the frame
+            # has nowhere to go, and sending it directly would block this
+            # producer on the very socket that stopped reading.
+            return
+        # Legacy direct-send path (pre-auth, kill-switch off).
         async with self._send_lock:
             if self.ws.client_state == WebSocketState.CONNECTED:
-                wire = make_event(event, payload, seq=self.next_seq(), meta=meta)
-                await self.ws.send_text(wire.model_dump_json())
+                wire_frame = make_event(event, payload, seq=self.next_seq(), meta=meta)
+                await self.ws.send_text(wire_frame.model_dump_json())
 
     async def send_res(self, frame: ResFrame) -> None:
         # RPC responses are always CONTROL: they carry state-bearing payloads
         # and a slow-client overflow must close the connection rather than
         # silently dropping the response.
         if self._queue_enabled and self._outbox is not None and not self._closing:
+            raw = frame.model_dump_json()
             outbound = _OutboundFrame(
                 kind="res",
                 classification="control",
                 payload=None,
                 event_name=None,
                 res_frame=frame,
+                raw_text=raw,
+                size=len(raw),
             )
             self._enqueue_frame(outbound)
             return
+        if self._queue_enabled:
+            return  # writer torn down; see send_event
         async with self._send_lock:
             if self.ws.client_state == WebSocketState.CONNECTED:
                 await self.ws.send_text(frame.model_dump_json())
 
     async def send_pong(self) -> None:
         raw = '{"type":"pong"}'
-        if (
-            self._queue_enabled
-            and self._outbox is not None
-            and not self._closing
-        ):
+        if self._queue_enabled and self._outbox is not None and not self._closing:
             outbound = _OutboundFrame(
                 kind="pong",
                 classification="control",
@@ -282,9 +380,12 @@ class WsConnection:
                 event_name=None,
                 res_frame=None,
                 raw_text=raw,
+                size=len(raw),
             )
             self._enqueue_frame(outbound)
             return
+        if self._queue_enabled:
+            return  # writer torn down; see send_event
         async with self._send_lock:
             if self.ws.client_state == WebSocketState.CONNECTED:
                 await self.ws.send_text(raw)
@@ -295,11 +396,36 @@ class WsConnection:
         except Exception:
             pass
 
+    async def flush(self, timeout: float = 1.0) -> None:
+        """Wait (at most ``timeout``) until every frame queued so far is written.
+
+        A no-op without a running writer. Used before a shutdown closes the
+        socket, so the ``shutdown`` event already queued reaches the client.
+        """
+        if (
+            not self._queue_enabled
+            or self._outbox is None
+            or self._writer_task is None
+            or self._closing
+        ):
+            return
+        done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        try:
+            self._outbox.put_nowait(_Flush(done))
+        except asyncio.QueueFull:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(done), timeout=timeout)
+        except TimeoutError:
+            log.debug("gateway.ws_flush_timeout", conn_id=self.conn_id)
+
     # ------------------------------------------------------------------
     # Writer task lifecycle
     # ------------------------------------------------------------------
 
-    def _start_writer(self, *, maxsize: int, enabled: bool) -> None:
+    def _start_writer(
+        self, *, maxsize: int, enabled: bool, max_buffered_bytes: int = MAX_BUFFERED_BYTES
+    ) -> None:
         """Idempotently boot the per-connection writer task.
 
         Called from ``handle_ws_connection`` immediately after
@@ -311,6 +437,7 @@ class WsConnection:
             return
         self._queue_enabled = bool(enabled)
         self._writer_queue_maxsize = int(maxsize)
+        self._max_buffered_bytes = max(1, int(max_buffered_bytes))
         if not self._queue_enabled:
             return
         self._outbox = asyncio.Queue(maxsize=self._writer_queue_maxsize)
@@ -408,7 +535,8 @@ class WsConnection:
 
         WS-frame ``seq`` is minted here, at dequeue. This guarantees a
         contiguous monotonic ``seq`` even when producers' lossy frames are
-        dropped by ``_enqueue_frame`` — drops never consume a seq.
+        evicted by ``_enqueue_frame`` — evictions never consume a seq. Only
+        a byte-budget drop does, on purpose (see ``_DROPPABLE_EVENTS``).
         """
         assert self._outbox is not None
         try:
@@ -416,21 +544,32 @@ class WsConnection:
                 item = await self._outbox.get()
                 if item is _SENTINEL_STOP or self._closing:
                     return
+                if isinstance(item, _SeqSkip):
+                    self._seq += item.count
+                    continue
+                if isinstance(item, _Flush):
+                    if not item.done.done():
+                        item.done.set_result(None)
+                    continue
                 if not isinstance(item, _OutboundFrame):
                     continue
+                self._buffered_bytes = max(0, self._buffered_bytes - item.size)
                 if self.ws.client_state != WebSocketState.CONNECTED:
                     return
                 try:
                     if item.raw_text is not None:
                         await self.ws.send_text(item.raw_text)
                     elif item.event_name is not None:
-                        wire = make_event(
-                            item.event_name,
-                            item.payload,
-                            seq=self.next_seq(),
-                            meta=item.meta,
-                        )
-                        await self.ws.send_text(wire.model_dump_json())
+                        if item.wire is not None:
+                            text = _event_wire_with_seq(item.wire, self.next_seq())
+                        else:
+                            text = make_event(
+                                item.event_name,
+                                item.payload,
+                                seq=self.next_seq(),
+                                meta=item.meta,
+                            ).model_dump_json()
+                        await self.ws.send_text(text)
                     elif item.res_frame is not None:
                         await self.ws.send_text(item.res_frame.model_dump_json())
                 except WebSocketDisconnect:
@@ -447,6 +586,14 @@ class WsConnection:
         except asyncio.CancelledError:
             raise
 
+    def _over_byte_budget(self, frame: _OutboundFrame) -> bool:
+        # A single frame larger than the budget still goes out when nothing
+        # else is waiting; the budget bounds a backlog, not one response.
+        return (
+            self._buffered_bytes > 0
+            and self._buffered_bytes + frame.size > self._max_buffered_bytes
+        )
+
     def _enqueue_frame(self, frame: _OutboundFrame) -> None:
         """Synchronous enqueue with classification-aware overflow.
 
@@ -457,8 +604,29 @@ class WsConnection:
         """
         if self._outbox is None:
             return
+        if self._over_byte_budget(frame):
+            if frame.event_name is not None and frame.event_name in _DROPPABLE_EVENTS:
+                # Consume the seq this frame would have taken: the client
+                # sees a gap and resynchronizes instead of silently missing
+                # a refresh.
+                self._record_seq_skip()
+                log.warning(
+                    "gateway.ws_writer_drop",
+                    conn_id=self.conn_id,
+                    event_name=frame.event_name,
+                    session_key=_payload_field(frame.payload, "session_key"),
+                    stream_seq=_payload_field(frame.payload, "stream_seq"),
+                    queue_depth=self._outbox.qsize(),
+                    buffered_bytes=self._buffered_bytes,
+                    eviction=False,
+                    seq_consumed=True,
+                )
+                return
+            self._schedule_slow_consumer_close(frame)
+            return
         try:
             self._outbox.put_nowait(frame)
+            self._buffered_bytes += frame.size
             return
         except asyncio.QueueFull:
             pass
@@ -468,6 +636,7 @@ class WsConnection:
             if evicted:
                 try:
                     self._outbox.put_nowait(frame)
+                    self._buffered_bytes += frame.size
                     log.warning(
                         "gateway.ws_writer_drop",
                         conn_id=self.conn_id,
@@ -516,6 +685,38 @@ class WsConnection:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+    def _record_seq_skip(self) -> None:
+        """Mark one dropped frame's seq at its place in the stream."""
+        assert self._outbox is not None
+        backing = self._outbox._queue  # type: ignore[attr-defined]
+        if backing and isinstance(backing[-1], _SeqSkip):
+            backing[-1].count += 1
+            return
+        try:
+            self._outbox.put_nowait(_SeqSkip())
+        except asyncio.QueueFull:
+            # No room for a marker: charge it to the next frame minted.
+            self._seq_skips += 1
+
+    def _schedule_slow_consumer_close(self, frame: _OutboundFrame) -> None:
+        """Non-droppable frame over the byte budget: close 1008 ``slow consumer``."""
+        self._closing = True
+        log.error(
+            "gateway.ws_slow_consumer_close",
+            conn_id=self.conn_id,
+            event_name=frame.event_name,
+            kind=frame.kind,
+            frame_bytes=frame.size,
+            buffered_bytes=self._buffered_bytes,
+            max_buffered_bytes=self._max_buffered_bytes,
+        )
+        task = asyncio.create_task(
+            self._force_close(reason="slow consumer", code=WS_CLOSE_POLICY_VIOLATION),
+            name=f"ws-slow-consumer-close-{self.conn_id}",
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     def _evict_oldest_same_kind(self, kind: str) -> bool:
         """Evict the oldest queued frame whose ``kind`` matches.
 
@@ -531,6 +732,7 @@ class WsConnection:
         for index, queued in enumerate(backing):
             if isinstance(queued, _OutboundFrame) and queued.kind == kind:
                 del backing[index]
+                self._buffered_bytes = max(0, self._buffered_bytes - queued.size)
                 return True
         return False
 
@@ -636,6 +838,19 @@ def get_registry() -> ConnectionRegistry:
     return _registry
 
 
+def _utf8_size_exceeds(text: str, limit: int) -> bool:
+    """Whether ``text`` encodes to more than ``limit`` UTF-8 bytes (cheap first)."""
+    if len(text) > limit:
+        return True
+    if len(text) * 4 <= limit:
+        return False
+    return len(text.encode("utf-8", "surrogatepass")) > limit
+
+
+def _malformed(req_id: str, message: str, details: dict[str, Any]) -> ResFrame:
+    return make_error_res(req_id, ErrorCode.INVALID_REQUEST, message, details=details)
+
+
 async def handle_ws_connection(
     ws: WebSocket,
     config: GatewayConfig,
@@ -658,6 +873,7 @@ async def handle_ws_connection(
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
     bind_is_loopback: bool | None = None,
+    auth_guard: AuthGuard | None = None,
 ) -> None:
     """Main WebSocket connection handler."""
     conn_id = str(uuid.uuid4())
@@ -673,116 +889,46 @@ async def handle_ws_connection(
     origin = ws.headers.get("origin")
     if not is_allowed_ws_origin(origin, config, bind_is_loopback=bind_is_loopback):
         log.warning("ws.origin_rejected", conn_id=conn_id, origin=origin)
-        await ws.close(code=1008)  # policy violation
+        await ws.close(code=WS_CLOSE_POLICY_VIOLATION)
         return
 
-    await ws.accept()
-    log.info("ws.connected", conn_id=conn_id, remote=str(ws.client))
-
-    # Step 1: Send connect.challenge
-    nonce = str(uuid.uuid4())
-    try:
-        await conn.send_event("connect.challenge", {"nonce": nonce})
-    except WebSocketDisconnect:
-        return
-
-    # Step 2: Pre-auth timeout — client must send connect request
-    try:
-        preauth_timeout = PREAUTH_TIMEOUT_MS / 1000
-        raw = await asyncio.wait_for(ws.receive_text(), timeout=preauth_timeout)
-    except TimeoutError:
-        log.warning("ws.preauth_timeout", conn_id=conn_id)
-        await conn.close()
-        return
-    except WebSocketDisconnect:
-        return
-
-    # Step 3: Parse the connect request
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        await conn.send_res(
-            make_error_res("handshake", "INVALID_REQUEST", "Invalid JSON in connect frame")
-        )
-        await conn.close()
-        return
-
-    if data.get("type") != "req" or data.get("method") != "connect":
-        await conn.send_res(
-            make_error_res(
-                data.get("id", "handshake"),
-                "INVALID_REQUEST",
-                "First message must be connect request",
-            )
-        )
-        await conn.close()
-        return
-
-    req_id = data.get("id", "handshake")
-    params_raw = data.get("params", {}) or {}
-
-    # Step 4: Resolve binary admission and the fixed protocol surface.
-    from agentos.gateway.auth import resolve_auth
-
-    auth_params = params_raw.get("auth", {}) or {}
     peer_ip = ws.client.host if ws.client is not None else None
-    access = resolve_auth(
-        config,
-        auth_params=auth_params,
-        client_kind=params_raw.get("clientKind", "control"),
-        peer_ip=peer_ip,
+    client_ip = resolve_client_ip(
+        peer_ip, ws.headers.get("x-forwarded-for"), config.auth.trusted_proxy
     )
-    if access is None:
-        await conn.send_res(make_error_res(req_id, "UNAUTHORIZED", "Authentication failed"))
-        await conn.close()
-        return
-    # An agent's connection is marked as such for its whole life: the trading
-    # handlers read this instead of trusting an ``initiator`` param.
-    from agentos.gateway.agent_surface import get_agent_surface
-
-    access = get_agent_surface().attach(access, auth_params)
-
-    # Step 5: Negotiate protocol version
-    min_proto = params_raw.get("minProtocol", 1)
-    max_proto = params_raw.get("maxProtocol", PROTOCOL_VERSION)
-    negotiated = min(max_proto, PROTOCOL_VERSION)
-    if negotiated < min_proto:
-        await conn.send_res(
-            make_error_res(req_id, "INVALID_REQUEST", "Unsupported protocol version range")
+    # Pre-auth budget: a peer may hold only so many sockets that have not
+    # finished the handshake. Refused before accept(): no timer, no buffer.
+    preauth = auth_guard.preauth if auth_guard is not None else None
+    if preauth is not None and not preauth.try_acquire(client_ip):
+        log.warning(
+            "ws.preauth_budget_exceeded",
+            conn_id=conn_id,
+            client_ip=client_ip,
+            limit=preauth.limit,
         )
-        await conn.close()
+        # Refused before accept(): the upgrade never completes, so the client
+        # sees an HTTP 403 response rather than a WebSocket close code.
+        await ws.close(code=1013)
         return
-
-    conn.access = access
-
-    # Step 6: Send HelloOk
-    hello = HelloOk(
-        protocol=negotiated,
-        server=ServerInfo(version=__version__, conn_id=conn_id),
-        features=_build_features(dispatcher),
-        snapshot=SnapshotInfo(
-            uptime_ms=int(time.time() * 1000),
-            config_path=config.config_path,
-            state_dir=config.state_dir,
-            auth_mode=config.auth.mode,
-        ),
-        policy=PolicyInfo(
-            agent_stream_heartbeat_interval_ms=int(
-                max(0.0, float(getattr(config, "agent_stream_heartbeat_interval_seconds", 15.0)))
-                * 1000
-            ),
-            agent_stream_idle_timeout_ms=int(
-                max(0.0, float(getattr(config, "agent_stream_idle_timeout_seconds", 600.0))) * 1000
-            ),
-            webui_stream_idle_grace_ms=int(
-                max(0.0, float(getattr(config, "webui_stream_idle_grace_seconds", 630.0))) * 1000
-            ),
-            client_ws_keepalive_timeout_ms=int(
-                max(0.0, float(getattr(config, "client_ws_keepalive_timeout_s", 120.0))) * 1000
-            ),
-        ),
-    )
-    await ws.send_text(hello.model_dump_json())
+    try:
+        hello = await _handshake(
+            conn,
+            config,
+            dispatcher,
+            peer_ip=peer_ip,
+            client_ip=client_ip,
+            origin=origin,
+            auth_guard=auth_guard,
+        )
+    finally:
+        if preauth is not None:
+            preauth.release(client_ip)
+    if hello is None:
+        return
+    # Frames before hello-ok were held to MAX_PREAUTH_PAYLOAD_BYTES at the
+    # transport (ws_transport.GatewayWebSocketProtocol); from here on the
+    # advertised max_payload applies.
+    raise_message_limit(getattr(ws, "scope", None), hello.policy.max_payload)
 
     registry.register(conn)
     # Boundary: pre-auth direct-send ends here. After registry.register(conn),
@@ -796,8 +942,17 @@ async def handle_ws_connection(
     conn._start_writer(
         maxsize=config.ws_writer_queue_maxsize,
         enabled=config.ws_writer_queue_enabled,
+        max_buffered_bytes=hello.policy.max_buffered_bytes,
     )
-    log.info("ws.authenticated", conn_id=conn_id, surface=conn.access.surface.value)
+    client = conn.client_info
+    log.info(
+        "ws.authenticated",
+        conn_id=conn_id,
+        surface=conn.access.surface.value,
+        client_id=client.id if client else None,
+        client_version=client.version if client else None,
+        client_mode=client.mode if client else None,
+    )
 
     # Step 7: Main message loop
     tick_task = asyncio.create_task(_tick_loop(conn, hello.policy.tick_interval_ms))
@@ -846,16 +1001,273 @@ async def handle_ws_connection(
         log.info("ws.disconnected", conn_id=conn_id)
 
 
-#: Methods answered off the connection's request loop. Requests on one
-#: connection are otherwise handled strictly in order (``chat.send`` before
-#: ``sessions.abort``, ``subscribe`` before the history read, ``reset`` before
-#: the next send), and clients rely on that. These handlers wait seconds on a
-#: model or the network, and neither write state nor read anything a later
-#: request on the same connection depends on, so they run concurrently and
-#: their response goes out when it is ready (frames carry the request id).
-#: ``chat.suggestNext`` -- an auxiliary model call at every turn end -- held
-#: back ``chat.history``, ``sessions.list`` and ``acp.status`` by ~5 s.
-DETACHED_METHODS: frozenset[str] = frozenset(
+async def _handshake(
+    conn: WsConnection,
+    config: GatewayConfig,
+    dispatcher: RpcDispatcher,
+    *,
+    peer_ip: str | None,
+    client_ip: str,
+    origin: str | None,
+    auth_guard: AuthGuard | None,
+) -> HelloOk | None:
+    """``connect.challenge`` → ``connect`` → ``hello-ok``; ``None`` when refused.
+
+    Every frame before ``hello-ok`` is capped at ``MAX_PREAUTH_PAYLOAD_BYTES``
+    and validated against ``ReqFrame`` / ``ConnectParams``; a refusal sends
+    one typed error response and closes the socket.
+    """
+    ws = conn.ws
+    await ws.accept()
+    log.info("ws.connected", conn_id=conn.conn_id, remote=str(ws.client))
+
+    # Step 1: Send connect.challenge. The nonce stays on the connection (a
+    # signed connect answers it) and comes back in hello-ok.auth so a client
+    # can check it answered this challenge; ts is the server clock (ms).
+    nonce = str(uuid.uuid4())
+    conn.challenge_nonce = nonce
+    try:
+        await conn.send_event("connect.challenge", {"nonce": nonce, "ts": int(time.time() * 1000)})
+    except WebSocketDisconnect:
+        return None
+
+    # Step 2: Pre-auth timeout — client must send connect request
+    try:
+        preauth_timeout = PREAUTH_TIMEOUT_MS / 1000
+        raw = await asyncio.wait_for(ws.receive_text(), timeout=preauth_timeout)
+    except TimeoutError:
+        log.warning("ws.preauth_timeout", conn_id=conn.conn_id)
+        await conn.close()
+        return None
+    except WebSocketDisconnect:
+        return None
+    except KeyError:
+        # A binary frame: the protocol is JSON text only.
+        await conn.send_res(
+            _malformed(
+                "handshake",
+                "The connect frame must be a JSON text frame",
+                {"code": ErrorDetailCode.INVALID_FRAME.value},
+            )
+        )
+        await conn.close(code=1003)
+        return None
+
+    # Step 3: Size gate, then parse and validate the connect request. The
+    # transport already refuses larger frames before reading them when the
+    # gateway runs under ws_transport.GatewayWebSocketProtocol; this check
+    # covers any other ASGI server.
+    if _utf8_size_exceeds(raw, MAX_PREAUTH_PAYLOAD_BYTES):
+        log.warning("ws.preauth_frame_too_large", conn_id=conn.conn_id, chars=len(raw))
+        await conn.send_res(
+            _malformed(
+                "handshake",
+                "Frame exceeds the pre-authentication size limit",
+                {
+                    "code": ErrorDetailCode.PAYLOAD_TOO_LARGE.value,
+                    "limit_bytes": MAX_PREAUTH_PAYLOAD_BYTES,
+                },
+            )
+        )
+        await conn.close(code=WS_CLOSE_MESSAGE_TOO_BIG)
+        return None
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        await conn.send_res(
+            _malformed(
+                "handshake",
+                "Invalid JSON in connect frame",
+                {"code": ErrorDetailCode.INVALID_FRAME.value},
+            )
+        )
+        await conn.close(code=1002)
+        return None
+
+    raw_id = data.get("id") if isinstance(data, dict) else None
+    fallback_id = raw_id if isinstance(raw_id, str) else "handshake"
+    if not isinstance(data, dict) or data.get("type") != "req" or data.get("method") != "connect":
+        await conn.send_res(
+            _malformed(
+                fallback_id,
+                "First message must be connect request",
+                {"code": ErrorDetailCode.INVALID_FRAME.value},
+            )
+        )
+        await conn.close(code=1002)
+        return None
+
+    try:
+        frame = ReqFrame.model_validate(data)
+    except ValidationError as exc:
+        await conn.send_res(
+            _malformed(
+                fallback_id,
+                "Malformed connect request",
+                validation_error_details(ErrorDetailCode.INVALID_FRAME, exc),
+            )
+        )
+        await conn.close(code=1002)
+        return None
+    req_id = frame.id
+
+    try:
+        params = ConnectParams.model_validate(frame.params if frame.params is not None else {})
+    except ValidationError as exc:
+        await conn.send_res(
+            _malformed(
+                req_id,
+                "Malformed connect params",
+                validation_error_details(ErrorDetailCode.INVALID_CONNECT_PARAMS, exc),
+            )
+        )
+        await conn.close(code=1002)
+        return None
+    conn.client_info = params.client
+
+    # Step 4: Resolve binary admission and the fixed protocol surface. A
+    # presented gateway token counts against the failed-auth budget; a
+    # missing one never does.
+    from agentos.gateway.auth import resolve_auth
+
+    auth_params = params.auth or {}
+    limiter = auth_guard.limiter if auth_guard is not None else None
+    presented = config.auth.mode == "token" and bool(auth_params.get("token"))
+    if limiter is not None and presented:
+        decision = limiter.check(client_ip, TOKEN_SCOPE, origin=origin)
+        if not decision.allowed:
+            log.warning(
+                "auth.rate_limited",
+                conn_id=conn.conn_id,
+                client_ip=client_ip,
+                origin=origin,
+                retry_after_ms=decision.retry_after_ms,
+            )
+            await conn.send_res(
+                make_error_res(
+                    req_id,
+                    ErrorCode.UNAUTHORIZED,
+                    "Too many failed authentication attempts; retry later",
+                    retryable=True,
+                    details={
+                        "code": ErrorDetailCode.AUTH_RATE_LIMITED.value,
+                        "retry_after_ms": decision.retry_after_ms,
+                    },
+                    retry_after_ms=decision.retry_after_ms,
+                )
+            )
+            await conn.close(code=WS_CLOSE_POLICY_VIOLATION)
+            return None
+
+    access = resolve_auth(
+        config,
+        auth_params=auth_params,
+        client_kind=params.client_kind,
+        peer_ip=peer_ip,
+    )
+    if access is None:
+        if limiter is not None and presented:
+            decision = limiter.record_failure(client_ip, TOKEN_SCOPE, origin=origin)
+            if decision.delay_s > 0:
+                await asyncio.sleep(decision.delay_s)
+        await conn.send_res(make_error_res(req_id, ErrorCode.UNAUTHORIZED, "Authentication failed"))
+        await conn.close(code=WS_CLOSE_POLICY_VIOLATION)
+        return None
+    if limiter is not None and presented:
+        limiter.record_success(client_ip, TOKEN_SCOPE, origin=origin)
+    # An agent's connection is marked as such for its whole life: the trading
+    # handlers read this instead of trusting an ``initiator`` param.
+    from agentos.gateway.agent_surface import get_agent_surface
+
+    access = get_agent_surface().attach(access, auth_params)
+
+    # Step 5: Negotiate protocol version
+    negotiated = negotiate_protocol(params.min_protocol, params.max_protocol)
+    if negotiated is None:
+        await conn.send_res(
+            make_error_res(
+                req_id,
+                ErrorCode.INVALID_REQUEST,
+                "Unsupported protocol version range",
+                details=protocol_mismatch_details(params.min_protocol, params.max_protocol),
+            )
+        )
+        await conn.close(code=1002)
+        return None
+
+    conn.access = access
+
+    # Step 6: Send HelloOk
+    hello = HelloOk(
+        protocol=negotiated,
+        server=ServerInfo(version=__version__, conn_id=conn.conn_id),
+        features=_build_features(dispatcher),
+        snapshot=SnapshotInfo(
+            uptime_ms=int(time.time() * 1000),
+            config_path=config.config_path,
+            state_dir=config.state_dir,
+            auth_mode=config.auth.mode,
+        ),
+        policy=PolicyInfo(
+            agent_stream_heartbeat_interval_ms=int(
+                max(0.0, float(getattr(config, "agent_stream_heartbeat_interval_seconds", 15.0)))
+                * 1000
+            ),
+            agent_stream_idle_timeout_ms=int(
+                max(0.0, float(getattr(config, "agent_stream_idle_timeout_seconds", 600.0))) * 1000
+            ),
+            webui_stream_idle_grace_ms=int(
+                max(0.0, float(getattr(config, "webui_stream_idle_grace_seconds", 630.0))) * 1000
+            ),
+            client_ws_keepalive_timeout_ms=int(
+                max(0.0, float(getattr(config, "client_ws_keepalive_timeout_s", 120.0))) * 1000
+            ),
+        ),
+        auth={"nonce": nonce},
+    )
+    await ws.send_text(hello.model_dump_json())
+    return hello
+
+
+# ---------------------------------------------------------------------------
+# Request start queue
+# ---------------------------------------------------------------------------
+#
+# Requests on one connection are admitted through a bounded start queue
+# instead of strictly one at a time. At most ``MAX_CONCURRENT_REQUESTS`` run
+# at once; one that cannot start within ``REQUEST_START_TIMEOUT_S`` is
+# answered ``UNAVAILABLE {details.code: REQUEST_START_TIMEOUT}`` (retryable).
+#
+# Ordering is kept where clients rely on it (``chat.send`` before
+# ``sessions.abort``, ``subscribe`` before the history read, ``reset`` before
+# the next send, ``plan.mode.set`` before the send it applies to):
+#
+# * A request naming a session (``sessionKey`` / ``session_key``, or ``key``
+#   on ``sessions.*``) runs in that session's lane: after the previous
+#   request on the same session, concurrently with other sessions.
+# * ``CONCURRENT_READ_METHODS`` (session-less reads such as ``sessions.list``)
+#   wait only for the barriers before them, so a poll is not held back by
+#   another session's slow request; later barriers still wait for them.
+# * Any other request is a barrier: it starts after every earlier request
+#   and every later request waits for it, exactly the old in-order rule.
+# * ``UNORDERED_METHODS`` wait for nothing. They neither write state nor
+#   read anything a later request on the connection depends on, and they
+#   wait seconds on a model or the network (``chat.suggestNext`` at every
+#   turn end held back ``chat.history`` by ~5 s).
+#
+# So one slow ``chat.history`` no longer holds back the same tab's other
+# sessions, or a second tab sharing the socket.
+
+#: Requests one connection may run at once.
+MAX_CONCURRENT_REQUESTS = 4
+#: Longest a request may wait for its turn before it is refused (retryable).
+REQUEST_START_TIMEOUT_S = 30.0
+#: Requests one connection may have admitted but not finished; more are
+#: refused at once.
+MAX_PENDING_REQUESTS = 256
+
+UNORDERED_METHODS: frozenset[str] = frozenset(
     {
         "chat.suggestNext",
         "acp.doctor",
@@ -864,8 +1276,145 @@ DETACHED_METHODS: frozenset[str] = frozenset(
         "trading.probe",
     }
 )
-#: At most this many detached requests per connection; more run in order.
-MAX_DETACHED_PER_CONNECTION = 8
+
+#: Session-less methods that only read. They run alongside session lanes.
+CONCURRENT_READ_METHODS: frozenset[str] = frozenset(
+    {
+        "acp.agents",
+        "acp.sessions",
+        "agents.list",
+        "channels.status",
+        "commands.list_for_surface",
+        "config.get",
+        "cron.list",
+        "doctor.status",
+        "health",
+        "models.list",
+        "projects.list",
+        "providers.status",
+        "sessions.list",
+        "sessions.preview",
+        "skills.list",
+        "status",
+        "usage.cost",
+        "usage.status",
+    }
+)
+
+_SESSION_PARAM_KEYS: tuple[str, ...] = ("sessionKey", "session_key")
+_READ_LANE = "read"
+
+
+def request_lane(method: str, params: Any) -> str | None:
+    """The ordering lane of one request: ``"session:<key>"``, ``"read"``,
+    ``"barrier"`` or ``None`` (unordered)."""
+    if method in UNORDERED_METHODS:
+        return None
+    if isinstance(params, dict):
+        keys = _SESSION_PARAM_KEYS + (("key",) if method.startswith("sessions.") else ())
+        for name in keys:
+            value = params.get(name)
+            if isinstance(value, str) and value.strip():
+                return "session:" + canonicalize_session_key(value)
+    if method in CONCURRENT_READ_METHODS:
+        return _READ_LANE
+    return "barrier"
+
+
+class RequestStartQueue:
+    """Admits one connection's requests in arrival order, a few at a time."""
+
+    def __init__(
+        self,
+        *,
+        max_concurrent: int = MAX_CONCURRENT_REQUESTS,
+        start_timeout_s: float = REQUEST_START_TIMEOUT_S,
+        max_pending: int = MAX_PENDING_REQUESTS,
+    ) -> None:
+        self._slots = asyncio.Semaphore(max(1, max_concurrent))
+        self._start_timeout_s = start_timeout_s
+        self._max_pending = max_pending
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._last_barrier: asyncio.Task[None] | None = None
+        self._since_barrier: set[asyncio.Task[None]] = set()
+        self._lane_tails: dict[str, asyncio.Task[None]] = {}
+
+    @property
+    def pending(self) -> int:
+        return len(self._tasks)
+
+    def full(self) -> bool:
+        return len(self._tasks) >= self._max_pending
+
+    def submit(
+        self,
+        lane: str | None,
+        run: Callable[[], Awaitable[None]],
+        on_start_timeout: Callable[[], Awaitable[None]],
+        *,
+        name: str = "ws-request",
+    ) -> asyncio.Task[None]:
+        deps: set[asyncio.Task[None]] = set()
+        if lane is not None and self._last_barrier is not None:
+            deps.add(self._last_barrier)
+        if lane == "barrier":
+            deps |= self._since_barrier
+        elif lane is not None and lane != _READ_LANE:
+            tail = self._lane_tails.get(lane)
+            if tail is not None:
+                deps.add(tail)
+        deps = {task for task in deps if not task.done()}
+
+        task = asyncio.create_task(self._run(deps, run, on_start_timeout), name=name)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        if lane == "barrier":
+            self._last_barrier = task
+            self._since_barrier = set()
+        elif lane == _READ_LANE:
+            self._since_barrier.add(task)
+        elif lane is not None:
+            self._lane_tails[lane] = task
+            self._since_barrier.add(task)
+            task.add_done_callback(functools.partial(self._forget_tail, lane))
+        if lane is not None:
+            task.add_done_callback(self._since_barrier.discard)
+        return task
+
+    def _forget_tail(self, lane: str, task: asyncio.Task[None]) -> None:
+        if self._lane_tails.get(lane) is task:
+            del self._lane_tails[lane]
+
+    async def _run(
+        self,
+        deps: set[asyncio.Task[None]],
+        run: Callable[[], Awaitable[None]],
+        on_start_timeout: Callable[[], Awaitable[None]],
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._start_timeout_s
+        if deps:
+            await asyncio.wait(deps, timeout=max(0.0, deadline - loop.time()))
+            if any(not task.done() for task in deps):
+                await on_start_timeout()
+                # Refused, but still a link in its lane: the requests queued
+                # behind this one must keep waiting for what it waited for,
+                # or they would overtake a request that is still running.
+                await asyncio.wait(deps)
+                return
+        try:
+            await asyncio.wait_for(self._slots.acquire(), timeout=max(0.0, deadline - loop.time()))
+        except TimeoutError:
+            await on_start_timeout()
+            return
+        try:
+            await run()
+        finally:
+            self._slots.release()
+
+    def cancel_all(self) -> None:
+        for task in list(self._tasks):
+            task.cancel()
 
 
 async def _dispatch_and_send(
@@ -880,7 +1429,25 @@ async def _dispatch_and_send(
     try:
         await conn.send_res(res)
     except Exception:  # noqa: BLE001 - the client may be gone by now
-        log.debug("ws.detached_send_failed", conn_id=conn.conn_id, method=method, exc_info=True)
+        log.debug("ws.request_send_failed", conn_id=conn.conn_id, method=method, exc_info=True)
+
+
+async def _send_unavailable(
+    conn: WsConnection, req_id: str, method: str, detail: ErrorDetailCode, message: str
+) -> None:
+    log.warning("ws.request_not_started", conn_id=conn.conn_id, method=method, reason=detail.value)
+    try:
+        await conn.send_res(
+            make_error_res(
+                req_id,
+                ErrorCode.UNAVAILABLE,
+                message,
+                retryable=True,
+                details={"code": detail.value, "method": method},
+            )
+        )
+    except Exception:  # noqa: BLE001 - the client may be gone by now
+        log.debug("ws.request_send_failed", conn_id=conn.conn_id, method=method, exc_info=True)
 
 
 async def _tick_loop(conn: WsConnection, tick_interval_ms: int) -> None:
@@ -915,14 +1482,15 @@ async def _message_loop(
     memory_managers: dict[str, Any] | None = None,
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
+    start_queue: RequestStartQueue | None = None,
 ) -> None:
-    detached: set[asyncio.Task[None]] = set()
+    queue = start_queue if start_queue is not None else RequestStartQueue()
     try:
         await _receive_loop(
             conn,
             config,
             dispatcher,
-            detached,
+            queue,
             session_manager,
             provider_selector,
             tool_registry,
@@ -942,15 +1510,14 @@ async def _message_loop(
             memory_retrievers,
         )
     finally:
-        for task in list(detached):
-            task.cancel()
+        queue.cancel_all()
 
 
 async def _receive_loop(
     conn: WsConnection,
     config: GatewayConfig,
     dispatcher: RpcDispatcher,
-    detached: set[asyncio.Task[None]],
+    queue: RequestStartQueue,
     session_manager: Any,
     provider_selector: Any,
     tool_registry: Any,
@@ -994,7 +1561,16 @@ async def _receive_loop(
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            await conn.send_res(make_error_res("", "INVALID_REQUEST", "Invalid JSON"))
+            await conn.send_res(
+                _malformed("", "Invalid JSON", {"code": ErrorDetailCode.INVALID_FRAME.value})
+            )
+            continue
+        if not isinstance(data, dict):
+            await conn.send_res(
+                _malformed(
+                    "", "Frame must be a JSON object", {"code": ErrorDetailCode.INVALID_FRAME.value}
+                )
+            )
             continue
 
         frame_type = data.get("type")
@@ -1007,9 +1583,29 @@ async def _receive_loop(
             continue
 
         if frame_type == "req":
-            req_id = data.get("id", "")
-            method = data.get("method", "")
-            params = data.get("params")
+            try:
+                frame = ReqFrame.model_validate(data)
+            except ValidationError as exc:
+                raw_id = data.get("id")
+                await conn.send_res(
+                    _malformed(
+                        raw_id if isinstance(raw_id, str) else "",
+                        "Malformed request envelope",
+                        validation_error_details(ErrorDetailCode.INVALID_FRAME, exc),
+                    )
+                )
+                continue
+            req_id, method, params = frame.id, frame.method, frame.params
+
+            if queue.full():
+                await _send_unavailable(
+                    conn,
+                    req_id,
+                    method,
+                    ErrorDetailCode.QUEUE_FULL,
+                    "Too many requests in flight on this connection; retry shortly",
+                )
+                continue
 
             ctx = RpcContext(
                 conn_id=conn.conn_id,
@@ -1034,19 +1630,28 @@ async def _receive_loop(
                 memory_stores=memory_stores or {},
                 memory_retrievers=memory_retrievers or {},
             )
-            if method in DETACHED_METHODS and len(detached) < MAX_DETACHED_PER_CONNECTION:
-                task = asyncio.create_task(
-                    _dispatch_and_send(conn, dispatcher, req_id, method, params, ctx),
-                    name=f"ws-detached-{conn.conn_id}-{method}",
-                )
-                detached.add(task)
-                task.add_done_callback(detached.discard)
-                continue
-            res = await dispatcher.dispatch(req_id, method, params, ctx)
-            await conn.send_res(res)
+            queue.submit(
+                request_lane(method, params),
+                functools.partial(
+                    _dispatch_and_send, conn, dispatcher, req_id, method, params, ctx
+                ),
+                functools.partial(
+                    _send_unavailable,
+                    conn,
+                    req_id,
+                    method,
+                    ErrorDetailCode.REQUEST_START_TIMEOUT,
+                    "The request could not start in time; retry",
+                ),
+                name=f"ws-req-{conn.conn_id}-{method}",
+            )
         else:
             await conn.send_res(
-                make_error_res("", "INVALID_REQUEST", f"Unknown frame type: {frame_type}")
+                _malformed(
+                    "",
+                    f"Unknown frame type: {frame_type}",
+                    {"code": ErrorDetailCode.INVALID_FRAME.value},
+                )
             )
 
 
@@ -1066,4 +1671,4 @@ def _build_features(dispatcher: RpcDispatcher) -> Any:
         "heartbeat",
         "cron",
     ]
-    return FeaturesInfo(methods=methods, events=events)
+    return FeaturesInfo(methods=methods, events=events, capabilities=sorted(CAPABILITIES))

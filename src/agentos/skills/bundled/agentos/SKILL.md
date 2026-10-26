@@ -239,7 +239,7 @@ Main `agentos.toml` sections (full commented reference:
 | `[acp]` | external coding harnesses over ACP: `enabled` (default true), `default_agent` (`claude`), `allowed_agents` (`["*"]`), `permission_mode` (`ask` approval queue \| `approve-reads` \| `approve-all` \| `deny-all`), `non_interactive_permissions` (`fail` \| `deny`), `approval_timeout_s` (900), `turn_timeout_s` (0 = none), `max_concurrent` (8), `state_dir` (default `<state>/acp`), `isolate_codex_home` (true), `install_missing_adapters` (true; allows the `npx -y`/`uvx` adapter download), `stream_delivery` (`live` default, text streams into the child session \| `final_only`), `[acp.agents.<id>]` `command`/`args`/`env` (launch override or a new harness id). Restart the gateway after changes. See docs/acp-agents.md |
 | `[sandbox]` | `sandbox`, `default_level` (DISABLED/STANDARD/STRICT/LOCKED), `backend`, network/mounts |
 | `[permissions]` | `default_mode` = `off` \| `on` \| `bypass` \| `full` (pair with `agentos sandbox …`); `cron_default_mode` = `off` \| `bypass` \| `full` (default `bypass`) |
-| `[auth]` | gateway admission: `mode` (`none` on loopback or `token`), `token` |
+| `[auth]` | gateway admission: `mode` (`none` on loopback, `token`, or `trusted-proxy` behind an authenticating reverse proxy), `token`, `trusted_proxy` (proxy IPs or CIDR blocks; `X-Forwarded-For` is read only from them, right to left); `[auth.rate_limit]` throttles wrong tokens per client address, whatever its `Origin` (`enabled`, `max_failures` 10, `window_seconds` 60, `lockout_seconds` 300, `exempt_loopback` true — loopback is only slowed down, except browser attempts, which have their own lockable budget): a locked-out client gets HTTP 429 + `Retry-After`, or `UNAUTHORIZED` with `details.code = "AUTH_RATE_LIMITED"` on the WebSocket |
 | `[control_ui]` | `allowed_origins` for reverse-proxy setups; `show_thinking` (default true) streams model reasoning to the WebUI as collapsible blocks — WebUI-only, channels never receive it |
 | `[updates]` | `notify` (default true) — the once-per-24h "new release available" notice |
 | `[acp]` | ACP coding harnesses spawned with `sessions_spawn(runtime="acp")`: `allowed_cwds` (default `[]`) lists extra directories a harness may use as `cwd` besides the agent workspace and managed worktrees; the workspace suits read-only work in a read-only `harness_mode`, a harness that writes needs its project listed (`agentos config set acp.allowed_cwds '["~/Code/my-app"]'` replaces the whole list) or `worktree: true`. A finished `oneshot` child still takes `sessions_send` follow-ups (its harness session is resumed); only `acp close` / `subagents kill` end it. Gateway RPC: `acp.sessions` (live harnesses with `activity`, `activity_kind`, `turn_tool_calls`), `acp.status {session_key}` (any ACP session: `idle`, `closed`, `last_turn`, ...), `acp.cancel`, `acp.close` |
@@ -406,14 +406,32 @@ gateway *refuses* non-loopback binds by design. The right fix is enabling
 auth, not bypassing the guard:
 
 ```sh
-agentos config set auth.mode token
-agentos config set auth.token "<long random secret>"
+agentos config set auth.mode token --config ~/.agentos/config.toml
+agentos config set auth.token "<long random secret>" --config ~/.agentos/config.toml
 agentos gateway restart
 ```
 
-Unauthenticated non-loopback Control is unsupported. A reverse proxy, VPN, or
-firewall does not replace the AgentOS Control token. Behind a reverse proxy on
-another browser origin, also set `control_ui.allowed_origins`.
+Without `--config`, `config set` only prints an `export` line; name the file
+the gateway actually reads (`agentos doctor` shows it). Unauthenticated
+non-loopback Control is unsupported. A VPN or firewall does
+not replace the AgentOS Control token; the one alternative is
+`auth.mode = "trusted-proxy"` with `auth.trusted_proxy` naming a reverse proxy
+that authenticates users itself (only that peer is admitted). Behind a reverse
+proxy on another browser origin, also set `control_ui.allowed_origins`. To
+reach a gateway from another machine without opening a port, keep it on
+loopback and tunnel in: `ssh -N -L 18791:127.0.0.1:18791 user@host`, or
+`tailscale serve --bg --https=443 http://127.0.0.1:18791` plus the `.ts.net`
+origin in `control_ui.allowed_origins` (full guide: `docs/remote-access.md`).
+Behind a proxy on the same host (Tailscale Serve, Caddy) every client looks
+like loopback, which is exempt from the failed-token lockout: also set
+`auth.trusted_proxy` to the proxy (`127.0.0.1`) or
+`auth.rate_limit.exempt_loopback = false`. `agentos doctor` reports risky
+exposure (`gateway.bind_no_auth`, `gateway.allowed_origins_wildcard`,
+`gateway.cors_wildcard_with_credentials`, `gateway.trusted_proxy_unset`,
+`gateway.auth_rate_limit_off`,
+`gateway.rate_limit_loopback_exempt_behind_proxy`, `gateway.token_short`) with a
+fix for each; it presents `AGENTOS_GATEWAY_TOKEN` / `auth.token` / `--token`
+and falls back to checking the config file when no gateway answers.
 
 ### Skills
 
@@ -652,7 +670,7 @@ agentos cron add --every 6h --agent main --no-elevated --name "LP check" --text 
 agentos memory status --deep --agent main
 agentos memory index --force --agent main
 agentos context --top 10 --json
-agentos doctor --quick --json          # --deep is the default
+agentos doctor --quick --json          # --deep is the default; --token T for a token-mode gateway
 agentos models list --provider openrouter -c tools --json
 agentos search status                  # optional provider id: agentos search status brave
 agentos auth logout xai
@@ -685,9 +703,14 @@ agentos migrate hermes --source <dir> [--profile <name>] [--preset full] [--appl
 The gateway is also a REST + WebSocket server on port 18791:
 `GET /api/config|sessions|agents|cron|usage|system/status|channels/status`,
 `POST /api/chat`, `GET /api/chat/history`, approvals endpoints under
-`/api/approvals*`, and `WS /ws` (primary RPC transport; `projects.*` CRUD
-lives there alongside `sessions.*`). On loopback binds
-auth is optional; on public binds the `[auth]` token gates every request.
+`/api/approvals*`, `POST /api/v1/rpc` (`{id?, method, params?}` → `{id, ok,
+payload|error}` for an allowlist of reads and of methods that create, rename or
+send (a `chat.send` there runs a turn exactly as over WS); config writes,
+secrets, env, trading, restarts and deletes answer 403 `FORBIDDEN`),
+and `WS /ws` (primary RPC transport; `projects.*` CRUD lives there alongside
+`sessions.*`). On loopback binds
+auth is optional; on public binds the `[auth]` token gates every request
+(or, in `trusted-proxy` mode, only the listed reverse proxy is admitted).
 Full reference: `docs/http-api.md` (https://useagentos.dev/docs/http-api).
 
 ## Key paths

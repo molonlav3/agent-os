@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import os
 import secrets
+import signal
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -43,6 +46,7 @@ from agentos.gateway.config import (
     is_public_bind,
 )
 from agentos.gateway.llm_runtime import resolve_llm_runtime_config
+from agentos.gateway.protocol import MAX_PAYLOAD_BYTES
 from agentos.gateway.rpc import get_dispatcher
 from agentos.gateway.session_events import build_sessions_changed_payload
 from agentos.gateway.session_lifecycle import (
@@ -53,6 +57,7 @@ from agentos.gateway.session_lifecycle import (
 from agentos.gateway.session_services import get_session_storage
 from agentos.gateway.session_streams import get_session_streams
 from agentos.gateway.websocket import get_registry
+from agentos.gateway.ws_transport import GatewayWebSocketProtocol
 from agentos.paths import default_agentos_home
 from agentos.permissions import configured_cron_default_elevated, configured_default_elevated
 from agentos.router_tiers import DEFAULT_ROUTER_STRATEGY
@@ -1158,6 +1163,19 @@ def _setup_file_logging(config: GatewayConfig | None = None) -> None:
     _install_structlog_tee()
 
 
+#: How long a SIGTERM / SIGINT shutdown lets in-flight turns finish.
+SIGNAL_DRAIN_TIMEOUT_S = 30.0
+#: After a second signal: how long cancelled turns get to unwind.
+FORCE_DRAIN_TIMEOUT_S = 2.0
+#: How long shutdown waits for all WebSocket closing handshakes together.
+WS_CLOSE_TIMEOUT_S = 2.0
+#: uvicorn's own bound on waiting for open HTTP connections at shutdown.
+UVICORN_GRACEFUL_SHUTDOWN_S = 5
+#: How long close() waits for uvicorn to finish (its graceful wait included)
+#: before cancelling it.
+UVICORN_STOP_TIMEOUT_S = 10.0
+
+
 @dataclass
 class GatewayServer:
     """Handle returned after gateway startup. Provides close() method."""
@@ -1176,6 +1194,131 @@ class GatewayServer:
     # its task after the server task ends so the exec happens outside the loop.
     _restarter: Any = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
+    # Signal-driven shutdown (``install_signal_handlers``): the first SIGTERM
+    # / SIGINT starts ``close()`` in ``_shutdown_task``; a second sets
+    # ``_forced``, which cuts the drain short.
+    _shutdown_task: asyncio.Task | None = field(default=None, repr=False)
+    _signal_count: int = field(default=0, repr=False)
+    _signal_loop: asyncio.AbstractEventLoop | None = field(default=None, repr=False)
+    _installed_signals: tuple[int, ...] = field(default=(), repr=False)
+    _forced: bool = field(default=False, repr=False)
+    _force_event: asyncio.Event | None = field(default=None, repr=False)
+
+    @property
+    def shutdown_task(self) -> asyncio.Task | None:
+        """The ``close()`` a shutdown signal started, if any (``run_gateway`` awaits it)."""
+        return self._shutdown_task
+
+    def install_signal_handlers(self, loop: asyncio.AbstractEventLoop | None = None) -> bool:
+        """Route SIGTERM and SIGINT to an orderly :meth:`close`; a second signal forces.
+
+        Every non-interactive stop sends SIGTERM (``agentos gateway stop``, the
+        desktop supervisor, launchd, systemd), so it must run the same
+        sequence as Ctrl+C: drain turns, stop channels, broadcast
+        ``shutdown``, close sockets, stop uvicorn. Returns ``False`` where the
+        loop cannot own signals (a worker thread, Windows); the caller then
+        leaves uvicorn's own handling in place.
+        """
+        if threading.current_thread() is not threading.main_thread():
+            return False
+        target = loop if loop is not None else asyncio.get_running_loop()
+        installed: list[int] = []
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                target.add_signal_handler(sig, self._on_shutdown_signal, int(sig))
+            except (NotImplementedError, RuntimeError, ValueError):
+                continue
+            installed.append(int(sig))
+        self._signal_loop = target
+        self._installed_signals = tuple(installed)
+        return bool(installed)
+
+    def remove_signal_handlers(self) -> None:
+        loop = self._signal_loop
+        if loop is None or loop.is_closed():
+            self._installed_signals = ()
+            return
+        for sig in self._installed_signals:
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+        self._installed_signals = ()
+
+    def _on_shutdown_signal(self, signum: int) -> None:
+        self._signal_count += 1
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(signum)
+        if self._signal_count == 1:
+            log.info("gateway.shutdown_signal", signal=name, drain_timeout_s=SIGNAL_DRAIN_TIMEOUT_S)
+            self.request_shutdown(f"signal:{name}")
+            return
+        log.warning("gateway.shutdown_forced", signal=name, drain_timeout_s=FORCE_DRAIN_TIMEOUT_S)
+        self.force_shutdown()
+
+    def request_shutdown(self, reason: str = "shutdown") -> asyncio.Task:
+        """Start the orderly shutdown once; later calls return the same task.
+
+        Stops admitting turns and reports not-ready first, as an in-place
+        restart does. A restart already draining keeps draining but will not
+        exec a new image: the process was asked to stop.
+        """
+        if self._shutdown_task is None:
+            restarter = self._restarter
+            cancel_exec = getattr(restarter, "cancel_exec", None)
+            if callable(cancel_exec):
+                cancel_exec(reason)
+            try:
+                self.app.state.gateway_ready = False
+            except Exception:  # noqa: BLE001 - a stub app in tests
+                pass
+            runtime = getattr(self._services, "task_runtime", None)
+            stop = getattr(runtime, "stop_admission", None)
+            if callable(stop):
+                stop()
+            self._shutdown_task = asyncio.get_running_loop().create_task(
+                self.close(reason, drain_timeout=SIGNAL_DRAIN_TIMEOUT_S),
+                name="gateway-signal-shutdown",
+            )
+        return self._shutdown_task
+
+    def force_shutdown(self) -> None:
+        """Cut a running drain short: cancel in-flight turns now.
+
+        uvicorn is only told to exit, not to force-exit: a forced uvicorn
+        skips the ASGI lifespan shutdown (browser sessions stay open, and the
+        abandoned lifespan task logs a CancelledError traceback at exit). Its
+        own wait for open connections is bounded by
+        ``timeout_graceful_shutdown`` instead.
+        """
+        self._forced = True
+        if self._force_event is not None:
+            self._force_event.set()
+        if self._server is not None:
+            self._server.should_exit = True
+
+    async def _drain(self, work: Any) -> bool:
+        """Await ``work`` unless a forced shutdown arrives first.
+
+        Returns ``True`` when forced; ``work`` keeps running in that case so a
+        cancellation it starts can unwind (the caller bounds it).
+        """
+        task = asyncio.ensure_future(work)
+        if self._forced:
+            return not task.done()
+        if self._force_event is None:
+            self._force_event = asyncio.Event()
+        forced = asyncio.ensure_future(self._force_event.wait())
+        try:
+            await asyncio.wait({task, forced}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            forced.cancel()
+        if task.done():
+            task.result()
+            return False
+        return True
 
     async def close(
         self,
@@ -1188,9 +1331,10 @@ class GatewayServer:
 
         ``drain_timeout`` bounds how long in-flight turns may run on. With
         ``cancel_in_flight`` they are cancelled at once instead of drained
-        (the ``/restart force`` path). A second call is a no-op: the
-        ``CancelledError`` branch in ``run_gateway`` and a restart in progress
-        must not close the same services twice.
+        (the ``/restart force`` path); :meth:`force_shutdown` (a second
+        signal) does the same to a drain already under way. A second call is
+        a no-op: the ``CancelledError`` branch in ``run_gateway`` and a
+        restart in progress must not close the same services twice.
         """
         if self._closed:
             return
@@ -1199,19 +1343,34 @@ class GatewayServer:
         # task_runtime.shutdown() waits for all running turns to complete before
         # returning; only then do we stop channel delivery.
         if self._services is not None and self._services.task_runtime is not None:
+            runtime = self._services.task_runtime
             try:
                 if cancel_in_flight:
-                    await self._services.task_runtime.shutdown(cancel=True, timeout=drain_timeout)
+                    await runtime.shutdown(cancel=True, timeout=drain_timeout)
                 else:
-                    await self._services.task_runtime.shutdown(
-                        graceful=True, graceful_timeout=drain_timeout
+                    graceful = asyncio.ensure_future(
+                        runtime.shutdown(graceful=True, graceful_timeout=drain_timeout)
                     )
+                    if await self._drain(graceful):
+                        await runtime.shutdown(cancel=True, timeout=FORCE_DRAIN_TIMEOUT_S)
+                        try:
+                            await asyncio.wait_for(graceful, timeout=FORCE_DRAIN_TIMEOUT_S)
+                        except TimeoutError:
+                            graceful.cancel()
             except Exception:
                 pass
 
         if self._background_completion_manager is not None:
             try:
-                await self._background_completion_manager.close(timeout=drain_timeout)
+                timeout = FORCE_DRAIN_TIMEOUT_S if self._forced else drain_timeout
+                closing = asyncio.ensure_future(
+                    self._background_completion_manager.close(timeout=timeout)
+                )
+                if await self._drain(closing):
+                    try:
+                        await asyncio.wait_for(closing, timeout=FORCE_DRAIN_TIMEOUT_S)
+                    except TimeoutError:
+                        closing.cancel()
             except Exception:
                 log.debug("gateway.background_completion_close_failed", exc_info=True)
             try:
@@ -1229,10 +1388,23 @@ class GatewayServer:
 
         registry = get_registry()
         await registry.broadcast("shutdown", {"reason": reason})
+        # The broadcast only queues the event; let each writer put it on the
+        # wire before the socket is closed under it (bounded per connection).
+        await asyncio.gather(
+            *(conn.flush(timeout=1.0) for conn in registry.all()), return_exceptions=True
+        )
 
-        # Close all active WS connections
-        for conn in registry.all():
-            await conn.close()
+        # Close all active WS connections, concurrently and bounded: a client
+        # that stopped reading must not hold the shutdown on its closing
+        # handshake.
+        connections = registry.all()
+        if connections:
+            _done, stuck = await asyncio.wait(
+                [asyncio.ensure_future(conn.close()) for conn in connections],
+                timeout=WS_CLOSE_TIMEOUT_S,
+            )
+            for task in stuck:
+                task.cancel()
 
         # Close MCP clients
         try:
@@ -1248,14 +1420,15 @@ class GatewayServer:
 
         if self._task is not None:
             try:
-                await asyncio.wait_for(self._task, timeout=5.0)
+                await asyncio.wait_for(self._task, timeout=UVICORN_STOP_TIMEOUT_S)
             except TimeoutError:
                 self._task.cancel()
 
         if self._services is not None:
             await self._services.close()
 
-        log.info("gateway.stopped", reason=reason)
+        self.remove_signal_handlers()
+        log.info("gateway.stopped", reason=reason, forced=self._forced)
 
 
 def emit_skill_filter_banner(skills_cfg: Any) -> None:
@@ -2788,6 +2961,13 @@ async def start_gateway_server(
             "port": config.port,
             "log_level": "info" if not config.debug else "debug",
             "access_log": config.debug,
+            # The post-handshake ceiling ``hello-ok.policy.max_payload``
+            # advertises. The protocol class holds every connection to
+            # MAX_PREAUTH_PAYLOAD_BYTES until its handshake succeeds, refusing
+            # a larger pre-auth message before reading it.
+            "ws_max_size": MAX_PAYLOAD_BYTES,
+            "ws": GatewayWebSocketProtocol,
+            "timeout_graceful_shutdown": UVICORN_GRACEFUL_SHUTDOWN_S,
         }
         if config.tls.keyfile and config.tls.certfile:
             uvicorn_kwargs["ssl_keyfile"] = config.tls.keyfile
@@ -2797,6 +2977,11 @@ async def start_gateway_server(
         )
         server = uvicorn.Server(uv_config)
         server_handle._server = server
+        if server_handle.install_signal_handlers():
+            # The gateway owns SIGTERM/SIGINT now. uvicorn's own capture would
+            # record the signal, return from serve() and re-raise it once the
+            # handlers are restored: the process died before close() ran.
+            setattr(server, "capture_signals", contextlib.nullcontext)
 
         task = create_background_task(server.serve())
         server_handle._task = task

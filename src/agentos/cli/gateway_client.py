@@ -7,11 +7,23 @@ import ipaddress
 import json
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from agentos.gateway_client import (
+    RECONNECT_INITIAL_DELAY_S,
+    RECONNECT_MAX_DELAY_S,
+    WS_CLOSE_SEQ_GAP,
+    EventSeqTracker,
+    GatewayHandshakeError,
+    SessionSubscriptions,
+    build_connect_params,
+    close_websocket,
+    open_websocket,
+    reconnect_delays,
+)
 from agentos.session.keys import canonicalize_session_key
 from agentos.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
@@ -143,21 +155,51 @@ def _frame_belongs_to_turn(
     return True
 
 
-class GatewayClient:
-    """WebSocket client for connecting to AgentOS gateway daemon."""
+_CONNECTION_LOST = (
+    "Gateway connection lost; restart chat or reconnect before sending another command."
+)
+#: How long the CLI client keeps reconnecting after a drop before giving up.
+CLI_RECONNECT_BUDGET_S = 60.0
 
-    def __init__(self) -> None:
+
+class GatewayClient:
+    """WebSocket client for connecting to AgentOS gateway daemon.
+
+    After :meth:`connect` succeeds the client reconnects by itself when the
+    socket drops or an event-sequence gap shows frames were lost: requests in
+    flight fail, later calls wait for the new connection, and each session
+    subscription is renewed from its last ``stream_seq`` so a turn being
+    streamed resumes. A wrong token or a protocol mismatch ends it for good.
+    """
+
+    def __init__(self, *, auto_reconnect: bool = True) -> None:
         self._ws: Any = None
         self._recv_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._pending: dict[str, asyncio.Future[dict]] = {}
         self._listener_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
         self._heartbeat_interval: float = 48.0
         self._connection_error: ConnectionError | None = None
         self._closing = False
         self._http_base: str | None = None
         self._auth_token: str | None = None
         self._server_version: str | None = None
+        self._url: str | None = None
+        self._seq = EventSeqTracker()
+        self._subscriptions = SessionSubscriptions()
+        self._ready: asyncio.Event | None = None
+        self.auto_reconnect = auto_reconnect
+        self.reconnect_initial_delay_s = RECONNECT_INITIAL_DELAY_S
+        self.reconnect_max_delay_s = RECONNECT_MAX_DELAY_S
+        #: How long to keep reconnecting before failing for good, so a caller
+        #: waiting on the gateway (``agentos chat``) is never stuck for ever.
+        self.reconnect_budget_s: float | None = CLI_RECONNECT_BUDGET_S
+        #: Told about outages as they happen ("reconnecting", "reconnected",
+        #: "lost"), e.g. to print a line in ``agentos chat``.
+        self.on_connection_status: Callable[[str, str], None] | None = None
+        #: Successful reconnects since :meth:`connect`.
+        self.reconnects = 0
 
     async def connect(
         self,
@@ -170,24 +212,16 @@ class GatewayClient:
             self._ws is not None
             or self._listener_task is not None
             or self._heartbeat_task is not None
+            or self._reconnect_task is not None
         )
         if has_existing_connection:
             await self.close()
         self._closing = False
         self._connection_error = None
         try:
-            import websockets
+            import websockets  # noqa: F401
         except ImportError:
             raise SystemExit("websockets package is required: uv pip install websockets")
-
-        try:
-            self._ws = await websockets.connect(url)
-        except Exception as exc:
-            raise SystemExit(
-                f"Cannot connect to AgentOS gateway at {url}\n"
-                f"Is the gateway running? Start it with: agentos gateway run\n"
-                f"Error: {exc}"
-            )
 
         # Cache an HTTP base derived from the WS URL for the bridge upload
         # endpoint. ws://host:port/ws -> http://host:port; same scheme swap
@@ -202,42 +236,67 @@ class GatewayClient:
             base = base[: -len("/ws")]
         self._http_base = base.rstrip("/")
         self._auth_token = token
+        self._url = url
+        self._subscriptions = SessionSubscriptions()
+        self.reconnects = 0
 
-        # Wait for connect.challenge
-        raw = await self._ws.recv()
-        challenge = json.loads(raw)
-        if challenge.get("type") != "event" or challenge.get("event") != "connect.challenge":
-            raise SystemExit(f"Unexpected handshake frame: {challenge}")
+        try:
+            await self._open()
+        except _SocketOpenError as exc:
+            raise SystemExit(
+                f"Cannot connect to AgentOS gateway at {url}\n"
+                f"Is the gateway running? Start it with: agentos gateway run\n"
+                f"Error: {exc.__cause__}"
+            ) from None
+        except GatewayHandshakeError as exc:
+            raise SystemExit(f"Handshake failed: {exc.frame}") from None
+        except _UnexpectedFrameError as exc:
+            raise SystemExit(f"Unexpected handshake frame: {exc.frame}") from None
 
-        # Send connect request
-        req_id = str(uuid.uuid4())
-        params: dict[str, Any] = {
-            "minProtocol": 1,
-            "maxProtocol": 3,
-            "clientKind": "control",
-        }
-        auth: dict[str, str] = {}
-        if token:
-            auth["token"] = token
-        auth.update(agent_surface_auth(url))
-        if auth:
-            params["auth"] = auth
-        await self._ws.send(
-            json.dumps(
-                {
-                    "type": "req",
-                    "id": req_id,
-                    "method": "connect",
-                    "params": params,
-                }
+    async def _open(self) -> None:
+        """One connection attempt: socket, handshake, listener, heartbeat."""
+        assert self._url is not None
+        try:
+            ws = await open_websocket(self._url)
+        except Exception as exc:
+            raise _SocketOpenError() from exc
+
+        try:
+            # Wait for connect.challenge
+            raw = await ws.recv()
+            challenge = json.loads(raw)
+            if challenge.get("type") != "event" or challenge.get("event") != "connect.challenge":
+                raise _UnexpectedFrameError(challenge)
+
+            # Send connect request
+            req_id = str(uuid.uuid4())
+            auth: dict[str, str] = {}
+            if self._auth_token:
+                auth["token"] = self._auth_token
+            auth.update(agent_surface_auth(self._url))
+            params = build_connect_params(client_id="agentos-cli", mode="cli", auth=auth or None)
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "req",
+                        "id": req_id,
+                        "method": "connect",
+                        "params": params,
+                    }
+                )
             )
-        )
 
-        # Wait for hello-ok
-        raw = await self._ws.recv()
-        hello = json.loads(raw)
-        if hello.get("type") != "hello-ok":
-            raise SystemExit(f"Handshake failed: {hello}")
+            # Wait for hello-ok
+            raw = await ws.recv()
+            hello = json.loads(raw)
+            if hello.get("type") != "hello-ok":
+                raise GatewayHandshakeError.from_response(hello)
+        except BaseException:
+            await close_websocket(ws)
+            raise
+
+        self._ws = ws
+        self._seq.reset()
         # Capture the gateway's reported version from the handshake so callers
         # can detect version skew without a second RPC round-trip.
         server_info = hello.get("server") if isinstance(hello.get("server"), dict) else {}
@@ -247,8 +306,14 @@ class GatewayClient:
         self._heartbeat_interval = _heartbeat_interval_from_policy(policy)
 
         # Start background listener and application-level keepalive.
-        self._listener_task = asyncio.create_task(self._listen())
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(self._ws))
+        self._listener_task = asyncio.create_task(self._listen(ws))
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+        self._ready_event().set()
+
+    def _ready_event(self) -> asyncio.Event:
+        if self._ready is None:
+            self._ready = asyncio.Event()
+        return self._ready
 
     def set_auth_token(self, token: str | None) -> None:
         """Cache a bearer token used for HTTP-side requests (e.g. uploads)."""
@@ -314,10 +379,12 @@ class GatewayClient:
             raise ConnectionError(f"upload returned malformed body: {body!r}")
         return str(body["file_uuid"])
 
-    async def _listen(self) -> None:
+    async def _listen(self, ws: Any | None = None) -> None:
         """Read frames and route to pending futures or the event queue."""
+        sock = self._ws if ws is None else ws
+        lost: BaseException = ConnectionError("WebSocket connection closed")
         try:
-            async for raw in self._ws:
+            async for raw in sock:
                 frame = json.loads(raw)
                 frame_type = frame.get("type")
                 if frame_type == "res":
@@ -325,16 +392,26 @@ class GatewayClient:
                     if fut and not fut.done():
                         fut.set_result(frame)
                 elif frame_type == "event":
+                    gap = self._seq.observe(frame)
+                    if gap is not None:
+                        # Frames were lost: drop this socket and resubscribe
+                        # from the last stream position on a fresh one.
+                        lost = ConnectionError(
+                            f"event sequence gap: expected {gap[0]}, got {gap[1]}"
+                        )
+                        await close_websocket(sock, WS_CLOSE_SEQ_GAP, "seq gap")
+                        break
+                    self._subscriptions.note_event(frame)
                     await self._recv_queue.put(frame)
                 elif frame_type == "pong":
                     continue
-            if not self._closing:
-                self._mark_connection_failed(ConnectionError("WebSocket connection closed"))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            lost = exc
+        if not self._closing:
             # Fail all pending requests so callers don't hang forever
-            self._mark_connection_failed(exc)
+            self._connection_lost(lost, ws=sock)
 
     async def _heartbeat_loop(self, ws: Any | None = None) -> None:
         """Send application-level text pings so server receive_text() stays active."""
@@ -348,7 +425,7 @@ class GatewayClient:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._mark_connection_failed(exc)
+            self._connection_lost(exc, ws=heartbeat_ws)
 
     async def _send_ping(self, ws: Any | None = None) -> None:
         target = self._ws if ws is None else ws
@@ -361,9 +438,7 @@ class GatewayClient:
         if self._connection_error is not None:
             raise self._connection_error
         if self._ws is None:
-            raise ConnectionError(
-                "Gateway connection lost; restart chat or reconnect before sending another command."
-            )
+            await self._await_reconnect()
         req_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict] = loop.create_future()
@@ -377,7 +452,7 @@ class GatewayClient:
             raise
         except Exception as exc:
             self._pending.pop(req_id, None)
-            err = self._mark_connection_failed(exc)
+            err = self._connection_lost(exc)
             raise err from exc
         res = await fut
         if not res.get("ok"):
@@ -394,7 +469,20 @@ class GatewayClient:
                 data=data if isinstance(data, dict) else None,
             )
         payload = res.get("payload")
+        self._subscriptions.note_call(method, params, payload)
         return {} if payload is None else payload
+
+    async def _await_reconnect(self) -> None:
+        task = self._reconnect_task
+        if task is None or task.done():
+            if self._connection_error is not None:
+                raise self._connection_error
+            raise ConnectionError(_CONNECTION_LOST)
+        await self._ready_event().wait()
+        if self._connection_error is not None:
+            raise self._connection_error
+        if self._ws is None:
+            raise ConnectionError(_CONNECTION_LOST)
 
     async def call(self, method: str, params: dict | None = None) -> Any:
         """Public thin wrapper for CLI commands that intentionally use RPC names."""
@@ -730,8 +818,8 @@ class GatewayClient:
     async def close(self) -> None:
         """Close the WebSocket connection."""
         self._closing = True
-        for task in (self._heartbeat_task, self._listener_task):
-            if task is None:
+        for task in (self._reconnect_task, self._heartbeat_task, self._listener_task):
+            if task is None or task is asyncio.current_task():
                 continue
             task.cancel()
             try:
@@ -743,29 +831,125 @@ class GatewayClient:
         self._ws = None
         self._heartbeat_task = None
         self._listener_task = None
+        self._reconnect_task = None
+
+    def _connection_lost(self, exc: BaseException, *, ws: Any = None) -> ConnectionError:
+        """The socket is gone: reconnect when possible, else fail for good."""
+        if ws is not None and ws is not self._ws:
+            return ConnectionError(f"{_CONNECTION_LOST} Original error: {exc}")
+        can_reconnect = (
+            self.auto_reconnect
+            and self._url is not None
+            and not self._closing
+            and self._connection_error is None
+        )
+        if not can_reconnect:
+            return self._mark_connection_failed(exc)
+        err = ConnectionError(f"Gateway connection lost (reconnecting). Original error: {exc}")
+        self._fail_pending(err)
+        self._stop_connection_tasks()
+        self._ws = None
+        self._ready_event().clear()
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._report_status("reconnecting", "Gateway connection lost; reconnecting…")
+            self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+        return err
+
+    def _report_status(self, state: str, text: str) -> None:
+        callback = self.on_connection_status
+        if callback is None:
+            return
+        try:
+            callback(state, text)
+        except Exception:  # noqa: BLE001 - a status line must never break the client
+            pass
+
+    def _give_up(self, exc: BaseException) -> None:
+        self._mark_connection_failed(exc)
+        self._ready_event().set()
+        self._report_status("lost", _CONNECTION_LOST)
+
+    async def _reconnect_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        budget = self.reconnect_budget_s
+        deadline = None if budget is None else loop.time() + budget
+        last_error: BaseException = ConnectionError("gateway unreachable")
+        delays = reconnect_delays(
+            initial=self.reconnect_initial_delay_s, maximum=self.reconnect_max_delay_s
+        )
+        for delay in delays:
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    self._give_up(
+                        ConnectionError(
+                            f"{_CONNECTION_LOST} Original error: no gateway for "
+                            f"{budget:g}s ({last_error})"
+                        )
+                    )
+                    return
+                delay = min(delay, remaining)
+            await asyncio.sleep(delay)
+            if self._closing:
+                return
+            try:
+                await self._open()
+            except asyncio.CancelledError:
+                raise
+            except GatewayHandshakeError as exc:
+                last_error = exc
+                if exc.recoverable:
+                    continue
+                self._give_up(exc)
+                return
+            except Exception as exc:  # noqa: BLE001 - network errors: try again later
+                last_error = exc.__cause__ or exc
+                continue
+            self.reconnects += 1
+            self._report_status("reconnected", "Reconnected to the gateway.")
+            for method, params in self._subscriptions.resubscribe_calls():
+                try:
+                    await self._call(method, params)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - the next drop or gap retries it
+                    pass
+            return
+
+    def _fail_pending(self, err: BaseException) -> None:
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(err)
+        self._pending.clear()
+
+    def _stop_connection_tasks(self) -> None:
+        current_task = asyncio.current_task()
+        for task in (self._heartbeat_task, self._listener_task):
+            if task is not None and task is not current_task and not task.done():
+                task.cancel()
 
     def _mark_connection_failed(self, exc: BaseException) -> ConnectionError:
         if isinstance(exc, ConnectionError) and str(exc).startswith("Gateway connection lost"):
             err = exc
         else:
-            err = ConnectionError(
-                "Gateway connection lost; restart chat or reconnect before sending "
-                "another command. "
-                f"Original error: {exc}"
-            )
+            err = ConnectionError(f"{_CONNECTION_LOST} Original error: {exc}")
         if self._connection_error is None:
             self._connection_error = err
         else:
             err = self._connection_error
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(err)
-        self._pending.clear()
-        current_task = asyncio.current_task()
-        for task in (self._heartbeat_task, self._listener_task):
-            if task is not None and task is not current_task and not task.done():
-                task.cancel()
+        self._fail_pending(err)
+        self._stop_connection_tasks()
         return err
+
+
+class _SocketOpenError(ConnectionError):
+    """The TCP/WebSocket connection itself could not be opened."""
+
+
+class _UnexpectedFrameError(RuntimeError):
+    def __init__(self, frame: Any) -> None:
+        super().__init__(f"Unexpected handshake frame: {frame}")
+        self.frame = frame
 
 
 def _task_terminal_as_session_event(event_name: str, payload: dict) -> dict[str, Any] | None:

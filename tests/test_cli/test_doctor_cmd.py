@@ -1140,3 +1140,37 @@ def test_local_config_findings_explain_optional_env_references(monkeypatch) -> N
     detail_steps = " ".join(step.detail or "" for step in finding.fix_steps)
     assert "CUSTOM_SEARCH_KEY" in detail_steps
     assert "CUSTOM_IMAGE_KEY" in detail_steps
+
+
+class _TokenRecordingClient(_ReadyGatewayClient):
+    tokens: list[str | None] = []
+
+    async def connect(self, url: str, *, token: str | None = None) -> None:
+        type(self).tokens.append(token)
+
+
+def test_doctor_presents_the_gateway_token(monkeypatch) -> None:
+    """A token-mode gateway refuses a doctor that connects without its token."""
+    _TokenRecordingClient.tokens = []
+    monkeypatch.setattr("agentos.cli.gateway_client.GatewayClient", _TokenRecordingClient)
+    monkeypatch.setenv("AGENTOS_GATEWAY_TOKEN", "from-the-environment")
+
+    result = runner.invoke(app, ["doctor", "--json"])
+    assert result.exit_code == 0, result.stdout
+    assert _TokenRecordingClient.tokens == ["from-the-environment"]
+
+    result = runner.invoke(app, ["doctor", "--json", "--token", "from-the-flag"])
+    assert result.exit_code == 0, result.stdout
+    assert _TokenRecordingClient.tokens[-1] == "from-the-flag"
+
+
+def test_doctor_reads_the_token_from_the_config(tmp_path, monkeypatch) -> None:
+    _TokenRecordingClient.tokens = []
+    monkeypatch.setattr("agentos.cli.gateway_client.GatewayClient", _TokenRecordingClient)
+    monkeypatch.delenv("AGENTOS_GATEWAY_TOKEN", raising=False)
+    config = tmp_path / "agentos.toml"
+    config.write_text('[auth]\nmode = "token"\ntoken = "from-the-config"\n', encoding="utf-8")
+
+    result = runner.invoke(app, ["doctor", "--json", "--config", str(config)])
+    assert result.exit_code == 0, result.stdout
+    assert _TokenRecordingClient.tokens == ["from-the-config"]

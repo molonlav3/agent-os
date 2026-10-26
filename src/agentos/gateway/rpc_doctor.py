@@ -9,6 +9,7 @@ from dataclasses import replace
 from typing import Any, cast
 
 from agentos.gateway.config import GatewayConfig
+from agentos.gateway.exposure import gateway_security_payload
 from agentos.gateway.rpc import RpcContext, get_dispatcher
 from agentos.gateway.rpc_channels import _handle_channels_status
 from agentos.gateway.rpc_logs import _build_logs_status
@@ -27,6 +28,7 @@ from agentos.health.evaluator import (
     evaluate_sandbox,
     evaluate_search,
 )
+from agentos.health.gateway_security import evaluate_gateway_security
 from agentos.health.model import FixStep, HealthFinding, HealthSeverity, build_report
 from agentos.health.recovery_commands import command_with_config as _command_with_config
 from agentos.sandbox.status import status_payload as _sandbox_status_payload
@@ -532,6 +534,13 @@ def _control_ui_payload(ctx: RpcContext) -> dict[str, Any]:
     }
 
 
+def _gateway_security_payload(ctx: RpcContext) -> dict[str, Any]:
+    config = getattr(ctx, "config", None)
+    if config is None:
+        raise RuntimeError("gateway config is not available")
+    return gateway_security_payload(config)
+
+
 async def _evaluate_collection(
     surface: str,
     collect: Collector,
@@ -592,6 +601,7 @@ async def _handle_doctor_status(params: dict | None, ctx: RpcContext) -> dict[st
         ),
         ("browser", lambda: _browser_payload(ctx), evaluate_browser),
         ("control_ui", lambda: _control_ui_payload(ctx), evaluate_control_ui),
+        ("gateway", lambda: _gateway_security_payload(ctx), evaluate_gateway_security),
     ]
 
     for surface, collect, evaluate in collectors:

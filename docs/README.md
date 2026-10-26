@@ -64,6 +64,8 @@ root release README with task-oriented guides.
 - [`scheduling.md`](scheduling.md) - recurring and one-time scheduled work.
 - [`http-api.md`](http-api.md) - REST HTTP API and WebSocket surface for
   external apps and automation.
+- [`remote-access.md`](remote-access.md) - reach a gateway from another
+  machine: SSH tunnel, Tailscale Serve, reverse proxy, token rotation.
 - [`mcp-server.md`](mcp-server.md) - MCP server bridge for MCP-capable clients.
 - [`usage-and-cost.md`](usage-and-cost.md) - token usage, estimated cost, and
   cost investigation workflow.

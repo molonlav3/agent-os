@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import time
 from collections import OrderedDict
@@ -14,9 +15,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.types import ASGIApp
 
-from agentos.gateway.access import is_loopback_address, peer_is_trusted_proxy
+from agentos.gateway.access import is_loopback_address, peer_is_trusted_proxy, resolve_client_ip
 from agentos.gateway.auth import token_matches
+from agentos.gateway.auth_rate_limit import TOKEN_SCOPE, AuthGuard, retry_after_seconds
 from agentos.gateway.config import GatewayConfig
+from agentos.gateway.protocol import ErrorCode, ErrorDetailCode
 
 log = structlog.get_logger(__name__)
 
@@ -198,8 +201,24 @@ class LoopbackOriginMiddleware(BaseHTTPMiddleware):
         return await call_next(request)  # type: ignore[no-any-return]
 
 
+def request_client_ip(request: Request, config: GatewayConfig) -> str:
+    """The client a request is attributed to: the transport peer, or the
+    ``X-Forwarded-For`` client when the peer is a trusted proxy (walked right
+    to left; see ``access.resolve_client_ip``)."""
+    peer_ip = request.client.host if request.client else None
+    return resolve_client_ip(
+        peer_ip, request.headers.get("x-forwarded-for"), config.auth.trusted_proxy
+    )
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    """Token-based auth middleware. Skips public paths."""
+    """Token-based auth middleware. Skips public paths.
+
+    In token mode a presented wrong token counts against the failed-auth
+    budget shared with the WebSocket handshake (``auth_guard``); a client
+    over it is answered ``429`` with ``Retry-After`` until the lockout ends.
+    A request with no token is a plain ``401`` and never consumes budget.
+    """
 
     PUBLIC_PATHS = _PUBLIC_PATHS
 
@@ -208,9 +227,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
         app: ASGIApp,
         config: GatewayConfig,
         control_ui_base_path: str | None = None,
+        auth_guard: AuthGuard | None = None,
     ) -> None:
         super().__init__(app)
         self._config = config
+        self._auth_guard = auth_guard
         base_path = (
             config.control_ui.base_path if control_ui_base_path is None else control_ui_base_path
         )
@@ -249,10 +270,30 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if auth_mode == "token":
             token = self._extract_token(request)
-            if not token_matches(token, self._config.auth.token):
-                return JSONResponse(
-                    {"error": "Unauthorized", "code": "UNAUTHORIZED"}, status_code=401
-                )
+            limiter = self._auth_guard.limiter if self._auth_guard is not None else None
+            if limiter is None or not token:
+                if not token_matches(token, self._config.auth.token):
+                    return JSONResponse(
+                        {"error": "Unauthorized", "code": "UNAUTHORIZED"}, status_code=401
+                    )
+            else:
+                client_ip = request_client_ip(request, self._config)
+                # A browser request (it carries Origin) is also charged to the
+                # address's browser budget, which is never loopback-exempt, as
+                # on the WebSocket: a page in the operator's browser reaches
+                # the gateway from loopback too.
+                origin = request.headers.get("origin") or None
+                decision = limiter.check(client_ip, TOKEN_SCOPE, origin=origin)
+                if not decision.allowed:
+                    return _auth_rate_limited(decision.retry_after_ms)
+                if not token_matches(token, self._config.auth.token):
+                    decision = limiter.record_failure(client_ip, TOKEN_SCOPE, origin=origin)
+                    if decision.delay_s > 0:
+                        await asyncio.sleep(decision.delay_s)
+                    return JSONResponse(
+                        {"error": "Unauthorized", "code": "UNAUTHORIZED"}, status_code=401
+                    )
+                limiter.record_success(client_ip, TOKEN_SCOPE, origin=origin)
 
         elif auth_mode == "trusted-proxy":
             # A trusted-proxy deployment means a reverse proxy in front of the
@@ -295,6 +336,21 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if auth_header.startswith("Bearer "):
             return auth_header[7:]
         return request.headers.get("x-agentos-token")
+
+
+def _auth_rate_limited(retry_after_ms: int) -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": "Too many failed authentication attempts",
+            "code": ErrorCode.RATE_LIMITED.value,
+            "details": {
+                "code": ErrorDetailCode.AUTH_RATE_LIMITED.value,
+                "retry_after_ms": retry_after_ms,
+            },
+        },
+        status_code=429,
+        headers={"Retry-After": str(retry_after_seconds(retry_after_ms))},
+    )
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -341,16 +397,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return peer_is_trusted_proxy(self._config.auth.trusted_proxy, peer_ip)
 
     def _get_client_ip(self, request: Request) -> str:
-        peer_ip = request.client.host if request.client else None
-        if self._is_trusted_proxy(peer_ip):
-            forwarded = request.headers.get("x-forwarded-for")
-            if forwarded:
-                first_ip = forwarded.split(",")[0].strip()
-                if first_ip:
-                    return first_ip
-        if peer_ip:
-            return peer_ip
-        return "unknown"
+        return request_client_ip(request, self._config)
 
     def _sweep_expired(self, now: float, window: float) -> None:
         self._last_sweep = now

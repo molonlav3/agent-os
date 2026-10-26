@@ -802,3 +802,39 @@ def test_gateway_restart_stops_before_starting(tmp_path, monkeypatch) -> None:
     assert result.exit_code == 0, result.stdout
     assert events == ["stop", "start"]
     assert _payload(result)["state"] == "running"
+
+
+def test_stop_sends_a_second_sigterm_before_sigkill(monkeypatch) -> None:
+    """The first SIGTERM drains; after the stop timeout a second one makes the
+    gateway cancel its turns and finish shutting down; SIGKILL only after that."""
+    import signal as _signal
+
+    sent: list[int] = []
+    alive = {"value": True}
+
+    def fake_kill(pid: int, sig: int) -> None:
+        sent.append(sig)
+        if sig == _signal.SIGTERM and len(sent) == 2:
+            alive["value"] = False  # the forced shutdown completes
+
+    manager = Manager(host="127.0.0.1", port=18791, shutdown_timeout=0.0)
+    manager.poll_interval = 0.0
+    monkeypatch.setattr(gateway_lifecycle.os, "kill", fake_kill)
+    monkeypatch.setattr(Manager, "_pid_running", lambda self, pid: alive["value"])
+
+    assert manager._terminate_pid(4242) is True  # noqa: SLF001
+    assert sent == [_signal.SIGTERM, _signal.SIGTERM]
+
+
+def test_stop_falls_back_to_sigkill_when_the_forced_shutdown_hangs(monkeypatch) -> None:
+    import signal as _signal
+
+    sent: list[int] = []
+    manager = Manager(host="127.0.0.1", port=18791, shutdown_timeout=0.0)
+    manager.poll_interval = 0.0
+    monkeypatch.setattr(gateway_lifecycle, "FORCED_SHUTDOWN_GRACE_S", 0.0)
+    monkeypatch.setattr(gateway_lifecycle.os, "kill", lambda pid, sig: sent.append(sig))
+    monkeypatch.setattr(Manager, "_pid_running", lambda self, pid: True)
+
+    manager._terminate_pid(4242)  # noqa: SLF001
+    assert sent == [_signal.SIGTERM, _signal.SIGTERM, _signal.SIGKILL]

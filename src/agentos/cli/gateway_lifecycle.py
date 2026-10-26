@@ -22,6 +22,9 @@ from agentos.paths import default_agentos_home, state_dir
 UNMANAGED_GATEWAY_RUNNING = "UNMANAGED_GATEWAY_RUNNING"
 MANAGED_GATEWAY_TARGET_MISMATCH = "MANAGED_GATEWAY_TARGET_MISMATCH"
 REMOTE_GATEWAY_UNAVAILABLE = "REMOTE_GATEWAY_UNAVAILABLE"
+#: After the stop timeout, a second SIGTERM forces the gateway's shutdown
+#: (in-flight turns cancelled); this is how long that may take before SIGKILL.
+FORCED_SHUTDOWN_GRACE_S = 5.0
 
 
 def gateway_pidfile_path() -> Path:
@@ -576,6 +579,19 @@ class GatewayLifecycleManager:
             return False
 
         deadline = time.monotonic() + max(self.shutdown_timeout, 0.0)
+        while time.monotonic() <= deadline:
+            if not self._pid_running(pid):
+                return True
+            time.sleep(self.poll_interval)
+
+        # Still draining turns: a second SIGTERM makes the gateway cancel them
+        # and finish its shutdown (channels, clients, MCP) instead of being
+        # killed in the middle of it.
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return not self._pid_running(pid)
+        deadline = time.monotonic() + FORCED_SHUTDOWN_GRACE_S
         while time.monotonic() <= deadline:
             if not self._pid_running(pid):
                 return True

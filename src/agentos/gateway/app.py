@@ -20,6 +20,7 @@ from starlette.websockets import WebSocket
 from agentos import __version__
 from agentos.application.approval_rpc import approval_display_title
 from agentos.gateway.approval_queue import get_approval_queue
+from agentos.gateway.auth_rate_limit import AuthGuard
 from agentos.gateway.config import GatewayConfig
 from agentos.gateway.control_ui import create_control_ui_routes
 from agentos.gateway.middleware import (
@@ -30,12 +31,38 @@ from agentos.gateway.middleware import (
     RateLimitMiddleware,
     SecurityHeadersMiddleware,
 )
+from agentos.gateway.protocol import ErrorCode, error_category
 from agentos.gateway.rpc import RpcContext, get_dispatcher
 from agentos.gateway.websocket import handle_ws_connection
 
 _start_time = time.time()
 
 log = structlog.get_logger(__name__)
+
+#: HTTP status for each canonical error category (``protocol.error_category``).
+#: ``UNAUTHORIZED`` stays 403: an RPC refused on this surface is a
+#: permission answer, the 401 for a missing/wrong token comes from
+#: ``AuthMiddleware`` before any handler runs.
+RPC_CATEGORY_STATUS: dict[ErrorCode, int] = {
+    ErrorCode.INVALID_REQUEST: 400,
+    ErrorCode.UNAUTHORIZED: 403,
+    ErrorCode.FORBIDDEN: 403,
+    ErrorCode.NOT_FOUND: 404,
+    ErrorCode.METHOD_NOT_FOUND: 404,
+    ErrorCode.RATE_LIMITED: 429,
+    ErrorCode.UNAVAILABLE: 503,
+    ErrorCode.INTERNAL_ERROR: 500,
+}
+
+
+def rpc_status_code(result: Any, default: int = 500) -> int:
+    """HTTP status for a dispatcher result, from its code's category."""
+    if result.error is None:
+        return default
+    category = error_category(result.error.code)
+    if category is None:
+        return default
+    return RPC_CATEGORY_STATUS.get(category, default)
 
 
 def resolve_trusted_hosts(config: GatewayConfig) -> list[str]:
@@ -110,20 +137,10 @@ def create_gateway_app(
         diagnostics_state = DiagnosticsState.from_config(config)
 
     dispatcher = get_dispatcher()
-
-    def _rpc_status_code(result: Any, default: int = 500) -> int:
-        if result.error is None:
-            return default
-        code = result.error.code
-        if code == "INVALID_REQUEST":
-            return 400
-        if code == "UNAUTHORIZED":
-            return 403
-        if code in {"NOT_FOUND", "METHOD_NOT_FOUND"}:
-            return 404
-        if code == "UNAVAILABLE":
-            return 503
-        return default
+    # Failed-auth limiter and pre-auth socket budget, shared by the HTTP
+    # middleware and the WebSocket handshake of this app.
+    auth_guard = AuthGuard.from_config(config)
+    _rpc_status_code = rpc_status_code
 
     # ── HTTP endpoint handlers ───────────────────────────────────────────────
 
@@ -306,6 +323,17 @@ def create_gateway_app(
             memory_managers=memory_managers or {},
             memory_stores=memory_stores or {},
             memory_retrievers=memory_retrievers or {},
+        )
+
+    async def api_rpc(request: Request) -> JSONResponse:
+        """POST /api/v1/rpc — allowlisted RPC over HTTP (``gateway.http_rpc``)."""
+        from agentos.gateway.http_rpc import handle_http_rpc
+
+        return await handle_http_rpc(
+            request,
+            dispatcher=dispatcher,
+            make_ctx=_make_ctx,
+            status_for=_rpc_status_code,
         )
 
     async def api_channels_status(request: Request) -> JSONResponse:
@@ -558,6 +586,7 @@ def create_gateway_app(
             memory_stores=memory_stores,
             memory_retrievers=memory_retrievers,
             bind_is_loopback=bind_is_loopback,
+            auth_guard=auth_guard,
         )
 
     # ── Routes ───────────────────────────────────────────────────────────────
@@ -582,6 +611,7 @@ def create_gateway_app(
         Route("/api/approvals/settings", api_approvals_settings, methods=["POST"]),
         Route("/api/approvals/resolve", api_approvals_resolve, methods=["POST"]),
         Route("/api/elevated-mode", api_elevated_mode, methods=["POST"]),
+        Route("/api/v1/rpc", api_rpc, methods=["POST"]),
         WebSocketRoute("/ws", ws_endpoint),
     ]
 
@@ -630,6 +660,7 @@ def create_gateway_app(
             AuthMiddleware,
             config=config,
             control_ui_base_path=config.control_ui.base_path,
+            auth_guard=auth_guard,
         ),
     ]
 
@@ -661,6 +692,7 @@ def create_gateway_app(
         lifespan=_lifespan,
     )
     app.state.diagnostics_state = diagnostics_state
+    app.state.auth_guard = auth_guard
 
     # Bridge upload endpoint: self-hosted multipart sink that
     # returns an opaque file_uuid the chat.send validator can resolve.

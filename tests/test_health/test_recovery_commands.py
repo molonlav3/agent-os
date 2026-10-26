@@ -17,6 +17,7 @@ from agentos.health.evaluator import (
     evaluate_sandbox,
     evaluate_search,
 )
+from agentos.health.gateway_security import evaluate_gateway_security
 from agentos.health.model import HealthFinding
 
 runner = CliRunner()
@@ -336,6 +337,26 @@ def _sample_findings() -> list[HealthFinding]:
                 "permissions": {"default_mode": "full"},
             }
         ),
+        evaluate_gateway_security(
+            {
+                "host": "0.0.0.0",
+                "loopbackBind": False,
+                "authMode": "none",
+                "allowedOrigins": ["*"],
+                "corsAllowedOrigins": ["*"],
+                "corsAllowCredentials": True,
+            }
+        ),
+        evaluate_gateway_security(
+            {
+                "host": "0.0.0.0",
+                "loopbackBind": False,
+                "authMode": "token",
+                "tokenLength": 8,
+                "authRateLimitEnabled": False,
+            }
+        ),
+        evaluate_gateway_security({"host": "127.0.0.1", "authMode": "trusted-proxy"}),
     ]
     collected: list[HealthFinding] = []
     for sample_findings in samples:

@@ -44,7 +44,12 @@ function emptyBootstrap(): Bootstrap {
  * connect. Losing the gateway disconnects; a new URL reconnects.
  */
 export function GatewayProviders({ children }: { children: ReactNode }) {
-  const [rpc] = useState(() => new WsRpcClient())
+  const [rpc] = useState(
+    () =>
+      new WsRpcClient({
+        clientInfo: { id: 'agentos-desktop', platform: 'darwin', mode: 'desktop' },
+      }),
+  )
   const [bootstrap, setBootstrap] = useState<Bootstrap>(emptyBootstrap)
   const gatewayState = useGateway((s) => s.status.state)
   const gatewayUrl = useGateway((s) => s.status.url)
@@ -94,17 +99,25 @@ export function GatewayProviders({ children }: { children: ReactNode }) {
       typeof bridge.operatorSecret === 'function'
         ? bridge.operatorSecret().catch(() => null)
         : Promise.resolve<string | null>(null)
-    Promise.all([fetchBootstrap().catch(() => fallbackBootstrap()), secretPromise]).then(
-      ([b, secret]) => {
-        if (cancelled) return
-        setBootstrap(b)
-        rpc.connect(
-          resolveWsUrl(b.ws_url),
-          token || undefined,
-          secret ? { operatorSecret: secret } : null,
-        )
-      },
-    )
+    const app = desktopApi().app as { version?: () => Promise<string> } | undefined
+    const versionPromise =
+      typeof app?.version === 'function'
+        ? app.version().catch(() => '')
+        : Promise.resolve<string>('')
+    Promise.all([
+      fetchBootstrap().catch(() => fallbackBootstrap()),
+      secretPromise,
+      versionPromise,
+    ]).then(([b, secret, version]) => {
+      if (cancelled) return
+      setBootstrap(b)
+      if (version) rpc.setClientInfo({ version })
+      rpc.connect(
+        resolveWsUrl(b.ws_url),
+        token || undefined,
+        secret ? { operatorSecret: secret } : null,
+      )
+    })
     // Approvals are a REST poller against the same origin; only worth running
     // while there is a gateway to ask.
     approvalMonitor.start()

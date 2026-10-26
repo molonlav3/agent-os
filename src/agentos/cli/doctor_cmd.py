@@ -349,7 +349,28 @@ def _local_config_findings(config_path: str | Path | None = None) -> list[Health
                 ],
             )
         ]
-    return _local_onboarding_findings(config, config_path=config_path)
+    return [
+        *_local_onboarding_findings(config, config_path=config_path),
+        *_local_security_findings(config),
+    ]
+
+
+def _local_security_findings(config: Any) -> list[HealthFinding]:
+    """Gateway exposure findings from the config file alone.
+
+    These are what a gateway that will not start, or will not admit this
+    CLI, cannot report itself: ``gateway.bind_no_auth`` (the startup guard
+    refuses that bind), ``gateway.trusted_proxy_unset`` (nothing is
+    admitted). Only problems are listed; "all clear" needs a running gateway.
+    """
+    try:
+        from agentos.gateway.exposure import gateway_security_payload
+        from agentos.health.gateway_security import evaluate_gateway_security
+
+        findings = evaluate_gateway_security(gateway_security_payload(config))
+    except Exception:  # noqa: BLE001 - doctor stays total on a partial config
+        return []
+    return [finding for finding in findings if finding.severity != "ok"]
 
 
 def _offline_report(
@@ -389,12 +410,16 @@ async def _fetch_report(
     gateway_url: str,
     agent_id: str,
     deep: bool,
+    token: str | None = None,
 ) -> dict[str, Any]:
     from agentos.cli import gateway_client as gateway_client_module
 
     client = gateway_client_module.GatewayClient()
     try:
-        await client.connect(gateway_url)
+        if token:
+            await client.connect(gateway_url, token=token)
+        else:
+            await client.connect(gateway_url)
         payload = await client.call("doctor.status", {"agentId": agent_id, "deep": deep})
         return dict(payload)
     finally:
@@ -670,6 +695,11 @@ def doctor_command(
         help="Config path to inspect when the local gateway is unavailable.",
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    token: str | None = typer.Option(
+        None,
+        "--token",
+        help="Gateway token (default: AGENTOS_GATEWAY_TOKEN, then auth.token from the config).",
+    ),
 ) -> None:
     """Diagnose AgentOS readiness and print recovery steps."""
 
@@ -688,7 +718,12 @@ def doctor_command(
             gateway_url=gateway_url,
             config_path=config_path,
         )
-        report = asyncio.run(_fetch_report(gateway_url=target_url, agent_id=agent_id, deep=deep))
+        from agentos.cli.gateway_rpc import default_gateway_token
+
+        gateway_token = token or default_gateway_token(config_path)
+        report = asyncio.run(
+            _fetch_report(gateway_url=target_url, agent_id=agent_id, deep=deep, token=gateway_token)
+        )
     except SystemExit as exc:
         report = _offline_report(
             exc,

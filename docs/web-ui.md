@@ -442,7 +442,9 @@ configure token auth and network controls first:
 agentos gateway run --listen 0.0.0.0 --port 18791
 ```
 
-Do not expose an unauthenticated gateway to the public internet.
+Do not expose an unauthenticated gateway to the public internet. For the
+supported ways to open the console from another machine, see
+[`remote-access.md`](remote-access.md).
 
 ---
 

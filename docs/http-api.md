@@ -21,10 +21,11 @@ http://127.0.0.1:18791
 `auth.mode = "none"`, and a loopback peer is admitted as a Control connection,
 so `curl http://127.0.0.1:18791/api/...` works with no credentials.
 
-A token is only enforced when `auth.mode = "token"`. That mode is required
-before the gateway will bind to a public address (`0.0.0.0` / LAN): the startup
-guard refuses to serve an unauthenticated public bind, and a token is
-auto-generated when unset. See [`gateway.md`](gateway.md) for bind safety.
+A token is only enforced when `auth.mode = "token"`. A public address
+(`0.0.0.0` / LAN) needs that mode or `trusted-proxy`: the startup guard
+refuses to serve an unauthenticated public bind, and a token is
+auto-generated when unset. See [`gateway.md`](gateway.md) for bind safety and
+[`remote-access.md`](remote-access.md) for tunnels and reverse proxies.
 
 When auth is enabled, send the token via HTTP headers (checked in order):
 
@@ -39,6 +40,43 @@ The gateway implements exactly three auth modes — `none`, `token`, and
 `trusted-proxy`. Any other value (including the never-implemented `"password"`,
 or a typo like `"tokenn"`) is refused when the config loads rather than silently
 admitting every request; the startup error names the supported modes.
+
+`trusted-proxy` admits a request only when the transport peer is listed in
+`auth.trusted_proxy` (IP literals or CIDR blocks such as `10.0.0.0/8`,
+comma-separated). `X-Forwarded-For` is read only from such a peer and walked
+right to left, skipping trusted hops; an address naming the gateway host
+itself is ignored as spoofed.
+
+### Failed-auth rate limiting
+
+A *wrong* token counts against a budget per client address, shared by HTTP
+and the WebSocket: ten failures within 60 seconds lock that address out for
+five minutes, whatever `Origin` header its attempts carry. A locked-out
+client gets `429` with `Retry-After` (seconds) and
+
+```json
+{"error": "Too many failed authentication attempts", "code": "RATE_LIMITED",
+ "details": {"code": "AUTH_RATE_LIMITED", "retry_after_ms": 299000}}
+```
+
+even when it presents the right token. A request with no token is a plain
+`401` and never counts. A loopback address is never locked out (each failure
+is answered after a delay growing from 250 ms to 5 s), but browser requests
+(those carrying `Origin`) are also counted in a second budget per address,
+shared by every `Origin` value and never exempt, so a page in the operator's
+browser cannot guess the token from loopback, and rotating `Origin` gains
+nothing. Behind a proxy on the same host every client looks like loopback:
+list the proxy in `auth.trusted_proxy` (its `X-Forwarded-For` then names the
+client) or set `exempt_loopback = false`. Settings:
+
+```toml
+[auth.rate_limit]
+enabled = true
+max_failures = 10
+window_seconds = 60
+lockout_seconds = 300
+exempt_loopback = true
+```
 
 `/health` and `/ready` never require a token. Cross-origin browser requests are
 governed by CORS configuration regardless of auth mode.
@@ -65,6 +103,7 @@ These require no auth and are safe for load balancers and container probes.
 | `GET` | `/api/cron` | List scheduled jobs. |
 | `GET` | `/api/usage` | Token usage and cost breakdown. |
 | `GET` | `/metrics` | Prometheus metrics exposition (`observability.metrics_path`). |
+| `POST` | `/api/v1/rpc` | Call an allowlisted RPC method: `{id?, method, params?}` → `{id, ok, payload \| error}`. See [RPC over HTTP](#rpc-over-http). |
 
 ## Channels
 
@@ -98,6 +137,49 @@ Raise it only if you run more consoles than that against one gateway.
 | `GET` | `/api/v1/artifacts/{artifact_id}` | Fetch a generated artifact. |
 | `POST` | `/api/audio/transcribe` | Transcribe audio to text. |
 
+## RPC over HTTP
+
+`POST /api/v1/rpc` calls one gateway RPC method without a WebSocket, behind the
+same bearer auth, origin guard and rate limits as the other `/api/*` routes:
+
+```sh
+curl -X POST -H "Authorization: Bearer $AGENTOS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"id": "1", "method": "sessions.list", "params": {"limit": 5}}' \
+  http://127.0.0.1:18791/api/v1/rpc
+```
+
+The body is `{id?, method, params?}` (`id` a string or integer, echoed back;
+`params` an object). The answer is the WebSocket `res` frame without its
+`type`: `{"id", "ok": true, "payload"}` with `200`, or `{"id", "ok": false,
+"error": {code, message, details, retryable, retry_after_ms}}` with a status
+from the error's category:
+
+| Category | Status |
+| --- | --- |
+| `INVALID_REQUEST` | `400` |
+| `UNAUTHORIZED`, `FORBIDDEN` | `403` |
+| `NOT_FOUND`, `METHOD_NOT_FOUND` | `404` |
+| `RATE_LIMITED` | `429` |
+| `UNAVAILABLE` | `503` |
+| `INTERNAL_ERROR` and anything else | `500` |
+
+Only an allowlist is reachable: reads (`health`, `status`, `config.get`,
+`sessions.list`/`get`/`preview`/`resolve`, `chat.history`, `models.list`,
+`usage.*`, `agents.list`, `projects.list`/`get`, `skills.list`, `cron.list`,
+`channels.status`, `doctor.status`, `acp.*` status, ...) and mutations that
+create, rename or send without deleting anything (`chat.send`,
+`sessions.send`, `sessions.create`, `sessions.rename`,
+`projects.create`/`update`, `*.abort`, `plan.mode.set`). `chat.send` and
+`sessions.send` start an agent turn with the same options as over the
+WebSocket, including an elevated execution mode the request asks for, so the
+token must be treated as full operator access either way. Configuration
+writes, secrets and environment variables, trading and wallets, restarts,
+deletes and approval decisions stay on the WebSocket. Any other method answers `403` with `error.code = "FORBIDDEN"` and
+`details.code = "METHOD_NOT_ALLOWED_OVER_HTTP"`. The full list is
+`HTTP_RPC_METHODS` in
+[`src/agentos/gateway/http_rpc.py`](../src/agentos/gateway/http_rpc.py).
+
 ## Streaming (WebSocket)
 
 For streaming turns and live events, connect to the WebSocket route:
@@ -111,9 +193,66 @@ plus server-pushed events. It is one route on the same app — the REST surface
 above sits alongside it. See [`mcp-server.md`](mcp-server.md) for a bridge that
 uses this transport.
 
-Projects (session groups with shared knowledge) are WebSocket-only:
-`projects.create` / `projects.list` / `projects.get` / `projects.update` /
-`projects.delete` (params use `projectId`, `agentId`, `name`, `knowledge`;
+### Handshake
+
+1. The server sends `connect.challenge` with `{nonce, ts}` (`ts` in ms since
+   the epoch).
+2. The client answers with a `req` whose `method` is `connect` and whose
+   `params` are `{minProtocol, maxProtocol, clientKind, client, auth?}`. The
+   current protocol is `3`; send `minProtocol = maxProtocol = 3`. `client` is
+   informational, `{id, version, platform, mode}`, every field optional.
+   `auth.token` carries the gateway token.
+3. The server answers with a bare `hello-ok` frame (not a `res`) carrying
+   `features.methods`, `features.events`, `features.capabilities` (additive
+   feature names such as `typed-errors`, `challenge-ts`, `auth-rate-limit`,
+   `rpc-http`; treat an unknown one as absent), `policy` and
+   `auth.nonce` (the challenge nonce, so a client can check it answered its
+   own challenge).
+
+Messages before `hello-ok` are capped at 64 KiB: a larger one (plain,
+fragmented or compressed) closes the socket with `1009` before it is read.
+After it the cap is `policy.max_payload` (25 MiB). One address may hold at
+most 128 sockets in the handshake; the next upgrade is refused with HTTP 403. Malformed
+frames answer `INVALID_REQUEST` with `details.code` `INVALID_FRAME` or
+`INVALID_CONNECT_PARAMS` and an `errors` list. A protocol range the server
+cannot meet answers `INVALID_REQUEST` with `details {code:
+"PROTOCOL_MISMATCH", client_min, client_max, server_min, server_max,
+reload_required}`; `reload_required` is true when the client is the older
+side (a stale web console bundle).
+
+### Errors
+
+`error.code` is one of `INVALID_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`,
+`NOT_FOUND`, `METHOD_NOT_FOUND`, `UNAVAILABLE`, `RATE_LIMITED`,
+`INTERNAL_ERROR`, a long-standing code kept for existing clients
+(`QUEUE_FULL`, `GATEWAY_RESTARTING`, ...), or a namespaced domain code
+(`project.conflict`, `trading.operator_required`). The specific reason of a
+new error is in `details.code` (`PROTOCOL_MISMATCH`, `AUTH_RATE_LIMITED`,
+`REQUEST_START_TIMEOUT`, `QUEUE_FULL`, ...). `retryable: true` says trying
+again later can succeed.
+
+### Concurrency and backpressure
+
+Up to four requests per connection run at once. Requests naming the same
+session (`sessionKey`, or `key` on `sessions.*`) run in order, and a request
+naming no session waits for every earlier one, so a client can still rely on
+`chat.send` before `sessions.abort` or `subscribe` before a history read.
+Session-less reads (`sessions.list`, `status`, `config.get`, `models.list`,
+`usage.*`, ...) wait only for earlier session-less writes, so a poll is not
+held back by another session's slow history. A request that cannot start
+within 30 seconds answers `UNAVAILABLE` with
+`details.code = "REQUEST_START_TIMEOUT"` (retryable).
+
+Event frames carry a per-connection `seq`. When more than
+`policy.max_buffered_bytes` (50 MiB) is waiting for a client that is not
+reading, periodic refreshes (`tick`, `presence`, `health`) are dropped and
+their `seq` still consumed, so the client sees a gap and resynchronizes;
+anything else closes the socket with `1008` `slow consumer`.
+
+Projects (session groups with shared knowledge) have no REST route of their
+own: `projects.create` / `projects.list` / `projects.get` / `projects.update`
+are RPC methods (WebSocket, or `POST /api/v1/rpc`), `projects.delete` is
+WebSocket-only (params use `projectId`, `agentId`, `name`, `knowledge`;
 delete responds with `sessionsCleared` — sessions are detached, not deleted).
 `projects.update` writes only the fields you pass and accepts an optional
 `expectedUpdatedAt` (the `updatedAt` you last read): when the row changed in
