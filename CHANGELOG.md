@@ -157,10 +157,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   same policy chain as an agent's tool call, unattended and sandboxed:
   `dry_run` returns the resolved policy, an approval requirement answers `403`
   with the `approval_id`, `idempotency_key` replays or answers `409
-  REQUEST_CONFLICT`. Shell and code execution, file writes, session
-  spawning/sending, scheduling, gateway control, outbound messages and trading
-  tools answer `404` whatever the config says, unless `[tools.invoke] allow`
-  names them (#3695).
+  REQUEST_CONFLICT`. Deny by default: only tools declared read-only run; shell
+  and code execution, file and memory writes, session spawning/sending,
+  scheduling, gateway control, outbound messages, browser, paid media and
+  trading tools answer `404` whatever the flags say, file-writing arguments are
+  refused, and only `[tools.invoke] allow` in `agentos.toml` lifts a tool
+  (config RPC writes cannot) (#3695).
 - Config file hot reload (`[gateway] config_reload`, default on): edits of the
   active config file are validated and applied while the gateway runs; keys
   read only at startup are reported as pending (`config.changed` event,

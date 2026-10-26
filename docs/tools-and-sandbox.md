@@ -76,12 +76,16 @@ policy chain — in an unattended, sandboxed context, so a tool that needs an
 approval refuses (`403 APPROVAL_REQUIRED`, with the `approval_id` when one was
 queued). `dry_run: true` returns the resolved policy without running anything.
 
-A hard deny list applies on top, whatever the configuration says: shell,
-terminal and code execution, file writes, deletes and moves (including memory,
-skill and document writes, `publish_artifact` and `env_set`), `sessions_spawn`,
-`sessions_send`, `subagents`, `acp`, `message`, `cron` and scheduler tools,
-`gateway`, and trading tools. Those answer `404`, exactly like a tool that
-does not exist. Lift one tool at a time with:
+It denies by default: only tools whose registration declares them read-only
+run. A name floor holds on top, whatever the configuration says: shell,
+terminal and code execution, file and memory writes (including the `memory`
+tool, `http_request` downloads, document creation, `publish_artifact`,
+`env_set`), project and session renames, `sessions_spawn`, `sessions_send`,
+`subagents`, `acp`, `message`, `cron` and scheduler tools, `gateway`,
+`browser`, `router_control`, paid media generation and trading tools. Those
+answer `404`, exactly like a tool that does not exist, and arguments that write
+a file (`output_path` and the like) are refused for every tool. Lift one tool
+at a time in `agentos.toml` (config RPC writes cannot add an entry):
 
 ```toml
 [tools.invoke]

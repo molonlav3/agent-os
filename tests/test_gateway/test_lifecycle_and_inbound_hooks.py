@@ -128,18 +128,18 @@ class TestLifecycleHooks:
         assert report.timed_out == ["command:sleep 30"]
 
     def test_lifecycle_commands_are_file_only(self) -> None:
-        from agentos.gateway.rpc_config import _assert_file_only_hooks_unchanged
+        from agentos.gateway.rpc_config import _assert_file_only_paths_unchanged
 
         source = {"hooks": {"lifecycle": {"shutdown": ["a"]}, "token": ""}}
-        _assert_file_only_hooks_unchanged(
+        _assert_file_only_paths_unchanged(
             {"hooks": {"lifecycle": {"shutdown": []}, "token": ""}}, source
         )  # clearing is allowed
         with pytest.raises(ValueError, match="file-only"):
-            _assert_file_only_hooks_unchanged(
+            _assert_file_only_paths_unchanged(
                 {"hooks": {"lifecycle": {"shutdown": ["a", "curl evil"]}, "token": ""}}, source
             )
         with pytest.raises(ValueError, match="file-only"):
-            _assert_file_only_hooks_unchanged(
+            _assert_file_only_paths_unchanged(
                 {"hooks": {"lifecycle": {"shutdown": ["a"]}, "token": "new"}}, source
             )
 

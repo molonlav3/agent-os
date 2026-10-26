@@ -1434,7 +1434,7 @@ allow = []                        # tools lifted off POST /api/v1/tools/invoke's
 | `artifacts.legacy_session_key_urls` | `true` | `false` makes `/api/v1/artifacts/{id}?sessionKey=` and `/api/v1/attachments/{sha256}?sessionKey=` answer `404`. Clients use ticketed URLs from `artifacts.download`; see [HTTP API](http-api.md#ticketed-downloads). |
 | `push.web_enabled` | `true` | Web Push for approvals. The VAPID key pair is generated once into `<state_dir>/web_push_vapid.json` (0600); subscriptions live in `<state_dir>/web_push.sqlite`. |
 | `push.vapid_subject` | `https://useagentos.dev` | Contact push services may use to reach the sender. |
-| `tools.invoke.allow` | `[]` | Exact tool names `POST /api/v1/tools/invoke` may run although they are on its hard deny list. The configured `[tools]` policy still applies. |
+| `tools.invoke.allow` | `[]` | Exact tool names `POST /api/v1/tools/invoke` may run although it would refuse them (not declared read-only, or on its name floor). The configured `[tools]` policy still applies. File-only: config RPC writes cannot add an entry. |
 
 All three are read per request: no restart.
 

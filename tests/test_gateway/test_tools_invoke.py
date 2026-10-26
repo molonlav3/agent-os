@@ -55,13 +55,39 @@ def _registry(calls: list[dict[str, Any]]) -> ToolRegistry:
         lookup,
     )
     registry.register(
-        ToolSpec(name="needs_human", description="", parameters={}, requires_approval=True),
+        ToolSpec(
+            name="needs_human",
+            description="",
+            parameters={},
+            requires_approval=True,
+            read_only=True,
+        ),
         needs_human,
     )
-    registry.register(ToolSpec(name="boom", description="", parameters={}), boom)
-    for name in ("exec_command", "write_file", "sessions_spawn", "cron", "gateway"):
+    registry.register(ToolSpec(name="boom", description="", parameters={}, read_only=True), boom)
+    for name in (
+        "exec_command",
+        "write_file",
+        "sessions_spawn",
+        "cron",
+        "gateway",
+        "trading_swap",
+        "memory",
+        "http_request",
+        "projects_create",
+        "session_rename",
+        "image_generate",
+        "tts",
+        "browser",
+        "router_control",
+    ):
         registry.register(ToolSpec(name=name, description="", parameters={}), never)
-    registry.register(ToolSpec(name="trading_swap", description="", parameters={}), never)
+    # Declared read-only but on the name floor all the same.
+    registry.register(
+        ToolSpec(name="music_generate", description="", parameters={}, read_only=True), never
+    )
+    # Not on any list, but its registration does not say it is read-only.
+    registry.register(ToolSpec(name="mcp__notes__append", description="", parameters={}), never)
     return registry
 
 
@@ -117,7 +143,25 @@ class TestInvoke:
         assert calls[0]["session_key"] == "agent:main:webchat:x"
 
     @pytest.mark.parametrize(
-        "tool", ["exec_command", "write_file", "sessions_spawn", "cron", "gateway", "trading_swap"]
+        "tool",
+        [
+            "exec_command",
+            "write_file",
+            "sessions_spawn",
+            "cron",
+            "gateway",
+            "trading_swap",
+            "memory",
+            "http_request",
+            "projects_create",
+            "session_rename",
+            "image_generate",
+            "tts",
+            "browser",
+            "router_control",
+            "music_generate",
+            "mcp__notes__append",
+        ],
     )
     def test_hard_denied_tool_is_404_like_an_unknown_one(self, tool: str) -> None:
         client = _client(_registry([]))
@@ -141,6 +185,26 @@ class TestInvoke:
         assert dry.json()["allowed"] is True
         assert dry.json()["policy"]["invokeAllowOverride"] is True
         assert _invoke(client, {"tool": "exec_command"}).status_code == 404
+
+    def test_a_tool_not_declared_read_only_needs_an_allow_entry(self) -> None:
+        client = _client(_registry([]))
+        assert _invoke(client, {"tool": "mcp__notes__append", "dry_run": True}).status_code == 404
+        tools = ToolsConfig(invoke=ToolsInvokeConfig(allow=["mcp__notes__append"]))
+        lifted = _invoke(
+            _client(_registry([]), tools=tools), {"tool": "mcp__notes__append", "dry_run": True}
+        )
+        assert lifted.status_code == 200
+        assert lifted.json()["allowed"] is True
+
+    @pytest.mark.parametrize("arg", ["output_path", "save_path", "output_file", "destination"])
+    def test_file_writing_arguments_are_refused(self, arg: str) -> None:
+        calls: list[dict[str, Any]] = []
+        resp = _invoke(
+            _client(_registry(calls)), {"tool": "lookup", "args": {"query": "q", arg: "x.bin"}}
+        )
+        assert resp.status_code == 400
+        assert arg in resp.json()["error"]
+        assert calls == []
 
     def test_policy_denied_tool_is_403(self) -> None:
         tools = ToolsConfig(deny=["lookup"])
@@ -247,6 +311,22 @@ class TestIdempotency:
         assert asyncio.run(scenario()) == ["new", "conflict", "new"]
 
 
+def test_shipped_registry_only_exposes_read_only_tools_by_default() -> None:
+    """Against the real registry: every tool the endpoint would run is declared
+    read-only, and the ones the floor names stay out even if a flag changes."""
+    import agentos.tools.builtin  # noqa: F401 - registers the built-in tools
+    from agentos.gateway.tools_invoke import invocable
+    from agentos.tools.registry import get_default_registry
+
+    registry = get_default_registry()
+    runnable = {name for name in registry.list_names() if invocable(name, registry.get(name))}
+    assert runnable, "expected some read-only tools"
+    assert all(registry.get(name).spec.read_only for name in runnable)
+    for name in ("memory", "http_request", "image_generate", "browser", "exec_command"):
+        assert name not in runnable
+    assert {"read_file", "list_dir", "web_search"} <= runnable
+
+
 def test_hard_deny_list_covers_the_documented_classes() -> None:
     for tool in (
         "exec",
@@ -265,3 +345,57 @@ def test_hard_deny_list_covers_the_documented_classes() -> None:
     assert is_hard_denied("trading_buy")
     assert not is_hard_denied("web_search")
     assert not is_hard_denied("exec_command", ["exec_command"])
+
+
+class TestDenyListIsFileOnly:
+    """#3695 hardening: a config RPC must not lift tools off the deny list."""
+
+    def _ctx(self, tmp_path: Any, via: str | None) -> Any:
+        from agentos.gateway.access import ConnectionSurface
+        from agentos.gateway.agent_surface import AgentBinding
+        from agentos.gateway.auth import AccessContext
+        from agentos.gateway.rpc import RpcContext
+
+        config = GatewayConfig(config_path=str(tmp_path / "agentos.toml"))
+        return RpcContext(
+            conn_id="c1",
+            access=AccessContext(
+                surface=ConnectionSurface.CONTROL,
+                admitted=True,
+                credential_verified=True,
+                agent=AgentBinding(via=via) if via else None,
+            ),
+            config=config,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("via", ["token", "window", "unbound", None])
+    @pytest.mark.parametrize(
+        ("method", "params"),
+        [
+            ("config.set", {"path": "tools.invoke.allow", "value": ["exec_command"]}),
+            ("config.patch", {"patches": {"tools.invoke.allow": ["exec_command"]}}),
+            ("config.patch", {"patch": {"tools": {"invoke": {"allow": ["exec_command"]}}}}),
+        ],
+    )
+    async def test_adding_an_allow_entry_is_refused(
+        self, tmp_path: Any, via: str | None, method: str, params: dict[str, Any]
+    ) -> None:
+        from agentos.gateway.rpc import get_dispatcher
+
+        ctx = self._ctx(tmp_path, via)
+        res = await get_dispatcher().dispatch("1", method, params, ctx)
+        assert res.ok is False
+        assert res.error.code == "INVALID_REQUEST"
+        assert ctx.config.tools.invoke.allow == []
+
+    @pytest.mark.asyncio
+    async def test_an_agent_cannot_even_clear_it(self, tmp_path: Any) -> None:
+        from agentos.gateway.rpc import get_dispatcher
+
+        ctx = self._ctx(tmp_path, "token")
+        res = await get_dispatcher().dispatch(
+            "1", "config.set", {"path": "hooks.lifecycle.shutdown", "value": []}, ctx
+        )
+        assert res.error.code == "INVALID_REQUEST"
+        assert "agent" in res.error.message

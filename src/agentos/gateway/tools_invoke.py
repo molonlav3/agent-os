@@ -3,11 +3,14 @@
 Scripts, CI and the desktop can call "search the web" or "read this memory"
 directly. The call goes through the same chain as an agent's tool call:
 
-1. a hard deny list no configuration widens -- shell and code execution,
-   file writes, session spawning and sending, scheduling, gateway control,
-   outbound messages, trading -- except tool by tool through
+1. default deny: only tools whose registration declares them read-only run,
+   on top of a name floor no configuration widens -- shell and code
+   execution, file and memory writes, session spawning and sending,
+   scheduling, gateway control, outbound messages, paid media generation,
+   browser and routing control, trading -- except tool by tool through
    ``[tools.invoke] allow``; a denied or unknown tool answers ``404`` and the
-   two are indistinguishable;
+   two are indistinguishable. Arguments that write a file (``output_path``
+   and friends) are refused for every tool;
 2. the configured policy (``[tools]`` profile / allow / deny, the agent's own
    entry) and the runtime capability surface, resolved exactly as for a turn;
 3. the dispatch preflight (injection guard, policy chain) -- a refusal is
@@ -94,19 +97,75 @@ HARD_DENY_TOOLS: frozenset[str] = frozenset(
         "cron",
         "scheduler",
         "gateway",
+        # Writes that do not look like file tools: the unified memory tool
+        # (MEMORY.md feeds every system prompt), project and session state,
+        # files written by a download, routing holds, and a browser.
+        "memory",
+        "http_request",
+        "projects_create",
+        "projects_update",
+        "projects_move_session",
+        "session_rename",
+        "router_control",
+        "browser",
+        "dubbing_download",
+        # Paid media generation.
+        "image_generate",
+        "music_generate",
+        "song_generate",
+        "tts",
+        "voice_clone",
+        "voice_convert",
+        "dubbing_generate",
+        # Turn control that needs a live conversation.
+        "ask_user",
+        "exit_plan_mode",
     }
 )
 #: Name prefixes that are always hard-denied (trading writes, any future
 #: scheduler variant).
 HARD_DENY_PREFIXES: tuple[str, ...] = ("trade", "trading", "cron_", "scheduler_")
 
+#: Arguments that make a tool write a file, refused whatever the tool.
+FILE_WRITE_ARGUMENTS: frozenset[str] = frozenset(
+    {
+        "output_path",
+        "output_file",
+        "out_path",
+        "save_path",
+        "save_to",
+        "download_path",
+        "dest_path",
+        "destination",
+    }
+)
+
 _APPROVAL_STATUSES = frozenset({"approval_pending", "approval_required", "pending_approval"})
 
 
 def is_hard_denied(tool: str, allow: list[str] | tuple[str, ...] = ()) -> bool:
+    """The name floor: tools never run here unless ``allow`` names them."""
     if tool in allow:
         return False
     return tool in HARD_DENY_TOOLS or tool.startswith(HARD_DENY_PREFIXES)
+
+
+def invocable(tool: str, registered: Any, allow: list[str] | tuple[str, ...] = ()) -> bool:
+    """Whether the endpoint may run ``tool`` at all.
+
+    Default deny: besides the name floor, a tool runs only when its
+    registration declares it read-only (``ToolSpec.read_only``). A tool that
+    may write, send, spend or change state -- including every MCP tool and
+    anything registered later without the flag -- needs ``[tools.invoke]
+    allow``.
+    """
+    if registered is None:
+        return False
+    if tool in allow:
+        return True
+    if is_hard_denied(tool):
+        return False
+    return bool(getattr(getattr(registered, "spec", None), "read_only", False))
 
 
 def _invoke_allow(config: Any) -> list[str]:
@@ -305,9 +364,16 @@ async def invoke_tool(
     dry_run = bool(body.get("dry_run", body.get("dryRun", False)))
 
     allow = _invoke_allow(config)
-    if is_hard_denied(tool, allow) or registry.get(tool) is None:
+    if not invocable(tool, registry.get(tool), allow):
         log.info("tools_invoke.not_found", tool=tool)
         return _not_found()
+    writes = sorted(FILE_WRITE_ARGUMENTS & set(args))
+    if writes:
+        return _error(
+            400,
+            "INVALID_REQUEST",
+            f"argument {writes[0]!r} writes a file, which this endpoint does not do",
+        )
 
     ctx = build_invoke_tool_context(config, registry, session_key=session_key, runtime=runtime)
     call = ToolCall(tool_use_id=f"http-{uuid.uuid4().hex[:12]}", tool_name=tool, arguments=args)
@@ -508,7 +574,29 @@ def register_tools_invoke_route(
             future.set_result((status, payload))
         return JSONResponse(payload, status_code=status)
 
-    app.router.routes.append(Route(INVOKE_PATH, handler, methods=["POST"]))
+    async def contained(request: Request) -> JSONResponse:
+        # Failures are logged by type and redacted message: the default error
+        # path prints traceback locals, the gateway config among them.
+        try:
+            return await handler(request)
+        except Exception as exc:  # noqa: BLE001 - see comment
+            from agentos.redact import redact_sensitive_text
+
+            log.warning(
+                "tools_invoke.failed",
+                error_type=type(exc).__name__,
+                error=(redact_sensitive_text(str(exc)) or "")[:300],
+            )
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "The tool call could not be handled",
+                    "code": "INTERNAL_ERROR",
+                },
+                status_code=500,
+            )
+
+    app.router.routes.append(Route(INVOKE_PATH, contained, methods=["POST"]))
 
 
 __all__ = [
@@ -519,6 +607,8 @@ __all__ = [
     "IdempotencyCache",
     "build_invoke_tool_context",
     "invoke_tool",
+    "FILE_WRITE_ARGUMENTS",
+    "invocable",
     "is_hard_denied",
     "register_tools_invoke_route",
     "request_fingerprint",

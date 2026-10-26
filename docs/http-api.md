@@ -263,18 +263,28 @@ and agent), `idempotency_key`, `dry_run`.
 | `200` `{"dryRun": true, "allowed": …, "policy": {…}}` | `dry_run`: the resolved policy (profile, caller, sandboxed, read-only, may-require-approval); nothing ran. |
 | `403` `POLICY_DENIED` | The configured tool policy (`[tools]` profile/allow/deny, the agent's own entry) refuses it. |
 | `403` `APPROVAL_REQUIRED` | The tool needs a human approval. HTTP calls run unattended, so the tool refuses as on any unattended run; `approval_id` is included when it queued one. |
-| `404` `NOT_FOUND` | Unknown tool **or** a hard-denied one — the two look the same. |
+| `400` `INVALID_REQUEST` | Bad body, or an argument that writes a file (`output_path`, `save_path`, `output_file`, `destination`, …), refused for every tool. |
+| `404` `NOT_FOUND` | Unknown tool **or** one the endpoint does not run — the two look the same. |
 | `409` `REQUEST_CONFLICT` | The `idempotency_key` was used for a different request in the last ten minutes (a repeat of the same request replays its first answer with `idempotentReplay: true`). |
 
-The hard deny list holds regardless of configuration: shell, terminal and code
-execution (`exec_command`, `bash`, `process`, `execute_code`, …), file writes,
-deletes and moves (`write_file`, `edit_file`, `apply_patch`, `git_commit`,
-memory and skill writes, document creation, `publish_artifact`, `env_set`),
-`sessions_spawn`, `sessions_send`, `subagents`, `acp`, `message`, `cron` and
-any scheduler tool, `gateway`, and any `trade*`/`trading*` tool. Lift a single
-tool with `[tools.invoke] allow = ["write_file"]`. Tools run sandboxed in an
-unattended context; a connection the gateway recognizes as an agent's (an agent
-token or an open exec window) is refused with `403`.
+The endpoint denies by default: it runs only tools whose registration
+declares them read-only (`read_file`, `list_dir`, `grep_search`, `web_search`,
+`web_fetch`, `memory_search`, `sessions_list`, …). Every other tool — anything
+that may write, send, spend or change state, every MCP tool, and anything
+registered later without the read-only flag — answers `404`. On top of that, a
+name floor holds even if a flag changes: shell, terminal and code execution,
+file writes, deletes and moves (including `memory`, memory and skill writes,
+document creation, `publish_artifact`, `env_set`, `http_request`), project and
+session renames, `sessions_spawn`, `sessions_send`, `subagents`, `acp`,
+`message`, `cron` and scheduler tools, `gateway`, `browser`,
+`router_control`, the paid media generators (`image_generate`, `tts`,
+`music_generate`, `song_generate`, `voice_clone`, `voice_convert`,
+`dubbing_*`), and any `trade*`/`trading*` tool. Lift a single tool with
+`[tools.invoke] allow = ["create_pdf_report"]` — in `agentos.toml` only: config
+RPC writes refuse to add an entry, and a connection the gateway recognizes as an
+agent's cannot touch the setting at all. Tools run sandboxed in an unattended
+context; an agent's connection (an agent token or an open exec window) is
+refused with `403`.
 
 ## Inbound webhooks
 
