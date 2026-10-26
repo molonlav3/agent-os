@@ -6,6 +6,8 @@ import { useConnection } from '@/stores/connection'
 import { initTheme } from '@/stores/theme'
 import { initLocale, t } from '@/i18n'
 import { approvalMonitor } from '@/services/approval-monitor'
+import { bindPendingQuestions } from '@/lib/pending-questions'
+import { bindRuntimeSignals } from '@/lib/runtime-signals'
 import type { RpcState } from '@/lib/ws-rpc'
 import { KeyboardShortcutProvider } from '@/components/KeyboardShortcuts'
 
@@ -44,6 +46,10 @@ export function AppProviders({ children }: { children: ReactNode }) {
     initLocale()
     let cancelled = false
     const unsubscribe = rpc.on('_state', (s) => useConnection.getState().setState(s as RpcState))
+    // The truth badge and the attention inbox read what this connection sees:
+    // frame age, refused handshakes, doctor/ready, presented ask_user questions.
+    const unbindSignals = bindRuntimeSignals(rpc)
+    const unbindQuestions = bindPendingQuestions(rpc)
     fetchBootstrap()
       // Legacy served bootstrap inline (it could not fail): the shell always
       // rendered and _autoConnect used the location-derived default WS URL with
@@ -78,6 +84,8 @@ export function AppProviders({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true
       unsubscribe()
+      unbindSignals()
+      unbindQuestions()
       rpc.disconnect()
     }
   }, [rpc])

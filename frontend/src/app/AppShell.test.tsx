@@ -16,6 +16,7 @@ import {
 import { KeyboardShortcutProvider } from '@/components/KeyboardShortcuts'
 import { useConnection } from '@/stores/connection'
 import { useApprovals } from '@/services/approval-monitor'
+import { useRuntimeSignals } from '@/lib/runtime-signals'
 import type { Bootstrap } from '@/lib/bootstrap'
 
 // AppShell reads useBootstrap() (version footer) — in production it always runs
@@ -50,6 +51,7 @@ vi.mock('./providers', async (importOriginal) => {
 beforeEach(() => {
   mockRpcCall.mockReset()
   mockRpcCall.mockImplementation(() => new Promise(() => {}))
+  useRuntimeSignals.getState().reset()
 })
 
 // Render the route tree without AppProviders (no network): test harness
@@ -496,6 +498,7 @@ describe('app shell chrome', () => {
     expect(links).toEqual([
       'Chat',
       'Projects',
+      'Inbox',
       'Overview',
       'Health',
       'Channels',
@@ -555,13 +558,13 @@ describe('app shell chrome', () => {
     mockBootstrap = { ...mockBootstrap, version: '' }
     renderShellAt('/cron')
     const foot = screen.getByTestId('nav-foot')
-    expect(foot).toHaveTextContent('DISCONNECTED')
+    expect(foot).toHaveTextContent('OFFLINE')
     expect(foot.querySelector('.shell-sidebar__version')).toBeNull()
   })
 
-  // M14 — the sidebar footer is the shell's single persistent connection
-  // indicator. The top header has been retired.
-  it('shows connection state only in the sidebar footer across all states', () => {
+  // M14 — the sidebar footer is the shell's single persistent status
+  // indicator (the truth badge). The top header has been retired.
+  it('shows the truth badge only in the sidebar footer across all states', () => {
     stubMatchMedia(false)
     renderShellAt('/cron')
     const pill = document.getElementById('conn-pill')!
@@ -571,23 +574,69 @@ describe('app shell chrome', () => {
     expect(sidebar).toContainElement(pill)
     expect(screen.queryByTestId('shell-header')).not.toBeInTheDocument()
 
-    // Disconnected (initial store state).
-    expect(pill).toHaveTextContent('DISCONNECTED')
-    expect(pill).toHaveAttribute('title', expect.stringContaining('Disconnected'))
+    // Never connected (initial store state): offline, nothing to show.
+    expect(pill).toHaveTextContent('OFFLINE')
+    expect(pill).toHaveTextContent('Unavailable')
+    expect(pill).toHaveAttribute('title', expect.stringContaining('Offline'))
     expect(pill).toHaveAttribute('data-variant', 'err')
 
     // Connecting.
     act(() => useConnection.getState().setState('connecting'))
     expect(pill).toHaveTextContent('CONNECTING')
-    expect(pill).toHaveAttribute('title', expect.stringContaining('Connecting'))
     expect(pill).toHaveAttribute('data-variant', 'warn')
 
-    // Connected stays mounted in the footer without a second readout.
-    act(() => useConnection.getState().setState('connected'))
+    // Connected, but no doctor report yet: not "Ready" until it is known.
+    act(() => {
+      useRuntimeSignals.setState({ everConnected: true, lastFrameAt: Date.now() })
+      useConnection.getState().setState('connected')
+    })
+    expect(pill).toHaveTextContent('UNKNOWN')
+    expect(pill).toHaveTextContent(/Live · \d+ s/)
+
+    // A clean doctor report over a live connection is Ready.
+    act(() =>
+      useRuntimeSignals.setState({
+        doctor: { status: 'ready', ready: true, counts: { error: 0 }, findings: [], fetchedAt: 1 },
+      }),
+    )
     expect(document.getElementById('conn-pill')).not.toBeNull()
-    expect(pill).toHaveTextContent('CONNECTED')
-    expect(pill).toHaveAttribute('title', expect.stringContaining('Connected'))
+    expect(pill).toHaveTextContent('READY')
+    expect(pill).toHaveAttribute('title', expect.stringContaining('Ready'))
     expect(pill).toHaveAttribute('data-variant', 'ok')
+
+    // An error-level finding degrades it.
+    act(() =>
+      useRuntimeSignals.setState({
+        doctor: {
+          status: 'degraded',
+          ready: true,
+          counts: { error: 1 },
+          findings: [],
+          fetchedAt: 1,
+        },
+      }),
+    )
+    expect(pill).toHaveTextContent('DEGRADED')
+    expect(pill).toHaveAttribute('data-variant', 'warn')
+  })
+
+  it('opens the truth panel with the reason and exactly one recovery action', async () => {
+    stubMatchMedia(false)
+    const retry = vi.fn()
+    useRuntimeSignals.setState({ everConnected: true, lastFrameAt: Date.now() - 5_000, retry })
+    useConnection.getState().setState('disconnected')
+    renderShellAt('/cron')
+
+    fireEvent.click(screen.getByTestId('truth-badge'))
+    const panel = await screen.findByTestId('truth-panel')
+    expect(panel).toHaveTextContent('Lost the gateway connection')
+    expect(panel).toHaveTextContent(/Snapshot · \d+ s/)
+    const actions = within(panel).getAllByRole('button')
+    expect(actions).toHaveLength(1)
+    expect(actions[0]).toHaveTextContent('Retry connection')
+    fireEvent.click(actions[0]!)
+    expect(retry).toHaveBeenCalledTimes(1)
+    expect(screen.queryByTestId('truth-panel')).toBeNull()
   })
 
   it('places Chat controls in a floating route header while theme stays in the sidebar', async () => {
@@ -664,6 +713,17 @@ describe('app shell chrome', () => {
     const banner = await screen.findByTestId('update-banner')
     fireEvent.click(within(banner).getByRole('button', { name: 'Update now' }))
 
+    // The preflight runs first: nothing is running, due or pending, so the
+    // confirm reads "Update now" and only it calls updates.apply.
+    const dialog = await screen.findByRole('alertdialog', { name: /Before updating AgentOS/ })
+    await waitFor(() => expect(calls).toContain('cron.list'))
+    expect(calls).toContain('sessions.list')
+    expect(calls).not.toContain('updates.apply')
+    const confirm = within(dialog).getByTestId('preflight-confirm')
+    await waitFor(() => expect(confirm).toBeEnabled())
+    expect(confirm).toHaveTextContent('Update now')
+    fireEvent.click(confirm)
+
     await waitFor(() => expect(calls).toContain('updates.apply'))
     expect(calls.filter((m) => m === 'updates.apply')).toHaveLength(1)
     expect(banner).toHaveAttribute('data-state', 'running')
@@ -675,6 +735,56 @@ describe('app shell chrome', () => {
     })
     expect(within(banner).getByText(/Updated to 2026\.9\.9/)).toBeInTheDocument()
     expect(within(banner).getByRole('button', { name: 'Reload' })).toBeInTheDocument()
+  })
+
+  it('blocks the update with a reason while an approval is pending', async () => {
+    stubMatchMedia(false)
+    useConnection.getState().setState('connected')
+    useApprovals.setState({
+      pending: [{ id: 'a1', namespace: 'exec', command: 'ls' }],
+      count: 1,
+    })
+    const calls: string[] = []
+    mockRpcCall.mockImplementation(async (method: string) => {
+      calls.push(method)
+      if (method === 'updates.check') {
+        return { current: '2026.8.11', latest: '2026.9.9', status: 'outdated' }
+      }
+      if (method === 'sessions.list') {
+        return { sessions: [{ key: 'agent:main:1', active_task: { status: 'running' } }] }
+      }
+      if (method === 'cron.list') {
+        return [{ id: 'j1', name: 'Soon', enabled: true, next_run: Date.now() + 60_000 }]
+      }
+      return {}
+    })
+
+    try {
+      renderShellAt('/cron')
+      const banner = await screen.findByTestId('update-banner')
+      fireEvent.click(within(banner).getByRole('button', { name: 'Update now' }))
+      const dialog = await screen.findByRole('alertdialog', { name: /Before updating AgentOS/ })
+      await within(dialog).findByText('1 session is running')
+      expect(within(dialog).getByTestId('preflight-jobs')).toHaveTextContent(
+        '1 scheduled job is due in the next 10 minutes (Soon)',
+      )
+      expect(within(dialog).getByTestId('preflight-approvals')).toHaveTextContent(
+        '1 approval is pending',
+      )
+      const confirm = within(dialog).getByTestId('preflight-confirm')
+      expect(confirm).toBeDisabled()
+      expect(
+        within(dialog).getByText('1 approval is waiting. Answer it before updating.'),
+      ).toBeInTheDocument()
+
+      // Answering the approval unblocks it; running work only warns.
+      act(() => useApprovals.setState({ pending: [], count: 0 }))
+      await waitFor(() => expect(confirm).toBeEnabled())
+      expect(confirm).toHaveTextContent('Update anyway')
+      expect(calls).not.toContain('updates.apply')
+    } finally {
+      useApprovals.setState({ pending: [], count: 0 })
+    }
   })
 
   it('suppresses the update banner if the version was already dismissed', async () => {
@@ -757,6 +867,26 @@ describe('approvals nav badge', () => {
     useApprovals.setState({ pending: [{ id: 'a1' }], count: 1, mode: 'prompt' })
     renderShellAt('/overview')
     expect(screen.getByTestId('approval-badge')).toHaveAttribute('aria-label', '1 pending approval')
+  })
+
+  it('counts everything waiting on the Inbox nav item', () => {
+    useApprovals.setState({ pending: [{ id: 'a1', command: 'ls' }], count: 1, mode: 'prompt' })
+    renderShellAt('/overview')
+    const badge = screen.getByTestId('inbox-badge')
+    expect(badge).toHaveTextContent('1')
+    expect(badge).toHaveAttribute('aria-label', '1 item needs attention')
+    expect(screen.getByRole('link', { name: /inbox/i })).toContainElement(badge)
+  })
+
+  it('keeps the global approval prompt off the inbox, which answers in place', async () => {
+    useApprovals.setState({
+      pending: [{ id: 'a1', namespace: 'exec', command: 'ls' }],
+      count: 1,
+      mode: 'prompt',
+    })
+    renderShellAt('/inbox')
+    expect(await screen.findByRole('heading', { name: 'Attention inbox' })).toBeInTheDocument()
+    expect(screen.queryByRole('alertdialog')).toBeNull()
   })
 })
 
@@ -879,8 +1009,14 @@ describe('navigation shortcuts in AppShell', () => {
     press({ key: 'c', code: 'KeyC' })
     await waitFor(() => expect(router.state.location.pathname).toBe('/chat'))
 
-    // Wait for the composer to autofocus, then blur it so it is not focused
-    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Message' })).toHaveFocus())
+    // Wait for the composer, let focus settle, then blur whatever holds it so
+    // the next chord is not typed into the composer. (The composer's mount
+    // autofocus and navigateTo's deferred focus on <main> race on module
+    // timing; which one wins is not what this test is about.)
+    await screen.findByRole('textbox', { name: 'Message' })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
     act(() => {
       ;(document.activeElement as HTMLElement)?.blur()
     })

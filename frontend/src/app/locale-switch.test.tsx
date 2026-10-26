@@ -18,7 +18,7 @@ registerCatalog('zz', {
     navGroupControl: 'ZZ Control',
     viewOverview: 'ZZ Overview',
     viewHealth: 'ZZ Health',
-    connDisconnected: 'ZZ Offline',
+    truthOffline: 'ZZ Offline',
   },
   overview: {
     documentTitle: 'ZZ Overview - AgentOS Control',
@@ -103,10 +103,10 @@ describe('locale changes after module load', () => {
     expect(groupLabels()).toEqual(['Chat', 'ZZ Control', 'Settings'])
   })
 
-  it('follows the change in the connection pill', async () => {
+  it('follows the change in the truth badge', async () => {
     renderShellAt('/overview')
     const pill = await screen.findByTestId('nav-foot')
-    expect(pill).toHaveTextContent('DISCONNECTED')
+    expect(pill).toHaveTextContent('OFFLINE')
 
     act(() => {
       setLocale('zz')
