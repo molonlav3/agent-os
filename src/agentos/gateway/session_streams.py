@@ -173,22 +173,28 @@ class SessionStreamRegistry:
 
     def __init__(self, *, max_events_per_session: int = 500) -> None:
         self._max_events_per_session = max_events_per_session
-        # Both are session-scoped: a gateway that serves many short sessions
-        # would otherwise keep one counter and one replay buffer per session
-        # for the life of the process.
+        # All session-scoped: a gateway that serves many short sessions would
+        # otherwise keep one counter and one replay buffer per session for the
+        # life of the process. They outlive a session *finishing*, though: a
+        # later turn on it (a follow-up to a child) must continue the same
+        # ``stream_seq``, or a client that saw the first turn drops the second
+        # one's frames as duplicates. They go when the session is deleted.
         self._seq_by_session: BoundedRegistry[str, int] = BoundedRegistry(
             name="SessionStreamRegistry._seq_by_session",
             session_of=lambda key, _value: key,
+            keep_until_deleted=True,
         )
         self._events_by_session: BoundedRegistry[str, deque[BufferedSessionEvent]] = (
             BoundedRegistry(
                 name="SessionStreamRegistry._events_by_session",
                 session_of=lambda key, _value: key,
+                keep_until_deleted=True,
             )
         )
         self._live_runs: BoundedRegistry[str, _LiveRun] = BoundedRegistry(
             name="SessionStreamRegistry._live_runs",
             session_of=lambda key, _value: key,
+            keep_until_deleted=True,
         )
 
     @staticmethod

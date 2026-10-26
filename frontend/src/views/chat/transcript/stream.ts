@@ -133,12 +133,24 @@ export function createSeqGate() {
     return true
   }
 
+  /**
+   * Forget everything seen for a session. For a gateway whose stream for it
+   * started over (a restart, a buffer it no longer holds): its next frames
+   * reuse low `stream_seq` values that are new, not duplicates.
+   */
+  function reset(key: string): void {
+    const canonicalKey = key || ''
+    streamSeqBySession.delete(canonicalKey)
+    streamSeqSeenBySession.delete(canonicalKey)
+  }
+
   return {
     accept,
     /** Seed/synchronize a server-advertised high-water value without marking a replay duplicate. */
     sync: setSessionStreamSeq,
     /** High-water accepted seq for a session (parity `_sessionStreamSeq`). */
     highWater: sessionStreamSeq,
+    reset,
   }
 }
 
@@ -610,6 +622,10 @@ export function createStreamController(
     if (typeof seq !== 'number' || !Number.isFinite(seq)) return true
     const key = sessionKeyFromPayload(payload) || getSessionKey() || ''
     return seqGate.accept(key, seq)
+  }
+
+  function resetStreamSeq(key: string): void {
+    seqGate.reset(key || getSessionKey() || '')
   }
 
   function syncLastStreamSeqFromSession(key: string, currentSeq?: number): number {
@@ -1613,6 +1629,7 @@ export function createStreamController(
     // seq
     acceptStreamSeq,
     syncLastStreamSeqFromSession,
+    resetStreamSeq,
     // idle timer
     resetStreamIdleTimer,
     clearStreamIdleTimer,

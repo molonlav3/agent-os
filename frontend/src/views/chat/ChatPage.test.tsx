@@ -831,6 +831,63 @@ describe('ChatPage', () => {
     expect(reads.historyReads()).toBe(afterLive)
   })
 
+  it('takes new frames after the gateway restarted its stream for the session', async () => {
+    mockRpc = makeRpc()
+    let answer: Record<string, unknown> = {
+      subscribed: true,
+      replay_complete: true,
+      replayed_count: 0,
+      current_stream_seq: 0,
+      run_status: 'idle',
+      in_flight_run: null,
+    }
+    mockRpc.call.mockImplementation((...args: unknown[]) => {
+      if (args[0] === 'commands.list_for_surface') {
+        return Promise.resolve({ surface: 'web_chat', commands: SLASH_CATALOG })
+      }
+      if (args[0] === 'chat.history') {
+        return Promise.resolve({ messages: [], history_scope: 'complete' })
+      }
+      if (args[0] === 'sessions.messages.subscribe') return Promise.resolve(answer)
+      return Promise.resolve({})
+    })
+    renderPage()
+    const key = 'agent:main:webchat:default'
+    await waitFor(() =>
+      expect(mockRpc.call.mock.calls.some(([m]) => m === 'sessions.messages.subscribe')).toBe(true),
+    )
+
+    // A first turn streams and ends live: seqs 1..3 are seen.
+    act(() => {
+      mockRpc.emit('session.event.text_delta', { key, stream_seq: 1, text: 'first turn' }, {})
+      mockRpc.emit('session.event.done', { key, stream_seq: 2, text: 'first turn' }, {})
+      mockRpc.emit('task.succeeded', { key, session_key: key, stream_seq: 3, task_id: 't1' }, {})
+    })
+    // The gateway restarts: its stream for the session starts over at 0.
+    answer = { ...answer, current_stream_seq: 0, replay_complete: false }
+    answer.replay_gap_reason = 'cursor_ahead_of_stream'
+    await act(async () => {
+      mockRpc.emit('_state', 'connected')
+      await Promise.resolve()
+    })
+    await waitFor(() =>
+      expect(
+        mockRpc.call.mock.calls.filter(([m]) => m === 'sessions.messages.subscribe').length,
+      ).toBeGreaterThan(1),
+    )
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+
+    // The next turn reuses seq 1: it is new, and it shows.
+    act(() => {
+      mockRpc.emit('session.event.text_delta', { key, stream_seq: 1, text: 'second turn' }, {})
+    })
+    await waitFor(() =>
+      expect(document.querySelector('.msg.assistant.streaming')).toHaveTextContent('second turn'),
+    )
+  })
+
   it('retries a send lost with the socket under the same idempotency key', async () => {
     mockRpc = makeRpc()
     let sendAttempts = 0

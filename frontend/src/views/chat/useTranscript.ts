@@ -1752,6 +1752,19 @@ export function useTranscript(opts: {
         applySessionRunState(subscribedState)
         seams().applySessionRunState?.(subscribedState)
         const currentSeq = Number(res?.current_stream_seq)
+        const gapReason = String(res?.replay_gap_reason || res?.replayGapReason || '')
+        if (
+          Number.isFinite(currentSeq) &&
+          (currentSeq < sinceStreamSeq ||
+            gapReason === 'stream_buffer_reset' ||
+            gapReason === 'cursor_ahead_of_stream')
+        ) {
+          // The gateway's stream for this session started over (it restarted,
+          // or no longer holds it): its next frames reuse `stream_seq` values
+          // this view has seen, and they are new, not duplicates.
+          diag('session.subscribe.stream_seq_reset', { sinceStreamSeq, currentSeq })
+          controller.resetStreamSeq(sessionKey)
+        }
         if (Number.isFinite(currentSeq)) {
           controller.syncLastStreamSeqFromSession(sessionKey, currentSeq)
         }

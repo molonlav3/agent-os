@@ -32,6 +32,19 @@ describe('stream seq gate (parity chat.js:6345-6378, 1645-1682)', () => {
     expect(gate.accept('s1', 3)).toBe(false) // now seen → reject
   })
 
+  it('forgets a session it is told to reset, and only that session', () => {
+    // A gateway whose stream for a session started over (restart, buffer it no
+    // longer holds) reuses low seqs; after a reset they are new again.
+    const gate = createSeqGate()
+    expect(gate.accept('s1', 1)).toBe(true)
+    expect(gate.accept('s1', 2)).toBe(true)
+    expect(gate.accept('s2', 1)).toBe(true)
+    gate.reset('s1')
+    expect(gate.highWater('s1')).toBe(0)
+    expect(gate.accept('s1', 1)).toBe(true)
+    expect(gate.accept('s2', 1)).toBe(false)
+  })
+
   it('treats non-finite / non-number seqs and empty keys as pass-through (returns true)', () => {
     // chat.js:1668 — a missing key or a non-finite seq is not gated.
     const gate = createSeqGate()

@@ -362,3 +362,40 @@ async def test_child_cancel_reaches_clients_as_cancelled_run_status(tmp_path: Pa
 
     changed = [p for n, p, _ in rig.live.events if n == "sessions.changed" and p["key"] == child]
     assert changed[-1]["run_status"] == "cancelled"
+
+
+async def test_a_finished_session_keeps_its_stream_for_its_next_turn(tmp_path: Path) -> None:
+    """A child row is finished when its run ends; a follow-up turn continues.
+
+    Finishing used to evict the stream counter and replay buffer, so the next
+    turn restarted at ``stream_seq`` 1: a view that saw the first turn dropped
+    the second one's frames as duplicates, and a late subscriber got nothing.
+    """
+    from agentos.session.manager import SessionManager
+    from agentos.session.storage import SessionStorage
+
+    store = SessionStorage(":memory:")
+    await store.connect()
+    try:
+        manager = SessionManager(store, inject_time_prefix=False)
+        key = f"agent:main:subagent:{uuid.uuid4().hex[:8]}"
+        await manager.create(key, agent_id="main")
+        streams = get_session_streams()
+        streams.record(key, "task.running", {"task_id": "t1"})
+        done = streams.record(key, "session.event.done", {"task_id": "t1", "state": "done"})
+
+        await manager.finish(key)
+
+        assert streams.current_seq(key) == done["stream_seq"]
+        assert [e.event_name for e in streams.replay(key, 0).events] == [
+            "task.running",
+            "session.event.done",
+        ]
+        follow_up = streams.record(key, "task.running", {"task_id": "t2"})
+        assert follow_up["stream_seq"] == done["stream_seq"] + 1
+
+        await manager.delete(key)
+        assert streams.current_seq(key) == 0
+    finally:
+        await store.close()
+
