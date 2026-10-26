@@ -94,6 +94,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   otherwise shows the exit code with doctor's top finding and fix. A spawned
   gateway counts as running once `/ready` answers `200` (`/health` on older
   engines), and the gateway status carries `detail` and `exitCode`. (#3682)
+- Gateway: approval prompts are pushed to the operator's consoles the moment
+  they are queued or settled, as `approval.requested` / `approval.resolved`
+  WebSocket events, for every kind of approval (commands, plugins, coding
+  agents, coding-agent questions). The web console and the desktop app show a
+  prompt straight away instead of polling for it (up to 30 s late), and read
+  the list over REST only once per reconnect (#3678).
+- Gateway: `chat.send`, `sessions.send`, `sessions.create`, `cron.add` and the
+  approval resolves accept an `idempotency_key`; a retry with the same key gets
+  the first answer instead of doing the work twice, also after a gateway
+  restart for messages. The web console and desktop app send one with every
+  message and resend it after a dropped connection (#3689).
+- Gateway: `sessions.messages.subscribe` and `chat.history` report the running
+  turn as `in_flight_run` (what it has written so far), or `null` when nothing
+  runs; the web console and desktop app use it to restore or end the live
+  reply when a chat is reopened (#3687).
+- Gateway: `chat.history` takes a `delta_cursor` to fetch only the messages
+  after the ones a client already has, and a new `chat.entry` method returns a
+  message too large to include in a history page (#3696).
+- Gateway: `hello-ok.features.capabilities` also lists `terminal-replay`,
+  `approval-events`, `inflight-snapshot` and `idempotency-keys`.
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up
@@ -125,6 +145,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   TOML (previously a traceback) or does not validate, a schema migration that
   cannot apply, a public bind without auth. Other startup failures still exit
   `1`; other commands keep exit `2` for a bad config. (#3682)
+- Gateway: stopping a chat (Stop, `sessions.abort`, `/abort`) also stops the
+  coding agents and subagents it started, waits until everything has ended,
+  and names the runs it stopped; if a child does not stop in time it says
+  which (`ABORT_INCOMPLETE`) instead of reporting success (#3688).
+- Gateway: assistant text arrives display-ready in history and while it
+  streams: reply directives, "generated artifact omitted" markers and tool-call
+  text a model leaked into its answer are removed by the gateway, so Telegram,
+  Discord and Slack replies are cleaned the same way as the web console (#3696).
+- Gateway: a `chat.history` page stays under 6 MiB; a message over 128 KiB
+  comes back as a short placeholder instead of one huge frame (#3696).
 
 ### Fixed
 - Gateway: SIGTERM — what `agentos gateway stop`, the desktop app, launchd
@@ -160,6 +190,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   while the gateway was down wait `[scheduler] startup_agent_delay_seconds`
   (default 120) after boot instead of competing with channel start-up; the
   catch-up cap (5) and the 10 s stagger are unchanged. (#3683)
+- A run now always ends with exactly one `done` / `error` event, including
+  after a cancel or a crash, and the run's end is replayed to a client that
+  reconnects late. A coding-agent child stopped together with its parent no
+  longer stays "Working" (#3677).
+- A turn cancelled right after it was queued no longer leaves its task (and
+  anything waiting on it) hanging.
 
 ### Security
 - Gateway: wrong tokens are rate limited per client address across HTTP and

@@ -126,10 +126,26 @@ event, exit code `78`) is in [`gateway.md`](gateway.md#supervisor-contract).
 
 `GET /api/approvals` serializes every pending command and its arguments, so it
 is rate limited per client IP like the rest of `/api/*` — just in its own
-bucket, because the Web UI polls it every 1.5s. The cap is
+bucket, because consoles read it on every reconnect, window focus and resolve
+(older consoles still poll it every 1.5s). The cap is
 `AGENTOS_RATE_APPROVALS_MAX_REQUESTS` (default 300 per
 `AGENTOS_RATE_WINDOW_SECONDS`, i.e. 300/min), which clears several open tabs.
 Raise it only if you run more consoles than that against one gateway.
+
+Queue changes are also pushed over the WebSocket to the operator's Control
+connections (never to channel, node or agent-held connections), for every
+namespace (`exec`, `plugin`, `acp`, `acp_elicitation`):
+
+- `approval.requested` — `{id, namespace, session_key, created_at, expires_at,
+  summary, tool, command, approval}` (fields that do not apply are omitted;
+  `approval` is the item exactly as `GET /api/approvals` lists it).
+- `approval.resolved` — `{id, namespace, decision, resolved_by, resolved_at}`,
+  `decision` being `approved`, `denied` or `expired`; `resolved_by` is
+  `operator`, `policy`, `session_elevation`, `timeout` or `system`.
+
+A row an `auto-approve` / `auto-deny` policy settles in the same call that
+queued it is not announced at all. Use the REST list once per (re)connect to
+catch up on what happened while the socket was down.
 
 ## Files and Media
 
@@ -272,6 +288,51 @@ accepts a `projectId` filter and emits `project_id`/`projectId` on every row.
 mints that key client-side and only sends it on the first message; every other
 key shape still fails with `NOT_FOUND`.
 Project CRUD broadcasts a `projects.changed` event to connected clients.
+
+### Run lifecycle
+
+`hello-ok.features.capabilities` names the behaviours below; check for a name
+before relying on it.
+
+- **`terminal-replay`** — every run ends with exactly one
+  `session.event.done` or `session.event.error`, whichever path ends it (a
+  normal end, a cancel, a crash, `sessions.abort`). The frame carries `state`
+  (`done`, `error` or `aborted`) and `task_id`; an aborted one also carries
+  `partial_text`. It is published after the task's terminal status is stored,
+  before `task.<status>`. `task.*` and `sessions.changed` frames are kept in
+  the session's replay buffer with a `stream_seq`, so
+  `sessions.messages.subscribe {key, since_stream_seq}` replays them (with
+  `meta.replayed: true`) to a client that reconnects late. Coding-agent and
+  subagent child sessions get `sessions.changed` with their `run_status` too.
+- **`inflight-snapshot`** — `sessions.messages.subscribe` and `chat.history`
+  (unless paging with `before`) return `in_flight_run`: `null` when nothing
+  runs (drop any live view), or `{run_id, task_id, status, started_at,
+  through_stream_seq, text, text_truncated?, plan?, events?}` for the running
+  turn. It is capped at 256 KiB, filled in that order of priority; text is cut
+  from the front. `through_stream_seq` is the stream position it covers.
+- **`idempotency-keys`** — `chat.send`, `sessions.send`, `sessions.create`,
+  `cron.add`, `exec.approval.resolve` and `plugin.approval.resolve` accept an
+  optional `idempotency_key`. The same key within five minutes returns the first
+  answer; the same key with a different request fails with `INVALID_REQUEST`
+  and `details.code: "REQUEST_CONFLICT"`. A `chat.send` / `sessions.send` key
+  is also stored on the turn's task, so a retry after a gateway restart finds
+  the turn instead of starting another.
+
+`sessions.abort` stops the session's run and every child run it spawned
+(coding-agent and subagent sessions, any depth), waits up to 10 s for them to
+end, and answers `{aborted: [<run ids>], children_aborted: [<session keys>],
+key}`. If some are still running after that, it fails with `UNAVAILABLE` and
+`details: {code: "ABORT_INCOMPLETE", still_running: [...]}`.
+
+`chat.history` answers stay under 6 MiB. A message over 128 KiB arrives as a
+placeholder (`placeholder: true`, `byte_size`, `entry_id`, the tool calls'
+identity, a short text preview); `chat.entry {sessionKey, entryId}` returns the
+full row. `delta_cursor` (a `newest_cursor` from an earlier answer) returns only
+the rows after it (`kind: "delta"`, at most 200 rows / 1 MiB, `has_more` when
+there are more), or `kind: "reset"` with the latest page when the cursor no
+longer names a row. Assistant text, in history and in `text_delta` frames, is
+display-ready: reply directives, generated-artifact markers and leaked
+tool-protocol text are removed by the gateway.
 
 ### Environment variables (`env.*`)
 
