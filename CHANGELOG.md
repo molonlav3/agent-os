@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Gateway: `POST /api/v1/rpc` calls one RPC method over plain HTTP behind the
+  normal bearer auth: `{id?, method, params?}` in, `{id, ok, payload | error}`
+  out, with the HTTP status taken from the error's category. Only an
+  allowlist of reads and non-destructive methods is reachable; config writes,
+  secrets, env, trading, restarts and deletes answer `403 FORBIDDEN`.
 - Gateway: `hello-ok.features.capabilities` lists additive features a client
   can gate on (`typed-errors`, `challenge-ts`, `auth-rate-limit`, `rpc-http`).
 - Gateway: a closed set of top-level error codes (`INVALID_REQUEST`,

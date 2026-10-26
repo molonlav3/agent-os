@@ -325,6 +325,17 @@ def create_gateway_app(
             memory_retrievers=memory_retrievers or {},
         )
 
+    async def api_rpc(request: Request) -> JSONResponse:
+        """POST /api/v1/rpc — allowlisted RPC over HTTP (``gateway.http_rpc``)."""
+        from agentos.gateway.http_rpc import handle_http_rpc
+
+        return await handle_http_rpc(
+            request,
+            dispatcher=dispatcher,
+            make_ctx=_make_ctx,
+            status_for=_rpc_status_code,
+        )
+
     async def api_channels_status(request: Request) -> JSONResponse:
         ctx = _make_ctx(request)
         result = await dispatcher.dispatch("_http", "channels.status", None, ctx)
@@ -600,6 +611,7 @@ def create_gateway_app(
         Route("/api/approvals/settings", api_approvals_settings, methods=["POST"]),
         Route("/api/approvals/resolve", api_approvals_resolve, methods=["POST"]),
         Route("/api/elevated-mode", api_elevated_mode, methods=["POST"]),
+        Route("/api/v1/rpc", api_rpc, methods=["POST"]),
         WebSocketRoute("/ws", ws_endpoint),
     ]
 

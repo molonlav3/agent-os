@@ -97,6 +97,7 @@ These require no auth and are safe for load balancers and container probes.
 | `GET` | `/api/cron` | List scheduled jobs. |
 | `GET` | `/api/usage` | Token usage and cost breakdown. |
 | `GET` | `/metrics` | Prometheus metrics exposition (`observability.metrics_path`). |
+| `POST` | `/api/v1/rpc` | Call an allowlisted RPC method: `{id?, method, params?}` → `{id, ok, payload \| error}`. See [RPC over HTTP](#rpc-over-http). |
 
 ## Channels
 
@@ -129,6 +130,46 @@ Raise it only if you run more consoles than that against one gateway.
 | `GET` | `/api/v1/attachments/{sha256}` | Fetch an attachment by content hash. |
 | `GET` | `/api/v1/artifacts/{artifact_id}` | Fetch a generated artifact. |
 | `POST` | `/api/audio/transcribe` | Transcribe audio to text. |
+
+## RPC over HTTP
+
+`POST /api/v1/rpc` calls one gateway RPC method without a WebSocket, behind the
+same bearer auth, origin guard and rate limits as the other `/api/*` routes:
+
+```sh
+curl -X POST -H "Authorization: Bearer $AGENTOS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"id": "1", "method": "sessions.list", "params": {"limit": 5}}' \
+  http://127.0.0.1:18791/api/v1/rpc
+```
+
+The body is `{id?, method, params?}` (`id` a string or integer, echoed back;
+`params` an object). The answer is the WebSocket `res` frame without its
+`type`: `{"id", "ok": true, "payload"}` with `200`, or `{"id", "ok": false,
+"error": {code, message, details, retryable, retry_after_ms}}` with a status
+from the error's category:
+
+| Category | Status |
+| --- | --- |
+| `INVALID_REQUEST` | `400` |
+| `UNAUTHORIZED`, `FORBIDDEN` | `403` |
+| `NOT_FOUND`, `METHOD_NOT_FOUND` | `404` |
+| `RATE_LIMITED` | `429` |
+| `UNAVAILABLE` | `503` |
+| `INTERNAL_ERROR` and anything else | `500` |
+
+Only an allowlist is reachable: reads (`health`, `status`, `config.get`,
+`sessions.list`/`get`/`preview`/`resolve`, `chat.history`, `models.list`,
+`usage.*`, `agents.list`, `projects.list`/`get`, `skills.list`, `cron.list`,
+`channels.status`, `doctor.status`, `acp.*` status, ...) and mutations that
+create or send but never destroy (`chat.send`, `sessions.send`,
+`sessions.create`, `sessions.rename`, `projects.create`/`update`, `*.abort`,
+`plan.mode.set`). Configuration writes, secrets and environment variables,
+trading and wallets, restarts, deletes and approval decisions stay on the
+WebSocket. Any other method answers `403` with `error.code = "FORBIDDEN"` and
+`details.code = "METHOD_NOT_ALLOWED_OVER_HTTP"`. The full list is
+`HTTP_RPC_METHODS` in
+[`src/agentos/gateway/http_rpc.py`](../src/agentos/gateway/http_rpc.py).
 
 ## Streaming (WebSocket)
 
@@ -197,9 +238,10 @@ reading, periodic refreshes (`tick`, `presence`, `health`) are dropped and
 their `seq` still consumed, so the client sees a gap and resynchronizes;
 anything else closes the socket with `1008` `slow consumer`.
 
-Projects (session groups with shared knowledge) are WebSocket-only:
-`projects.create` / `projects.list` / `projects.get` / `projects.update` /
-`projects.delete` (params use `projectId`, `agentId`, `name`, `knowledge`;
+Projects (session groups with shared knowledge) have no REST route of their
+own: `projects.create` / `projects.list` / `projects.get` / `projects.update`
+are RPC methods (WebSocket, or `POST /api/v1/rpc`), `projects.delete` is
+WebSocket-only (params use `projectId`, `agentId`, `name`, `knowledge`;
 delete responds with `sessionsCleared` — sessions are detached, not deleted).
 `projects.update` writes only the fields you pass and accepts an optional
 `expectedUpdatedAt` (the `updatedAt` you last read): when the row changed in

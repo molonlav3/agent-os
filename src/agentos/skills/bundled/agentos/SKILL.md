@@ -695,8 +695,11 @@ agentos migrate hermes --source <dir> [--profile <name>] [--preset full] [--appl
 The gateway is also a REST + WebSocket server on port 18791:
 `GET /api/config|sessions|agents|cron|usage|system/status|channels/status`,
 `POST /api/chat`, `GET /api/chat/history`, approvals endpoints under
-`/api/approvals*`, and `WS /ws` (primary RPC transport; `projects.*` CRUD
-lives there alongside `sessions.*`). On loopback binds
+`/api/approvals*`, `POST /api/v1/rpc` (`{id?, method, params?}` → `{id, ok,
+payload|error}` for an allowlist of read and non-destructive methods; config
+writes, secrets, env, trading, restarts and deletes answer 403 `FORBIDDEN`),
+and `WS /ws` (primary RPC transport; `projects.*` CRUD lives there alongside
+`sessions.*`). On loopback binds
 auth is optional; on public binds the `[auth]` token gates every request.
 Full reference: `docs/http-api.md` (https://useagentos.dev/docs/http-api).
 
