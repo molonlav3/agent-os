@@ -16,7 +16,6 @@ import {
 } from '@/lib/runtime-issues'
 import { useRuntimeSignals } from '@/lib/runtime-signals'
 import { useAttentionInbox } from '@/lib/useAttentionInbox'
-import { useRuntimeTruth } from '@/lib/useRuntimeTruth'
 import { approvalMonitor, useApprovals, type ApprovalAction } from '@/services/approval-monitor'
 import { useConnection } from '@/stores/connection'
 import { sessionPath } from '~/components/sidebar/SessionRow'
@@ -158,11 +157,11 @@ function AttentionPopover({ id, onClose }: { id: string; onClose: () => void }) 
 }
 
 /**
- * Empty only means "nothing waits" while the view is live. Its own component:
- * the truth hook ages every second and only this needs to follow it.
+ * Empty only means "nothing waits" while the view is live: connected now (the
+ * client drops a silent socket within 2.5 tick intervals). No clock needed.
  */
 function EmptyPanel() {
-  const live = useRuntimeTruth(useRuntimeHost()).source === 'live'
+  const live = useConnection((s) => s.state === 'connected')
   return (
     <div className="attn__empty">
       <span className="attn__empty-title">

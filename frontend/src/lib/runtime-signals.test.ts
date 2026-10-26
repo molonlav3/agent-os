@@ -232,6 +232,24 @@ describe('bindRuntimeSignals', () => {
     off()
   })
 
+  it('forces a new socket from Retry only when the connected one has gone silent', () => {
+    const rpc = new FakeRpc()
+    const off = bindRuntimeSignals(rpc, { now, fetchReady: null })
+    rpc.connect({ protocol: 3, policy: { tick_interval_ms: 30_000 } })
+    clock += 10_000
+    useRuntimeSignals.getState().retry()
+    expect(rpc.reconnect).toHaveBeenLastCalledWith({ force: false })
+    // 2.5 tick intervals without a frame: stale.
+    clock += 70_000
+    useRuntimeSignals.getState().retry()
+    expect(rpc.reconnect).toHaveBeenLastCalledWith({ force: true })
+    // Not connected: a plain reconnect.
+    rpc.state = 'disconnected'
+    useRuntimeSignals.getState().retry()
+    expect(rpc.reconnect).toHaveBeenLastCalledWith({ force: false })
+    off()
+  })
+
   it('wires retry to reconnect and unwires on dispose', () => {
     const rpc = new FakeRpc()
     const off = bindRuntimeSignals(rpc, { now, fetchReady: null })

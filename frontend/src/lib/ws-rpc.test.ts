@@ -264,14 +264,22 @@ describe('keepalive and reconnect', () => {
     expect(FakeWebSocket.instances.length).toBe(count + 1)
   })
 
-  it('closes the socket when no frame arrives within the tick timeout', () => {
+  it('drops the socket when no frame arrives within the tick timeout', () => {
     const { client, ws } = newClient()
     handshake(ws) // tick_interval_ms 30000 -> timeout 75s, checked every 10s
     const gap = vi.fn()
     client.on('_gap', gap)
-    // Idle exceeds the 75s timeout at the next 10s check tick (80s), so advance past it.
-    vi.advanceTimersByTime(81_000)
+    // A silent peer never completes the close handshake: the client must not
+    // wait for it before calling the connection lost.
+    ws.close = () => {}
+    const count = FakeWebSocket.instances.length
+    // Idle exceeds the 75s timeout at the next 10s check tick (80s).
+    vi.advanceTimersByTime(80_000)
     expect(gap).toHaveBeenCalledWith(expect.objectContaining({ reason: 'tick_timeout' }))
+    expect(client.state).toBe('disconnected')
+    expect(FakeWebSocket.instances.length).toBe(count)
+    vi.advanceTimersByTime(800)
+    expect(FakeWebSocket.instances.length).toBe(count + 1)
   })
 })
 
@@ -443,9 +451,32 @@ describe('handshake refusal and manual retry', () => {
     const live = FakeWebSocket.instances.length
     client.reconnect()
     expect(FakeWebSocket.instances.length).toBe(live)
+    expect(client.state).toBe('connected')
     ws.close()
     client.reconnect()
     expect(FakeWebSocket.instances.length).toBe(live + 1)
+  })
+
+  it('reconnect({force: true}) drops a silent "connected" socket and opens a new one', async () => {
+    const { client, ws } = newClient()
+    handshake(ws)
+    const states: unknown[] = []
+    client.on('_state', (s) => states.push(s))
+    const inflight = client.call('a.b')
+    // The old socket never answers its close handshake (a frozen peer).
+    ws.close = () => {}
+    const count = FakeWebSocket.instances.length
+    client.reconnect({ force: true })
+    await expect(inflight).rejects.toThrow('Connection closed')
+    expect(FakeWebSocket.instances.length).toBe(count + 1)
+    // It cycles through "disconnected", so subscribers resubscribe on connect.
+    expect(states).toEqual(['disconnected', 'connecting'])
+    const next = FakeWebSocket.instances.at(-1)!
+    next.serverOpen()
+    handshake(next)
+    expect(client.state).toBe('connected')
+    // A late frame on the abandoned socket is ignored.
+    expect(ws.onmessage).toBeNull()
   })
 
   it('a socket that drops mid-handshake still schedules the reconnect', () => {

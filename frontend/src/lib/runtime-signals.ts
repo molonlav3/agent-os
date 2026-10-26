@@ -4,12 +4,14 @@
  *
  * One store per app. `bindRuntimeSignals(rpc)` feeds it from the
  * connection's own frames (the hello, every event frame, the `tick`
- * revision, `state_version` revisions, a refused handshake) and from two
- * reads: `doctor.status` (shallow) and `GET /ready`. Both reads run on
- * (re)connect, when the gateway says health moved (`health` event or a
- * `state_version.health` bump) and every few ticks. Nothing here runs on an
- * interval timer of its own: when the gateway stops ticking, the signals stop
- * moving, which is exactly what the freshness readout has to show.
+ * revision, a refused handshake) and from two reads: `doctor.status`
+ * (shallow) and `GET /ready`. Both reads run on (re)connect and every few
+ * ticks; that is what keeps them current with today's gateway. A `health`
+ * event or a `state_version.health` bump triggers an extra read, but the
+ * gateway does not send either yet, so nothing depends on them. Nothing here
+ * runs on an interval timer of its own: when the gateway stops ticking, the
+ * signals stop moving, which is exactly what the freshness readout has to
+ * show.
  *
  * The connection state itself stays in `useConnection` (both the web
  * providers and the desktop's mirror the client's `_state` into it); this
@@ -32,6 +34,12 @@ export const DEFAULT_TICK_MS = 30_000
 
 /** Re-read doctor.status / ready every Nth tick (4 x 30 s = 2 min by default). */
 export const DOCTOR_EVERY_TICKS = 4
+
+/** A connected view with no frame for this long is a snapshot, not live. */
+export function staleAfterMs(tickIntervalMs: number): number {
+  const tick = tickIntervalMs > 0 ? tickIntervalMs : DEFAULT_TICK_MS
+  return Math.max(10_000, tick * 2.5)
+}
 
 /** A frame-age update is recorded at most this often (streams are chatty). */
 const FRAME_THROTTLE_MS = 1_000
@@ -106,7 +114,10 @@ export interface RuntimeSignalsState {
   updateFailure: { detail: string; at: number } | null
   /** Re-read doctor.status and /ready now. A no-op until a binder is attached. */
   refresh(): void
-  /** Reconnect now (skips backoff). A no-op until a binder is attached. */
+  /**
+   * Reconnect now (skips backoff); forces a new socket when the connected one
+   * has gone silent. A no-op until a binder is attached.
+   */
   retry(): void
   noteUpdateFailure(detail: string | null): void
   reset(): void
@@ -204,7 +215,7 @@ export interface SignalsRpc {
   readonly state: RpcState
   on(event: string, handler: (...args: unknown[]) => void): () => void
   call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>
-  reconnect(): void
+  reconnect(options?: { force?: boolean }): void
 }
 
 export interface BindRuntimeSignalsOptions {
@@ -350,7 +361,17 @@ export function bindRuntimeSignals(
     }),
   ]
 
-  store.setState({ refresh, retry: () => rpc.reconnect() })
+  // Retry reconnects at once. A socket that still reads "connected" but has
+  // gone silent (the stale state the badge reports) is dropped and reopened;
+  // a healthy one is left alone.
+  const retry = (): void => {
+    const s = store.getState()
+    const stale =
+      rpc.state === 'connected' &&
+      (s.lastFrameAt === null || now() - s.lastFrameAt > staleAfterMs(s.tickIntervalMs))
+    rpc.reconnect({ force: stale })
+  }
+  store.setState({ refresh, retry })
   // Bound to an already-open client (a remount): read once now.
   if (rpc.state === 'connected') {
     store.setState({ everConnected: true, lastFrameAt: now() })

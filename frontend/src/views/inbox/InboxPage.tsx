@@ -17,23 +17,28 @@ import { Button } from '@/components/ui/button'
 import { useRpc } from '@/app/providers'
 // Registers this view's copy; it ships in this chunk, not the entry bundle.
 import '@/i18n/en/inbox'
-import { t, tPlural } from '@/i18n'
+import { getLocale, t, tPlural } from '@/i18n'
 import { composeAskAnswer, type AskQuestion } from '@/lib/ask-questions'
 import type { AttentionItem, AttentionMember } from '@/lib/attention-inbox'
 import { gate, requireConnection, type Gate } from '@/lib/disabled-reason'
 import { usePendingQuestions } from '@/lib/pending-questions'
 import { useDismissedIssues, type IssueAction, type RuntimeIssue } from '@/lib/runtime-issues'
 import { useRuntimeSignals } from '@/lib/runtime-signals'
-import { formatAge, truthFreshnessLabel } from '@/lib/runtime-truth'
 import { useAttentionInbox } from '@/lib/useAttentionInbox'
-import { useClock, useRuntimeTruth } from '@/lib/useRuntimeTruth'
 import { approvalMonitor, useApprovals, type ApprovalAction } from '@/services/approval-monitor'
 import { useConnection } from '@/stores/connection'
 import { chatPath, webSettingsPath } from './logic'
 
-function Age({ at, now }: { at: number | null; now: number }) {
+/**
+ * When an item started waiting, as a wall-clock time ("since 11:32"): it
+ * needs no clock to stay true, so the inbox runs no timer of its own.
+ */
+function Age({ at }: { at: number | null }) {
   if (at === null) return null
-  return <span className="inbox-age t-data">{t('inbox.age', { age: formatAge(now - at) })}</span>
+  const time = new Intl.DateTimeFormat(getLocale(), { hour: '2-digit', minute: '2-digit' }).format(
+    new Date(at),
+  )
+  return <span className="inbox-age t-data">{t('inbox.since', { time })}</span>
 }
 
 function SessionLink({ sessionKey }: { sessionKey: string | null }) {
@@ -55,12 +60,10 @@ function ItemHead({
   item,
   icon,
   kindLabel,
-  now,
 }: {
   item: AttentionItem
   icon: ReactNode
   kindLabel: string
-  now: number
 }) {
   return (
     <header className="inbox-item__head">
@@ -77,13 +80,13 @@ function ItemHead({
             {tPlural('inbox.seenInSessions', item.sessions.length)}
           </span>
         ) : null}
-        <Age at={item.createdAt} now={now} />
+        <Age at={item.createdAt} />
       </div>
     </header>
   )
 }
 
-function ApprovalItem({ item, answer, now }: { item: AttentionItem; answer: Gate; now: number }) {
+function ApprovalItem({ item, answer }: { item: AttentionItem; answer: Gate }) {
   const navigate = useNavigate()
   const [busy, setBusy] = useState<string | null>(null)
   const namespace = item.approval?.namespace || 'exec'
@@ -111,7 +114,6 @@ function ApprovalItem({ item, answer, now }: { item: AttentionItem; answer: Gate
         item={item}
         icon={<ShieldAlertIcon />}
         kindLabel={`${t('inbox.kindApproval')} · ${namespace}`}
-        now={now}
       />
       {item.detail ? <CommandLine command={item.detail} toastIdPrefix="inbox-copy" /> : null}
       <ul className="inbox-members">
@@ -156,7 +158,7 @@ function ApprovalItem({ item, answer, now }: { item: AttentionItem; answer: Gate
   )
 }
 
-function QuestionItem({ item, answer, now }: { item: AttentionItem; answer: Gate; now: number }) {
+function QuestionItem({ item, answer }: { item: AttentionItem; answer: Gate }) {
   const rpc = useRpc()
   const questions: AskQuestion[] = item.questions ?? []
   const [selections, setSelections] = useState<string[][]>(() => questions.map(() => []))
@@ -206,7 +208,6 @@ function QuestionItem({ item, answer, now }: { item: AttentionItem; answer: Gate
         item={item}
         icon={<MessageCircleQuestionIcon />}
         kindLabel={t('inbox.kindQuestion')}
-        now={now}
       />
       {questions.map((q, qIndex) => (
         <fieldset
@@ -378,16 +379,31 @@ function IssueItem({ item, issue }: { item: AttentionItem; issue: RuntimeIssue }
 }
 
 /**
- * The freshness readout ages every second; it lives in its own component so
- * the clock re-renders this tile, not the whole list.
+ * Whether the list is live: connected now (a silent socket is dropped by the
+ * client within 2.5 tick intervals, so connected means frames arrive). The
+ * age of the last frame is the status bar's job; the inbox shows the source
+ * only, and so needs no clock.
  */
+function useInboxSource(): 'live' | 'snapshot' | 'unavailable' {
+  const rpcState = useConnection((s) => s.state)
+  const everConnected = useRuntimeSignals((s) => s.everConnected)
+  if (rpcState === 'connected') return 'live'
+  return everConnected ? 'snapshot' : 'unavailable'
+}
+
 function SourceStat() {
-  const truth = useRuntimeTruth()
+  const source = useInboxSource()
+  const label =
+    source === 'live'
+      ? t('inbox.sourceLive')
+      : source === 'snapshot'
+        ? t('inbox.sourceSnapshot')
+        : t('inbox.sourceUnavailable')
   return (
     <div className="inbox-stat">
       <span className="t-label">{t('inbox.statSource')}</span>
-      <strong className="t-data" data-source={truth.source}>
-        {truthFreshnessLabel(truth)}
+      <strong className="t-data" data-source={source} title={t('inbox.sourceTitle')}>
+        {label}
       </strong>
     </div>
   )
@@ -395,7 +411,7 @@ function SourceStat() {
 
 /** An empty list only means "nothing waits" while the view is live. */
 function EmptyInbox() {
-  const live = useRuntimeTruth().source === 'live'
+  const live = useInboxSource() === 'live'
   return (
     <section className="inbox-empty" data-live={live ? 'true' : 'false'}>
       <div className="inbox-empty__signal" aria-hidden="true">
@@ -417,7 +433,6 @@ export function InboxPage() {
   const refresh = useRuntimeSignals((s) => s.refresh)
   const dismissed = useDismissedIssues((s) => s.ids)
   const restoreAll = useDismissedIssues((s) => s.restoreAll)
-  const now = useClock(15_000)
   const [rechecking, setRechecking] = useState(false)
   const answer = gate(requireConnection(rpcState))
 
@@ -496,9 +511,9 @@ export function InboxPage() {
         <section className="inbox-list" aria-label={t('inbox.listLandmark')}>
           {items.map((item) =>
             item.kind === 'approval' ? (
-              <ApprovalItem key={item.id} item={item} answer={answer} now={now} />
+              <ApprovalItem key={item.id} item={item} answer={answer} />
             ) : item.kind === 'question' ? (
-              <QuestionItem key={item.id} item={item} answer={answer} now={now} />
+              <QuestionItem key={item.id} item={item} answer={answer} />
             ) : item.issue ? (
               <IssueItem key={item.id} item={item} issue={item.issue} />
             ) : null,

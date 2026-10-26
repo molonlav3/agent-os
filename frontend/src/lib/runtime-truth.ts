@@ -18,9 +18,9 @@
 import { t, tPlural } from '@/i18n'
 import type { RpcState } from '@/lib/ws-rpc'
 import {
-  DEFAULT_TICK_MS,
   doctorErrorCount,
   EXPECTED_PROTOCOL,
+  staleAfterMs,
   type RuntimeSignalsState,
 } from '@/lib/runtime-signals'
 
@@ -92,11 +92,7 @@ export interface RuntimeTruth {
   detail: string | null
 }
 
-/** A connected view with no frame for this long is a snapshot, not live. */
-export function staleAfterMs(tickIntervalMs: number): number {
-  const tick = tickIntervalMs > 0 ? tickIntervalMs : DEFAULT_TICK_MS
-  return Math.max(10_000, tick * 2.5)
-}
+export { staleAfterMs }
 
 export function deriveRuntimeTruth(input: TruthInput, now: number): RuntimeTruth {
   const { rpcState, signals, attentionCount, host } = input

@@ -4,9 +4,13 @@
  * and memoises the merged list. Shared by the web inbox view, the web nav
  * badge, the truth badge and the desktop's attention panel.
  *
- * Everything it reads is pushed by the gateway's own frames (approval
- * monitor, question frames, doctor refresh on the tick revision); the hook
- * adds no timer.
+ * Each input is a store, and the list is recomputed when one changes:
+ * approvals are sourced from the approvals store (`useApprovals`) and refresh
+ * when that store changes, however the approval service fills it; questions
+ * from the question frames this connection receives; runtime issues from the
+ * doctor report the runtime signals re-read on connect and every few ticks.
+ * The hook adds no timer and does not depend on `state_version` revisions,
+ * which today's gateway does not stamp on its frames.
  */
 import { useMemo } from 'react'
 import { useShallow } from 'zustand/react/shallow'

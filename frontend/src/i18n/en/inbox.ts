@@ -14,6 +14,10 @@ export const inbox = defineNamespace('inbox', {
   statQuestions: 'Questions',
   statIssues: 'Runtime issues',
   statSource: 'Source',
+  sourceLive: 'Live',
+  sourceSnapshot: 'Snapshot (offline)',
+  sourceUnavailable: 'Unavailable',
+  sourceTitle: 'The status bar at the bottom of the sidebar shows how fresh it is',
   listLandmark: 'Items that need your attention',
   emptyTitle: 'Nothing needs you',
   emptyText: 'Approvals, agent questions and runtime issues land here as they happen.',
@@ -49,5 +53,5 @@ export const inbox = defineNamespace('inbox', {
   dismissedNote_one: '{count} issue dismissed for this session.',
   dismissedNote_other: '{count} issues dismissed for this session.',
   restoreDismissed: 'Show them again',
-  age: '{age} ago',
+  since: 'since {time}',
 } as const)
