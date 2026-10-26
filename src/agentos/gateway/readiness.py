@@ -63,6 +63,20 @@ def drain_budget_ms() -> int:
     return int((SAFE_DRAIN_TIMEOUT_S + FORCE_DRAIN_TIMEOUT_S) * 1000)
 
 
+def stop_budget_ms() -> int:
+    """Worst case from SIGTERM to exit: the drain plus the bounded teardown.
+
+    :func:`drain_budget_ms`, then the WebSocket closing handshakes
+    (``WS_CLOSE_TIMEOUT_S``) and uvicorn's own stop (``UVICORN_STOP_TIMEOUT_S``),
+    each bounded in :meth:`GatewayServer.close`. A service manager that kills
+    sooner cuts a legitimate shutdown short; ``agentos gateway install`` sizes
+    launchd's ``ExitTimeOut`` and systemd's ``TimeoutStopSec`` from this.
+    """
+    from agentos.gateway.boot import UVICORN_STOP_TIMEOUT_S, WS_CLOSE_TIMEOUT_S
+
+    return drain_budget_ms() + int((WS_CLOSE_TIMEOUT_S + UVICORN_STOP_TIMEOUT_S) * 1000)
+
+
 class GatewayReadiness:
     """Readiness of one gateway process, from boot to the last frame.
 
@@ -301,6 +315,7 @@ __all__ = [
     "GatewayReadiness",
     "GatewayState",
     "drain_budget_ms",
+    "stop_budget_ms",
     "get_gateway_readiness",
     "readiness_from_scope",
     "readiness_payload",

@@ -88,7 +88,9 @@ other failures. See [Supervisor contract](gateway.md#supervisor-contract).
 `agentos gateway install [--port N] [--config PATH] [--no-start] [--json]`
 runs the gateway as a user service that restarts it when it dies: a
 LaunchAgent (`dev.useagentos.gateway`) on macOS, a systemd user unit
-(`agentos-gateway.service`) on Linux; not supported on Windows (exit 1). It
+(`agentos-gateway.service`) on Linux; not supported on Windows (exit 1). Both
+units allow a stop 54 s (`ExitTimeOut` / `TimeoutStopSec`): the gateway's
+worst-case drain and teardown plus a 10 s margin. It
 refuses when a different unit with the same name exists (run
 `agentos gateway uninstall` first) and is a no-op for the same unit.
 `--no-start` writes the unit without loading it. `agentos gateway uninstall

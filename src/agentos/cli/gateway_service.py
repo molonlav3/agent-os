@@ -6,10 +6,11 @@ Windows is not supported. Both run the absolute ``agentos`` executable with
 ``gateway run --port N`` and restart it when it dies:
 
 * launchd: ``KeepAlive`` + ``ThrottleInterval 10`` (at most one respawn per
-  10 s), ``ExitTimeOut`` = drain budget + margin so a stop can drain turns;
+  10 s), ``ExitTimeOut`` = the worst-case stop + a margin, so a stop can
+  drain turns and tear down before it is killed;
 * systemd: ``Restart=always``, ``RestartSec=5``, ``RestartPreventExitStatus=78``
   (EX_CONFIG: a broken config is not restarted into a loop), ``KillMode=mixed``
-  and ``TimeoutStopSec`` = the same budget.
+  and ``TimeoutStopSec`` = the same timeout.
 
 The gateway's crash-loop breaker (safe mode) is what keeps keep-alive from
 becoming a restart storm when a channel crashes it at boot.
@@ -33,7 +34,7 @@ from typing import Any, Literal
 
 LAUNCHD_LABEL = "dev.useagentos.gateway"
 SYSTEMD_UNIT = "agentos-gateway.service"
-#: Seconds on top of the drain budget before the service manager kills.
+#: Seconds on top of the worst-case stop before the service manager kills.
 STOP_MARGIN_S = 10
 #: Seconds between two respawns (launchd ``ThrottleInterval``).
 LAUNCHD_THROTTLE_S = 10
@@ -127,9 +128,17 @@ def service_path_env(home: Path, inherited: str | None = None) -> str:
 
 
 def stop_timeout_s() -> int:
-    from agentos.gateway.readiness import drain_budget_ms
+    """launchd ``ExitTimeOut`` / systemd ``TimeoutStopSec``, in whole seconds.
 
-    return int(drain_budget_ms() / 1000) + STOP_MARGIN_S
+    The gateway's own worst-case stop (drain 30 s + forced unwind 2 s +
+    socket close 2 s + uvicorn stop 10 s, from the constants that bound
+    them) plus :data:`STOP_MARGIN_S`: 54 s today.
+    """
+    import math
+
+    from agentos.gateway.readiness import stop_budget_ms
+
+    return math.ceil(stop_budget_ms() / 1000) + STOP_MARGIN_S
 
 
 @dataclass(frozen=True)

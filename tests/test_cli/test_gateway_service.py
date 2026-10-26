@@ -75,8 +75,8 @@ def test_launchd_plist_carries_the_keep_alive_contract(tmp_path: Path) -> None:
     assert plist["KeepAlive"] is True
     assert plist["RunAtLoad"] is True
     assert plist["ThrottleInterval"] == 10
-    # drain budget (30 s safe + 2 s force) + 10 s margin
-    assert plist["ExitTimeOut"] == 42 == gs.stop_timeout_s()
+    # drain (30 s safe + 2 s force) + socket close 2 s + uvicorn stop 10 s + 10 s margin
+    assert plist["ExitTimeOut"] == 54 == gs.stop_timeout_s()
     logs = tmp_path / "Library" / "Logs" / "AgentOS"
     assert plist["StandardOutPath"] == str(logs / "gateway-service.log")
     assert plist["StandardErrorPath"] == str(logs / "gateway-service.err.log")
@@ -105,7 +105,7 @@ def test_systemd_unit_carries_the_restart_contract(tmp_path: Path) -> None:
         "RestartSec=5",
         "RestartPreventExitStatus=78",
         "KillMode=mixed",
-        "TimeoutStopSec=42",
+        "TimeoutStopSec=54",
         "WantedBy=default.target",
     ):
         assert f"\n{line}\n" in unit
@@ -384,3 +384,23 @@ def test_no_backoff_outside_launchd(tmp_path: Path, env: dict[str, str]) -> None
     )
     # systemd's RestartPreventExitStatus=78 already stops the loop.
     assert delay == 0.0 and slept == []
+
+
+def test_stop_timeout_is_derived_from_the_gateways_own_shutdown_bounds() -> None:
+    """Not a constant: raising any bound the shutdown waits on raises it too."""
+    from agentos.gateway.boot import UVICORN_STOP_TIMEOUT_S, WS_CLOSE_TIMEOUT_S
+    from agentos.gateway.readiness import drain_budget_ms, stop_budget_ms
+    from agentos.gateway.restart import FORCE_DRAIN_TIMEOUT_S, SAFE_DRAIN_TIMEOUT_S
+
+    assert drain_budget_ms() == (SAFE_DRAIN_TIMEOUT_S + FORCE_DRAIN_TIMEOUT_S) * 1000
+    assert (
+        stop_budget_ms() == drain_budget_ms() + (WS_CLOSE_TIMEOUT_S + UVICORN_STOP_TIMEOUT_S) * 1000
+    )
+    assert gs.stop_timeout_s() == stop_budget_ms() / 1000 + gs.STOP_MARGIN_S == 54
+
+
+def test_stop_timeout_follows_a_raised_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agentos.gateway import boot
+
+    monkeypatch.setattr(boot, "UVICORN_STOP_TIMEOUT_S", 20.5)
+    assert gs.stop_timeout_s() == 65  # 32 + 2 + 20.5 rounded up, + 10

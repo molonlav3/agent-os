@@ -53,9 +53,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   advertises it as the `supervisor-contract` capability.
 - `agentos gateway install` / `uninstall` / `status --deep` (#3690): run the
   gateway as a macOS LaunchAgent (`dev.useagentos.gateway`: `KeepAlive`,
-  `ThrottleInterval 10`, `ExitTimeOut` = drain budget + 10 s) or a Linux
+  `ThrottleInterval 10`, `ExitTimeOut` 54 s = the worst-case stop + 10 s) or a Linux
   systemd user unit (`agentos-gateway.service`: `Restart=always`,
-  `RestartSec=5`, `RestartPreventExitStatus=78`, `KillMode=mixed`). Installing
+  `RestartSec=5`, `RestartPreventExitStatus=78`, `KillMode=mixed`,
+  `TimeoutStopSec=54`). Installing
   the same unit twice is a no-op (also from a shell with another `PATH`; the
   unit carries the installing shell's `PATH` after the standard dirs); a
   different unit under the same name is refused. `agentos gateway stop` on a

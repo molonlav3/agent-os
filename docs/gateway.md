@@ -75,8 +75,8 @@ agentos gateway uninstall
 
 | Platform | Unit | Restart policy |
 |---|---|---|
-| macOS | LaunchAgent `~/Library/LaunchAgents/dev.useagentos.gateway.plist` (label `dev.useagentos.gateway`), logs in `~/Library/Logs/AgentOS/gateway-service.log` and `gateway-service.err.log` | `KeepAlive`, `RunAtLoad`, `ThrottleInterval 10` (at most one respawn per 10 s), `ExitTimeOut 42` |
-| Linux | systemd user unit `~/.config/systemd/user/agentos-gateway.service` (`systemctl --user daemon-reload` + `enable --now`) | `Restart=always`, `RestartSec=5`, `RestartPreventExitStatus=78`, `KillMode=mixed`, `TimeoutStopSec=42` |
+| macOS | LaunchAgent `~/Library/LaunchAgents/dev.useagentos.gateway.plist` (label `dev.useagentos.gateway`), logs in `~/Library/Logs/AgentOS/gateway-service.log` and `gateway-service.err.log` | `KeepAlive`, `RunAtLoad`, `ThrottleInterval 10` (at most one respawn per 10 s), `ExitTimeOut 54` |
+| Linux | systemd user unit `~/.config/systemd/user/agentos-gateway.service` (`systemctl --user daemon-reload` + `enable --now`) | `Restart=always`, `RestartSec=5`, `RestartPreventExitStatus=78`, `KillMode=mixed`, `TimeoutStopSec=54` |
 | Windows | not supported | — |
 
 The unit runs the absolute path of the `agentos` you installed it with
@@ -87,9 +87,10 @@ installing shell's own `PATH`, so harness CLIs installed with Homebrew, npm,
 nvm, volta, bun or pyenv are found. `AGENTOS_STATE_DIR` and
 `AGENTOS_GATEWAY_CONFIG_PATH` are carried into the unit when they are set in
 the installing shell, and `AGENTOS_SERVICE` (`launchd` or `systemd`) tells
-the gateway it runs under a service manager. The stop timeout (42 s) is the
-drain budget — 30 s for turns to finish plus 2 s to cancel the rest — plus a
-10 s margin.
+the gateway it runs under a service manager. The stop timeout (54 s) is the
+gateway's worst-case stop — 30 s for turns to finish, 2 s to cancel the rest,
+2 s for clients' closing handshakes and 10 s for the HTTP server to stop —
+plus a 10 s margin, derived from the bounds the shutdown itself uses.
 
 Installing the same unit again is a no-op, also from a shell whose `PATH`
 differs (the installed unit is kept; uninstall and install again to refresh
