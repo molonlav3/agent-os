@@ -67,6 +67,17 @@ def test_cors_wildcard_with_credentials_only_matters_off_loopback() -> None:
     assert "gateway.cors_wildcard_with_credentials" not in _ids(GatewayConfig())
 
 
+def test_cors_wildcard_is_reported_as_inert_not_as_a_risk() -> None:
+    """The origin policy answers CORS only for admitted origins on every bind,
+    so a ``*`` entry allows nothing; doctor must not claim otherwise."""
+    public = _public(cors=CorsConfig(allowed_origins=["*"], allow_credentials=True))
+    findings = evaluate_gateway_security(gateway_security_payload(public))
+    finding = next(f for f in findings if f.id == "gateway.cors_wildcard_with_credentials")
+    assert finding.severity == "info"
+    assert "nothing does" not in finding.detail
+    assert "origin policy" in finding.detail
+
+
 def test_trusted_proxy_unset() -> None:
     config = _public(auth=AuthConfig(mode="trusted-proxy"))
     findings = evaluate_gateway_security(gateway_security_payload(config))

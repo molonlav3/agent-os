@@ -145,7 +145,11 @@ non-loopback bind for that reason; with an empty `trusted_proxy` nothing is
 admitted and `doctor` reports `gateway.trusted_proxy_unset`.
 
 The proxy must forward WebSocket upgrades on `/ws` and should append the
-client address to `X-Forwarded-For`. The gateway reads that header only from
+client address to `X-Forwarded-For`. The origin you list in
+`control_ui.allowed_origins` (or `[gateway] public_origin`) is also the
+hostname the gateway answers to: a request whose `Host` names anything else
+gets `400` (the DNS-rebinding guard), so a proxy that forwards the public
+`Host` needs that origin declared. The gateway reads that header only from
 a trusted peer and walks it right to left, skipping trusted hops, so the
 first address your proxies did not add is the client used for rate limiting.
 An address that names the gateway host itself (loopback or one of its own
@@ -188,8 +192,17 @@ mode in the file first, then start on the wider bind:
 
 ```sh
 agentos config set auth.mode token --config ~/.agentos/config.toml
-agentos gateway run --listen 0.0.0.0
+agentos gateway run --bind-mode lan      # same as --listen 0.0.0.0
 ```
+
+`--bind-mode tailnet` listens on the machine's `tailscale ip -4` address and
+on `127.0.0.1` only, and refuses to start when Tailscale is not up instead of
+falling back to every interface. Browsers are admitted from the address you
+opened the console at when it is a private one (`http://192.168.1.20:18791`),
+from the gateway's own localhost, and from declared origins; anything else is
+refused before auth. To open it under a DNS name, declare that origin:
+`agentos config set gateway.public_origin https://agent.example.com --config
+~/.agentos/config.toml`. See [Gateway → Browser origins](gateway.md#browser-origins).
 
 A token is generated at startup when none is set. Clients send it as
 `Authorization: Bearer <token>` (HTTP) or in the WebSocket `connect`

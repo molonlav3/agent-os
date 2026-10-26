@@ -40,6 +40,12 @@ export interface Approval {
   toolName?: string
   actionKind?: string
   sessionKey?: string
+  /**
+   * The requesting session followed by its subagent / coding-agent ancestors
+   * (gateway `audience_session_keys`): a parent session's viewers see a
+   * child's prompt too.
+   */
+  audienceSessionKeys?: string[]
   agent?: string
   command?: string
   warning?: string
@@ -242,7 +248,8 @@ function eventId(value: unknown): string {
  * Turn an `approval.requested` payload into a queue item. The gateway attaches
  * the full GET /api/approvals item as `approval` when it has one; otherwise
  * the frame's own summary fields are mapped onto the same shape (session_key →
- * sessionKey, tool → toolName, summary → warning). Returns null for a frame
+ * sessionKey, audience_session_keys → audienceSessionKeys, tool → toolName,
+ * summary → warning). Returns null for a frame
  * without a usable id.
  */
 export function approvalFromEvent(payload: unknown): Approval | null {
@@ -269,6 +276,11 @@ function readRequested(payload: unknown): { item: Approval; full: boolean } | nu
   const item: Approval = { id }
   if (namespace) item.namespace = namespace
   if (typeof frame.session_key === 'string') item.sessionKey = frame.session_key
+  if (Array.isArray(frame.audience_session_keys)) {
+    item.audienceSessionKeys = frame.audience_session_keys.filter(
+      (key): key is string => typeof key === 'string' && key !== '',
+    )
+  }
   if (typeof frame.tool === 'string') item.toolName = frame.tool
   if (typeof frame.command === 'string') item.command = frame.command
   if (typeof frame.summary === 'string') item.warning = frame.summary

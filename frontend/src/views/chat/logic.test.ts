@@ -522,6 +522,31 @@ describe('attachment helpers (parity chat.js:8299-8325)', () => {
     )
     expect(attachmentDownloadHref(null, 'text/plain')).toBe('')
   })
+  it('routes a gateway-stored attachment chip through the delegated download', () => {
+    const sha = 'ef'.repeat(32)
+    const href = `/api/v1/attachments/${sha}?sessionKey=k&name=brief.pdf&mime=application%2Fpdf`
+    const host = document.createElement('div')
+    host.innerHTML = renderMessageAttachmentHtml({
+      name: 'brief.pdf',
+      mime: 'application/pdf',
+      download_url: href,
+    })
+    const chip = host.querySelector('a')
+    expect(chip).toHaveAttribute('data-artifact-download', href)
+    expect(chip).toHaveAttribute('download', 'brief.pdf')
+    // Not an artifact card: the chat export must not list it as one.
+    expect(chip).not.toHaveAttribute('data-artifact-name')
+
+    // Inline bytes stay a plain link.
+    host.innerHTML = renderMessageAttachmentHtml({
+      name: 'a.txt',
+      mime: 'text/plain',
+      data: 'QQ==',
+    })
+    expect(host.querySelector('a')).not.toHaveAttribute('data-artifact-download')
+    host.innerHTML = renderMessageAttachmentHtml({ name: 'b.txt', url: 'blob:http://x/1' })
+    expect(host.querySelector('a')).not.toHaveAttribute('data-artifact-download')
+  })
   it('renders escaped history/live attachment markup and rejects an unsafe image source', () => {
     const html = renderMessageAttachmentHtml({
       name: '"><img src=x onerror=alert(1)>',

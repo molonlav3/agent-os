@@ -95,7 +95,10 @@ def test_trusted_proxy_mode_admits_a_peer_inside_a_cidr_block() -> None:
     config = GatewayConfig(
         host="0.0.0.0", auth=AuthConfig(mode="trusted-proxy", trusted_proxy="10.0.0.0/8")
     )
-    inside = TestClient(create_gateway_app(config), client=("10.9.8.7", 4000))
-    outside = TestClient(create_gateway_app(config), client=("203.0.113.1", 4000))
+    # The proxy forwards to the gateway's address; a bare "testserver" Host
+    # is refused by the DNS-rebinding guard off loopback.
+    base = "http://10.0.0.2:18791"
+    inside = TestClient(create_gateway_app(config), client=("10.9.8.7", 4000), base_url=base)
+    outside = TestClient(create_gateway_app(config), client=("203.0.113.1", 4000), base_url=base)
     assert inside.get("/api/system/status").status_code == 200
     assert outside.get("/api/system/status").status_code == 401

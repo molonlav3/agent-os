@@ -510,8 +510,196 @@ def commit_config(
     )
 
 
+class ConfigReloadError(ValueError):
+    """The file on disk cannot become the running config (it stays as it was)."""
+
+
+@dataclass(frozen=True)
+class ConfigReloadResult:
+    """Outcome of applying an external edit of the config file."""
+
+    path: Path
+    revision: str
+    changed_paths: tuple[str, ...]
+    hot_paths: tuple[str, ...]
+    restart_paths: tuple[str, ...]
+    restart_reasons: tuple[str, ...]
+    applied_now: bool
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.changed_paths)
+
+
+def _set_dotted_attr(target: Any, path: str, value: Any) -> None:
+    parts = path.split(".")
+    node = target
+    for part in parts[:-1]:
+        node = getattr(node, part)
+    setattr(node, parts[-1], value)
+
+
+def _get_dotted_attr(target: Any, path: str) -> Any:
+    node = target
+    for part in path.split("."):
+        node = getattr(node, part)
+    return node
+
+
+def _leaf_paths(paths: set[str]) -> set[str]:
+    return {
+        path
+        for path in paths
+        if not any(other.startswith(f"{path}.") for other in paths if other != path)
+    }
+
+
+def reload_config_from_disk(ctx: RpcContext) -> ConfigReloadResult:
+    """Make an edit of the active config file the running config.
+
+    The file was written by someone else -- an editor, a deploy script -- so
+    unlike :func:`commit_config` nothing is persisted: rewriting it would
+    discard the operator's comments and layout. Everything after the write is
+    the same: the same validation, the same public-bind safety guard, the same
+    in-place update and hot adapters, and the same restart bookkeeping. Values
+    the process holds that the file does not -- ``--listen``/``--port``
+    overrides, an auto-generated token, env-sourced secrets -- carry over.
+
+    Raises :class:`ConfigReloadError` when the file cannot be read, parsed or
+    validated; the running config is untouched then.
+    """
+    from pydantic import ValidationError
+
+    from agentos.gateway.config import GatewayConfig, enforce_public_bind_auth_guard
+    from agentos.gateway.config_migration import migrate_config_payload
+    from agentos.gateway.config_persist import get_runtime_overrides
+    from agentos.gateway.rpc_config import (
+        _bind_restart_fingerprint,
+        _boot_runtime_restart_fingerprints,
+        _channels_restart_fingerprint,
+        _has_unproven_live_change,
+        _memory_restart_fingerprint,
+        _restart_reasons,
+        _sandbox_posture_restart_fingerprint,
+        diff_paths,
+    )
+
+    running = getattr(ctx, "config", None)
+    path = _resolved_config_path(running)
+    if running is None or path is None:
+        raise ConfigReloadError("no active config file")
+    try:
+        text = path.read_bytes().decode("utf-8")
+        raw = tomllib.loads(text)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigReloadError(f"cannot read {path.name}: {exc}") from exc
+    try:
+        migrated = migrate_config_payload(raw).payload
+        new_config = GatewayConfig(**migrated)
+        new_config.mark_env_sourced_auth_secrets(migrated)
+        _assert_payload_is_modeled(migrated, new_config)
+    except (ValidationError, ValueError, TypeError) as exc:
+        raise ConfigReloadError(_short_error(exc)) from exc
+    new_config.config_path = str(path)
+    # What the CLI set for this process (``--listen``, ``--port``, ``--debug``)
+    # keeps winning over the file, exactly as it did at boot.
+    for override_path in get_runtime_overrides():
+        try:
+            _set_dotted_attr(new_config, override_path, _get_dotted_attr(running, override_path))
+        except AttributeError:
+            continue
+    # Runtime-only secrets the file does not carry (an auto-generated token,
+    # an env-sourced key) stay; the file can still set its own value.
+    new_config.inherit_runtime_secrets(running)
+    for secret_path in sorted(getattr(running, "_runtime_secret_paths", ())):
+        if _dotted_path_present(migrated, secret_path):
+            new_config.clear_runtime_secret(secret_path)
+            continue
+        try:
+            _set_dotted_attr(new_config, secret_path, _get_dotted_attr(running, secret_path))
+        except (AttributeError, ValidationError):
+            continue
+
+    old_payload = running.model_dump(mode="python")
+    changed = diff_paths(old_payload, new_config.model_dump(mode="python"))
+    leaves = _leaf_paths(changed)
+    if not leaves:
+        return ConfigReloadResult(
+            path=path,
+            revision=config_revision(running),
+            changed_paths=(),
+            hot_paths=(),
+            restart_paths=(),
+            restart_reasons=(),
+            applied_now=True,
+        )
+
+    if new_config.auth.mode == "token" and not new_config.auth.token:
+        raise ConfigReloadError("auth.mode='token' requires a token")
+    posture = (running.host, running.auth.mode, running.auth.trusted_proxy)
+    if posture != (new_config.host, new_config.auth.mode, new_config.auth.trusted_proxy):
+        try:
+            enforce_public_bind_auth_guard(new_config)
+        except ValueError as exc:
+            raise ConfigReloadError(str(exc)) from exc
+
+    reasons = set(
+        _restart_reasons(
+            old_memory_fingerprint=_memory_restart_fingerprint(running),
+            old_channels_fingerprint=_channels_restart_fingerprint(running),
+            old_sandbox_posture_fingerprint=_sandbox_posture_restart_fingerprint(running),
+            old_bind_fingerprint=_bind_restart_fingerprint(running),
+            old_boot_runtime_fingerprints=_boot_runtime_restart_fingerprints(running),
+            changed_paths=changed,
+            new_config=new_config,
+        )
+    )
+    # Per path: hot only when a live consumer or hot adapter is audited for
+    # it (the same table config RPC writes use); anything else, including an
+    # unknown key, waits for a restart.
+    restart_paths = sorted(p for p in leaves if _has_unproven_live_change({p}))
+    hot_paths = sorted(leaves - set(restart_paths))
+    if restart_paths and not reasons:
+        reasons.add("config")
+
+    update_config_in_place(running, new_config)
+    applied_now = True
+    for name, apply_step in _runtime_steps(ctx, changed):
+        try:
+            apply_step(running)
+        except Exception:
+            log.exception("config hot apply failed adapter=%s", name)
+            applied_now = False
+            reasons.add(f"hot_apply:{name}")
+    pending = _record_pending_restart(running, reasons)
+    return ConfigReloadResult(
+        path=path,
+        revision=config_revision(running),
+        changed_paths=tuple(sorted(leaves)),
+        hot_paths=tuple(hot_paths),
+        restart_paths=tuple(restart_paths),
+        restart_reasons=pending,
+        applied_now=applied_now,
+    )
+
+
+def _short_error(exc: BaseException) -> str:
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        try:
+            first = errors()[0]
+            loc = ".".join(str(part) for part in first.get("loc", ()))
+            return f"{loc}: {first.get('msg', 'invalid value')}" if loc else str(first.get("msg"))
+        except (IndexError, TypeError):
+            pass
+    return str(exc).splitlines()[0][:300] if str(exc) else type(exc).__name__
+
+
 __all__ = [
     "ConfigCommitResult",
+    "ConfigReloadError",
+    "ConfigReloadResult",
+    "reload_config_from_disk",
     "ConfigDiskState",
     "commit_config",
     "config_disk_state",

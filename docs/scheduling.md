@@ -518,6 +518,34 @@ more than twice as late as planned) when they happen.
   works meanwhile, except for a job the crash left marked running. See
   [Gateway](gateway.md#crash-loop-breaker-safe-mode).
 
+## Automation From Outside
+
+Something outside AgentOS — CI, a repository webhook, a no-code workflow — can
+start agent work without a chat channel through the inbound webhooks:
+
+```sh
+curl -X POST -H "Authorization: Bearer $AGENTOS_HOOKS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Nightly build failed: summarize the log", "idempotency_key": "build-4211"}' \
+  http://127.0.0.1:18791/api/v1/hooks/agent
+```
+
+- `/api/v1/hooks/agent` enqueues the message into `agent:main:hook:agent`
+  (or another `agent:<agent>:hook:...` key you pass as `session_key`).
+- `/api/v1/hooks/wake` asks the heartbeat loop to run its next tick now
+  (a disabled heartbeat or quiet hours still skip it).
+- `/api/v1/hooks/<name>` maps any JSON body to an agent, a session and a
+  message template set in `[hooks.routes.<name>]` — point a repository's
+  webhook straight at it.
+
+They use their own `[hooks] token`, never the gateway token. Retried
+deliveries are deduplicated by `idempotency_key` (or the `Idempotency-Key`
+header) for five minutes; each hook is limited to `rate_limit_per_minute` calls
+and `max_sessions_per_hook` sessions per hour; reusing an idempotency key for a
+different body is `409`. Setup: [Configuration → Inbound
+webhooks](configuration.md#inbound-webhooks); responses: [HTTP API → Inbound
+webhooks](http-api.md#inbound-webhooks).
+
 ## Troubleshooting
 
 Check the gateway and job state:

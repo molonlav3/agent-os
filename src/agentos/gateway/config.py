@@ -135,7 +135,12 @@ class AuthConfig(BaseSettings):
 class CorsConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENTOS_CORS_")
 
-    allowed_origins: list[str] = Field(default_factory=lambda: ["*"])
+    # Extra origins CORS reflects, on top of the gateway's origin policy
+    # (``gateway.origin_policy``): an entry is allowlisted like a
+    # ``control_ui.allowed_origins`` one. ``"*"`` -- the old default, still
+    # found in written configs -- adds nothing: a wildcard is never reflected
+    # with credentials.
+    allowed_origins: list[str] = Field(default_factory=list)
     allow_credentials: bool = True
     allowed_methods: list[str] = Field(default_factory=lambda: ["*"])
     allowed_headers: list[str] = Field(default_factory=lambda: ["*"])
@@ -263,6 +268,19 @@ class SkillsConfig(BaseSettings):
     install_policy: SkillInstallPolicyConfig = Field(default_factory=SkillInstallPolicyConfig)
 
 
+class ToolsInvokeConfig(BaseModel):
+    """``[tools.invoke]`` — the direct HTTP tool endpoint.
+
+    ``allow`` names tools lifted off the endpoint's hard deny list (shell,
+    file writes, session spawning, scheduling, gateway control, trading
+    writes), one tool per entry. Nothing else widens that list.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    allow: list[str] = Field(default_factory=list)
+
+
 class ToolsConfig(BaseModel):
     """Top-level runtime tool policy configuration."""
 
@@ -280,6 +298,8 @@ class ToolsConfig(BaseModel):
     also_allow: list[str] = Field(default_factory=list)
     workspace_write_deny_globs: list[str] = Field(default_factory=list)
     trusted_fake_ip_cidrs: list[str] = Field(default_factory=list)
+    # ``POST /api/v1/tools/invoke`` (``[tools.invoke]``). Read per request.
+    invoke: ToolsInvokeConfig = Field(default_factory=ToolsInvokeConfig)
 
     @field_validator("trusted_fake_ip_cidrs")
     @classmethod
@@ -2243,6 +2263,139 @@ class SchedulerConfig(BaseModel):
     startup_agent_delay_seconds: float = Field(default=120.0, ge=0)
 
 
+GatewayBindMode = Literal["loopback", "lan", "tailnet", "custom"]
+GATEWAY_BIND_MODES: tuple[str, ...] = ("loopback", "lan", "tailnet", "custom")
+
+
+class GatewayServeConfig(BaseModel):
+    """Listener posture and config-file watching (``[gateway]``).
+
+    ``bind`` picks the listener: ``loopback`` (127.0.0.1), ``lan`` (every
+    interface, auth required), ``tailnet`` (the Tailscale IPv4 plus
+    127.0.0.1, never a wildcard) or ``custom`` (the top-level ``host``).
+    Unset keeps the pre-existing behaviour: ``host`` decides, and it defaults
+    to loopback. ``--listen``/``--bind`` still win and count as ``custom``.
+
+    ``public_origin`` is the browser origin a public deployment is opened at
+    (``https://agent.example.com``); it joins the origin allowlist.
+    ``config_reload`` watches the active config file and applies edits.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bind: GatewayBindMode | None = None
+    public_origin: str = ""
+    config_reload: bool = True
+
+    @field_validator("public_origin")
+    @classmethod
+    def _validate_public_origin(cls, value: str) -> str:
+        cleaned = value.strip().rstrip("/")
+        if not cleaned:
+            return ""
+        from urllib.parse import urlsplit
+
+        try:
+            parts = urlsplit(cleaned)
+            host = parts.hostname
+            parts.port  # noqa: B018 - raises on a malformed port
+        except ValueError as exc:
+            raise ValueError(f"gateway.public_origin is not a valid origin: {exc}") from exc
+        if parts.scheme not in {"http", "https"} or not host or parts.path or parts.query:
+            raise ValueError(
+                "gateway.public_origin must be a full origin, scheme://host[:port], "
+                "e.g. https://agent.example.com"
+            )
+        return cleaned
+
+
+class ArtifactsConfig(BaseModel):
+    """Download URLs for artifacts and attachments (``[artifacts]``).
+
+    ``legacy_session_key_urls`` keeps the pre-ticket
+    ``/api/v1/artifacts/{id}?sessionKey=`` and
+    ``/api/v1/attachments/{sha256}?sessionKey=`` routes answering for one
+    release, each use logged as deprecated. Clients mint a ticketed URL with
+    the ``artifacts.download`` RPC instead.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    legacy_session_key_urls: bool = True
+
+
+class PushConfig(BaseModel):
+    """Web Push for approval prompts (``[push]``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    web_enabled: bool = True
+    # The VAPID ``sub`` claim push services may use to reach the sender.
+    vapid_subject: str = "https://useagentos.dev"
+
+    @field_validator("vapid_subject")
+    @classmethod
+    def _validate_vapid_subject(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned.startswith(("mailto:", "https://")):
+            raise ValueError("push.vapid_subject must be a mailto: or https:// URL")
+        return cleaned
+
+
+class HookRouteConfig(BaseModel):
+    """One named inbound webhook, ``[hooks.routes.<name>]``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str = "main"
+    # Empty: ``agent:<agent>:hook:<name>``. Set it to deliver into an
+    # existing conversation; only the operator can point a hook there.
+    session_key: str = ""
+    # ``{{ payload.path.to.value }}`` placeholders, filled from the JSON body.
+    # Empty: the body's ``message`` field, else the JSON body itself.
+    template: str = ""
+
+
+class LifecycleHooksConfig(BaseModel):
+    """Shell commands run on gateway lifecycle events (``[hooks.lifecycle]``).
+
+    File-only: config RPC writes cannot add or change them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    startup: list[str] = Field(default_factory=list)
+    shutdown: list[str] = Field(default_factory=list)
+    pre_restart: list[str] = Field(default_factory=list)
+
+
+class HooksConfig(BaseModel):
+    """Inbound webhooks and lifecycle hooks (``[hooks]``).
+
+    ``token`` is the bearer the ``/api/v1/hooks/*`` routes accept -- never
+    the gateway token, which those routes refuse. Unset disables them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = ""
+    rate_limit_per_minute: int = Field(default=60, ge=1)
+    max_sessions_per_hook: int = Field(default=1, ge=1)
+    routes: dict[str, HookRouteConfig] = Field(default_factory=dict)
+    lifecycle: LifecycleHooksConfig = Field(default_factory=LifecycleHooksConfig)
+
+    @field_validator("routes")
+    @classmethod
+    def _validate_route_names(cls, value: dict[str, HookRouteConfig]) -> dict[str, HookRouteConfig]:
+        for name in value:
+            if name in {"agent", "wake"} or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
+                raise ValueError(
+                    f"hooks.routes.{name}: a route name is 1-64 of a-z 0-9 _ - "
+                    "and cannot be 'agent' or 'wake'"
+                )
+        return value
+
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -2546,6 +2699,10 @@ class GatewayConfig(BaseSettings):
     gateway_control: GatewayControlConfig = Field(default_factory=GatewayControlConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     trading: TradingConfig = Field(default_factory=TradingConfig)
+    gateway: GatewayServeConfig = Field(default_factory=GatewayServeConfig)
+    artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
+    push: PushConfig = Field(default_factory=PushConfig)
+    hooks: HooksConfig = Field(default_factory=HooksConfig)
 
     # Component enable flags
     control_ui: ControlUiConfig = Field(default_factory=ControlUiConfig)
@@ -2884,6 +3041,7 @@ class GatewayConfig(BaseSettings):
             # field existed — an empty table would otherwise be rejected by any
             # older AgentOS the operator rolls back to.
             skills.pop("config", None)
+        _drop_default_sections(data, self)
         llm = data.get("llm")
         if isinstance(llm, dict):
             if not llm.get("api_key_env"):
@@ -3145,6 +3303,26 @@ def redact_public_config(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_public_config(item) for item in value]
     return value
+
+
+#: Sections added after configs were already in the field. Persisted only when
+#: they differ from their defaults, so a file this release writes for an
+#: install that never touched them still loads on the release before it.
+_OMIT_WHEN_DEFAULT_SECTIONS: tuple[tuple[str, type[BaseModel]], ...] = (
+    ("gateway", GatewayServeConfig),
+    ("artifacts", ArtifactsConfig),
+    ("push", PushConfig),
+    ("hooks", HooksConfig),
+)
+
+
+def _drop_default_sections(data: dict[str, Any], config: GatewayConfig) -> None:
+    for name, model in _OMIT_WHEN_DEFAULT_SECTIONS:
+        if getattr(config, name, None) == model():
+            data.pop(name, None)
+    tools = data.get("tools")
+    if isinstance(tools, dict) and config.tools.invoke == ToolsInvokeConfig():
+        tools.pop("invoke", None)
 
 
 def _delete_path(obj: dict[str, Any], path: str) -> None:

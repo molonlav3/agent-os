@@ -158,6 +158,7 @@ def approval_pending_rpc_payload(
                 "sessionKey": params.get("sessionKey") or params.get("session_key") or "",
                 "createdAt": entry.get("created_at"),
                 "expiresAt": entry.get("expires_at"),
+                "audienceSessionKeys": entry.get("audience_session_keys") or [],
                 "params": params,
             }
         )

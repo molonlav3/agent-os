@@ -52,7 +52,16 @@ def _click(approval_id: str, *, message: dict) -> dict:
 
 
 def _pending() -> str:
-    return get_approval_queue().request("exec", {"argv": ["ls"], "action_kind": "exec"})
+    # The approval belongs to this Slack channel's session: only that chat may
+    # answer it (approval custody).
+    return get_approval_queue().request(
+        "exec",
+        {
+            "argv": ["ls"],
+            "action_kind": "exec",
+            "sessionKey": f"agent:main:slack:channel:{CHANNEL_ID}",
+        },
+    )
 
 
 @pytest.mark.asyncio

@@ -68,6 +68,18 @@ agentos gateway install --port 18791
 agentos gateway uninstall
 ```
 
+`gateway run` and `gateway start` take `--port`, `--bind` / `--listen HOST`
+(an explicit host, bind mode `custom`) and `--bind-mode loopback|lan|tailnet|custom`,
+which overrides `[gateway] bind`. `tailnet` listens on the `tailscale ip -4`
+address and on `127.0.0.1`, and fails to start rather than fall back to
+`0.0.0.0` when Tailscale is unavailable; `lan` and `tailnet` need token auth.
+`status`, `stop` and `restart` follow the bind mode `start` recorded (or take
+`--bind-mode`). A Control UI on a specific public address needs `[gateway]
+public_origin = "https://<the address you open>"` (or
+`control_ui.allowed_origins`); without it the gateway refuses to start and says
+so.
+See [Gateway → Host and Port](gateway.md#host-and-port).
+
 `agentos gateway status` (and `--json`) reports **both** the installed CLI
 version (`cliVersion`) and the running gateway's version (`gatewayVersion`);
 when they differ it sets `versionMismatch` and prints a diagnostic advising a

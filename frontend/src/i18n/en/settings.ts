@@ -42,4 +42,18 @@ export const settings = defineNamespace('settings', {
   divergedAction: 'Refresh state',
   loadErrorBody:
     'Agent state could not be loaded. Retry before changing guided or advanced settings.',
+
+  // Web Push opt-in for approval requests (WebPushToggle).
+  pushLandmark: 'Notifications',
+  pushTitle: 'Push notifications for approvals',
+  pushOff: 'Notify this browser when an approval is waiting, even with the console closed',
+  pushOn: 'On for this browser',
+  pushChecking: 'Checking this browser…',
+  pushBusy: 'Updating…',
+  pushInsecure: 'Needs a secure page: open the console over HTTPS or on localhost',
+  pushUnsupported: 'This browser does not support push notifications',
+  pushGatewayOff: 'Turned off on the gateway ([push] web_enabled = false)',
+  pushGatewayMissing: 'This gateway version does not offer push notifications',
+  pushDenied: 'Notifications are blocked for this site in the browser settings',
+  pushFailed: 'Push notifications could not be changed: {message}',
 } as const)

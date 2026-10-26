@@ -25,6 +25,12 @@ from agentos.cli.gateway_lifecycle import (
 )
 from agentos.cli.ui import ACCENT_MARKUP, console
 from agentos.cli_quoting import config_cli_arg
+from agentos.gateway.bind_modes import (
+    BindResolution,
+    BindResolutionError,
+    CommandRunner,
+    resolve_bind,
+)
 from agentos.gateway.boot import start_gateway_server
 from agentos.gateway.config import (
     GatewayConfig,
@@ -80,6 +86,35 @@ def _load_config_or_exit(config_path: str | None, *, exit_code: int = 2) -> Gate
         raise typer.Exit(exit_code) from exc
 
 
+def resolve_cli_bind(
+    config: GatewayConfig,
+    *,
+    explicit_host: str | None,
+    bind_mode: str | None,
+    env: dict[str, str] | None = None,
+    tailscale_runner: CommandRunner | None = None,
+) -> BindResolution:
+    """Resolve the listener for ``gateway run`` / ``gateway start``.
+
+    An explicit ``--listen``/``--bind`` host wins and is ``custom``; then
+    ``--bind-mode``; then ``AGENTOS_LISTEN`` / ``AGENTOS_GATEWAY_HOST``
+    (``custom``); then ``[gateway] bind``; then the ``host`` field.
+    """
+    if explicit_host:
+        return resolve_bind("custom", host=explicit_host)
+    if bind_mode:
+        return resolve_bind(bind_mode, host=config.host, tailscale_runner=tailscale_runner)
+    environ = env if env is not None else dict(os.environ)
+    env_host = environ.get("AGENTOS_LISTEN") or environ.get("AGENTOS_GATEWAY_HOST")
+    if env_host:
+        return resolve_bind("custom", host=resolve_listen_address(None, env=environ))
+    return resolve_bind(
+        config.gateway.bind,
+        host=config.host or "127.0.0.1",
+        tailscale_runner=tailscale_runner,
+    )
+
+
 def gateway_startup_guidance(host: str, port: int, scheme: str = "http") -> tuple[str, ...]:
     """Return operator-facing guidance shown after the gateway starts."""
 
@@ -98,11 +133,17 @@ def run_gateway(
     listen: str = typer.Option("", "--listen", help="Host to bind (wins over --bind)"),
     debug: bool = typer.Option(False, "--debug", help="Enable debug mode"),
     config_path: str | None = typer.Option(None, "--config", help="Override config path"),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (overrides [gateway] bind)",
+    ),
 ) -> None:
     """Start the ASGI gateway server.
 
-    Precedence: ``--listen`` > ``--bind`` > ``AGENTOS_LISTEN`` >
-    ``AGENTOS_GATEWAY_HOST`` > toml ``host`` field > default ``127.0.0.1``.
+    Precedence: ``--listen`` > ``--bind`` > ``--bind-mode`` > ``AGENTOS_LISTEN``
+    > ``AGENTOS_GATEWAY_HOST`` > toml ``[gateway] bind`` > toml ``host`` field >
+    default ``127.0.0.1``. An explicit host counts as bind mode ``custom``.
 
     The toml ``host`` field was previously silently ignored — operators
     setting ``host = "0.0.0.0"`` in agentos.toml then ran the gateway
@@ -125,7 +166,15 @@ def run_gateway(
     # env vars + toml get a chance to participate when the operator only
     # sets one of them.
     explicit_flag: str | None = listen or (bind if bind and bind != "127.0.0.1" else None)
-    host = resolve_listen_address(explicit_flag, default=config.host or "127.0.0.1")
+    # Called as a plain function (tests, the main.py command) the typer default
+    # is an OptionInfo, not None.
+    requested_mode = bind_mode if isinstance(bind_mode, str) else None
+    try:
+        resolution = resolve_cli_bind(config, explicit_host=explicit_flag, bind_mode=requested_mode)
+    except BindResolutionError as exc:
+        console.print(f"[red]Gateway could not start:[/red] {escape(str(exc))}")
+        raise typer.Exit(2) from exc
+    host = resolution.host
     resolved_port = port if port is not None else config.port
     # Record the RAW on-disk values BEFORE overriding them in memory, in the
     # process-global runtime-override map that every config writer consults. A
@@ -158,8 +207,10 @@ def run_gateway(
         raise typer.Exit(0)
 
     banner_host = f"[red]{host}[/red]" if is_public_bind(host) else f"[{ACCENT_MARKUP}]{host}[/]"
+    also = "".join(f" + {extra}:{resolved_port}" for extra in resolution.extra_hosts)
     console.print(
         f"[bold green]Starting AgentOS gateway[/bold green] on {banner_host}:{resolved_port}"
+        f"{also} [dim](bind mode {resolution.mode})[/dim]"
     )
     scheme = "https" if (config.tls.keyfile and config.tls.certfile) else "http"
     for line in gateway_startup_guidance(host, resolved_port, scheme=scheme):
@@ -174,11 +225,15 @@ def run_gateway(
         # build_services() inside start_gateway_server handles:
         # session_manager, provider_selector, tool_registry, usage_tracker,
         # memory, skills, scheduler, search, MCP discovery.
+        extra: dict[str, Any] = {}
+        if resolution.extra_hosts:
+            extra["extra_listen_hosts"] = resolution.extra_hosts
         try:
             server = await start_gateway_server(
                 config=config,
                 subscription_manager=subscription_mgr,
                 run=True,
+                **extra,
             )
         except BaseException as exc:
             _record_startup_failure(exc)
@@ -217,7 +272,8 @@ def run_gateway(
         # Refused public bind, failed schema migration: only a config change
         # fixes these, so a supervisor must not just restart (systemd's
         # RestartPreventExitStatus=78; the desktop runs doctor, then retries).
-        console.print(f"[red]Gateway could not start:[/red] {exc}")
+        # Escaped: the messages name config sections ([gateway] public_origin).
+        console.print(f"[red]Gateway could not start:[/red] {escape(str(exc))}")
         console.print("Inspect: agentos doctor")
         _service_config_backoff()
         raise typer.Exit(code=EX_CONFIG) from exc
@@ -225,7 +281,7 @@ def run_gateway(
         from agentos.onboarding.next_steps import env_recovery_commands
         from agentos.onboarding.status import get_onboarding_status
 
-        console.print(f"[red]Gateway could not start:[/red] {exc}")
+        console.print(f"[red]Gateway could not start:[/red] {escape(str(exc))}")
         status = get_onboarding_status(config)
         recovery_entries = env_recovery_commands(status)
         if not recovery_entries:
@@ -340,18 +396,35 @@ def _lifecycle_manager(
     config_path: str | None = None,
     health_timeout: float = 60.0,
     shutdown_timeout: float = 10.0,
+    bind_mode: str | None = None,
 ) -> GatewayLifecycleManager:
     config = _load_config_or_exit(config_path)
     host = _resolve_lifecycle_host(bind=bind or "127.0.0.1", listen=listen)
+    run_bind_mode: str | None = None
     if not listen and (bind is None or bind == "127.0.0.1"):
         host = resolve_listen_address(None, default=config.host or "127.0.0.1")
+        env_host = os.environ.get("AGENTOS_LISTEN") or os.environ.get("AGENTOS_GATEWAY_HOST")
+        if bind_mode or (config.gateway.bind and not env_host):
+            # A bind mode travels to the spawned ``gateway run`` as itself, so
+            # ``tailnet`` keeps its loopback listener; ``host`` is still what
+            # the lifecycle manager records and probes.
+            try:
+                resolution = resolve_cli_bind(config, explicit_host=None, bind_mode=bind_mode)
+            except BindResolutionError as exc:
+                typer.echo(f"Error: {exc}", err=True)
+                raise typer.Exit(2) from exc
+            host = resolution.host
+            run_bind_mode = resolution.mode
     resolved_port = port if port is not None else config.port
+    explicit_target = bool(listen) or (bind is not None and bind != "127.0.0.1") or bool(bind_mode)
     return GatewayLifecycleManager(
         host=host,
         port=resolved_port,
         config_path=config_path or os.environ.get("AGENTOS_GATEWAY_CONFIG_PATH") or None,
         health_timeout=health_timeout,
         shutdown_timeout=shutdown_timeout,
+        bind_mode=run_bind_mode,
+        follow_record=not explicit_target,
     )
 
 
@@ -374,6 +447,11 @@ def start_gateway(
     config_path: str | None = typer.Option(None, "--config", help="Override config path"),
     health_timeout: float = typer.Option(60.0, "--timeout", help="Readiness wait timeout"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (overrides [gateway] bind)",
+    ),
 ) -> None:
     """Start the gateway in the background and wait for readiness."""
 
@@ -383,6 +461,7 @@ def start_gateway(
         listen=listen,
         config_path=config_path,
         health_timeout=health_timeout,
+        bind_mode=bind_mode if isinstance(bind_mode, str) else None,
     )
     _emit_lifecycle_result(_with_service_hint(manager.start()), json_output=json_output)
 
@@ -589,6 +668,11 @@ def status_gateway(
     gateway_url: str | None = typer.Option(None, "--gateway", help="Remote gateway URL"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
     deep: bool = False,
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (default: what gateway start recorded)",
+    ),
 ) -> None:
     """Inspect the managed gateway process without mutating state.
 
@@ -616,7 +700,13 @@ def status_gateway(
         )
         return
 
-    manager = _lifecycle_manager(port=port, bind=bind, listen=listen, config_path=config_path)
+    manager = _lifecycle_manager(
+        port=port,
+        bind=bind,
+        listen=listen,
+        config_path=config_path,
+        bind_mode=bind_mode if isinstance(bind_mode, str) else None,
+    )
     result = manager.status()
     version = None
     runtime = None
@@ -645,6 +735,11 @@ def stop_gateway(
     config_path: str | None = typer.Option(None, "--config", help="Override config path"),
     shutdown_timeout: float = typer.Option(10.0, "--timeout", help="Shutdown wait timeout"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (default: what gateway start recorded)",
+    ),
 ) -> None:
     """Stop the recorded gateway process."""
 
@@ -654,6 +749,7 @@ def stop_gateway(
         listen=listen,
         config_path=config_path,
         shutdown_timeout=shutdown_timeout,
+        bind_mode=bind_mode if isinstance(bind_mode, str) else None,
     )
     _emit_lifecycle_result(_with_service_hint(manager.stop()), json_output=json_output)
 
@@ -797,6 +893,11 @@ def restart_gateway(
         help="In-place restart only: cancel active turns instead of draining them",
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (default: what gateway start recorded)",
+    ),
 ) -> None:
     """Restart the gateway: the recorded process, or a healthy unmanaged one in place."""
 
@@ -807,6 +908,7 @@ def restart_gateway(
         config_path=config_path,
         health_timeout=health_timeout,
         shutdown_timeout=shutdown_timeout,
+        bind_mode=bind_mode if isinstance(bind_mode, str) else None,
     )
     status = manager.status()
     if status.state == "unmanaged":

@@ -277,7 +277,9 @@ cards for:
 - exported data files;
 - PDFs, slide decks, images, and other generated outputs.
 
-Images and audio play inline in the card. An artifact published as
+Images and audio play inline in the card. The console loads them, and every
+download, through short-lived ticketed URLs bound to its connection, so no
+token ever appears in a page URL. An artifact published as
 `application/vnd.agentos.chart+json` renders as an interactive candlestick
 chart instead of a download chip — the `gmgn-market` and `gmgn-token` skills use
 this for token price charts.
@@ -297,6 +299,11 @@ Use the approvals area when:
 - a command requires elevated permissions;
 - a channel or external action needs human confirmation;
 - unattended automation should pause before a risky operation.
+
+Settings → *Push notifications for approvals* sends a notification to this
+browser for every new approval, even with the console closed (HTTPS or
+`localhost` only); see
+[Approvals and Permissions](approvals-and-permissions.md#where-a-prompt-reaches-you).
 
 ## MCP Servers
 

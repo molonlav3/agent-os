@@ -27,6 +27,7 @@ import {
   artifactKind,
   artifactSizeLabel,
   artifactSummary,
+  artifactHasThumbnail,
   type Artifact,
   type ArtifactRendererDeps,
 } from './artifacts'
@@ -694,5 +695,165 @@ describe('createArtifactRenderer markets artifacts', () => {
     expect(container.querySelector('.msg-artifact-markets-group [data-markets-src]')).toBe(host)
     expect(container.querySelector('.msg-artifact-markets-group [data-trigger-src]')).toBeNull()
     expect(container.querySelector('[data-artifact-download]')).toBeNull()
+  })
+})
+
+/* ── ticketed media + downloads (lib/artifact-tickets.ts) ──────────────── */
+
+describe('artifactHasThumbnail', () => {
+  it('is true only for the still formats the gateway previews', () => {
+    expect(artifactHasThumbnail({ mime: 'image/png' })).toBe(true)
+    expect(artifactHasThumbnail({ mime: 'IMAGE/JPEG' })).toBe(true)
+    expect(artifactHasThumbnail({ mime: 'image/webp' })).toBe(true)
+    expect(artifactHasThumbnail({ mime: 'image/gif' })).toBe(false)
+    expect(artifactHasThumbnail({ mime: 'image/svg+xml' })).toBe(false)
+    expect(artifactHasThumbnail({ mime: 'audio/wav' })).toBe(false)
+  })
+})
+
+describe('createArtifactRenderer with tickets', () => {
+  const IMAGE: Artifact = {
+    id: 'i-1',
+    name: 'plot.png',
+    mime: 'image/png',
+    download_url: '/api/v1/artifacts/i-1',
+  }
+  const GIF: Artifact = { id: 'g-1', name: 'loop.gif', mime: 'image/gif' }
+  const AUDIO: Artifact = { id: 'a-1', name: 'clip.wav', mime: 'audio/wav' }
+  const FILE: Artifact = { id: 'x-1', name: 'report.xlsx', mime: 'application/zip' }
+  const SESSION = 'agent%3Amain%3Awebchat%3Atest'
+
+  function render(resolveTicket: ArtifactRendererDeps['resolveTicket'], artifacts: Artifact[]) {
+    const { deps } = chartRendererDeps({ resolveTicket })
+    const container = document.createElement('div')
+    container.innerHTML = createArtifactRenderer(deps).renderArtifacts(artifacts)
+    return container
+  }
+
+  it('leaves image and audio sources for the mount pass to fill', () => {
+    const container = render(vi.fn(), [IMAGE, GIF, AUDIO])
+    const [still, animated] = Array.from(container.querySelectorAll('img'))
+    expect(still).not.toHaveAttribute('src')
+    expect(still).toHaveAttribute('data-ticket-src', `/api/v1/artifacts/i-1?sessionKey=${SESSION}`)
+    expect(still).toHaveAttribute('data-ticket-variant', 'thumbnail')
+    // A GIF previews as itself.
+    expect(animated).not.toHaveAttribute('data-ticket-variant')
+    const audio = container.querySelector('audio')
+    expect(audio).not.toHaveAttribute('src')
+    expect(audio).toHaveAttribute('data-ticket-src', `/api/v1/artifacts/a-1?sessionKey=${SESSION}`)
+    // The download targets the renderer's other surfaces read are unchanged.
+    expect(container.querySelector('.msg-artifact-card--image')).toHaveAttribute(
+      'data-artifact-download',
+      '/api/v1/artifacts/i-1',
+    )
+  })
+
+  it('keeps the auth token out of every URL on the page', () => {
+    const container = render(vi.fn(), [IMAGE, AUDIO, FILE, CHART_ARTIFACT])
+    expect(container.innerHTML).not.toContain('token=')
+    expect(container.querySelector<HTMLElement>('[data-chart-src]')?.dataset.chartSrc).toBe(
+      `/api/v1/artifacts/art-1?sessionKey=${SESSION}`,
+    )
+  })
+
+  it('keeps direct sources without a resolver', () => {
+    const container = render(undefined, [IMAGE, AUDIO])
+    expect(container.querySelector('img')).toHaveAttribute(
+      'src',
+      `/api/v1/artifacts/i-1?sessionKey=${SESSION}&token=tok`,
+    )
+    expect(container.querySelector('[data-ticket-src]')).toBeNull()
+  })
+})
+
+describe('downloadArtifact with tickets', () => {
+  const REPORT: Artifact = { id: 'x-1', name: 'report.xlsx' }
+  let clicked: string[]
+  let clickSpy: { mockRestore: () => void }
+
+  beforeEach(() => {
+    clicked = []
+    clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      clicked.push(`${this.getAttribute('href')} ${this.download}`)
+    })
+    ;(URL as unknown as { createObjectURL: unknown }).createObjectURL = vi
+      .fn()
+      .mockReturnValue('blob:x')
+    ;(URL as unknown as { revokeObjectURL: unknown }).revokeObjectURL = vi.fn()
+  })
+  afterEach(() => {
+    clickSpy.mockRestore()
+    vi.unstubAllGlobals()
+    delete window.__AGENTOS_ENV__
+  })
+
+  it('hands a ticket straight to the browser on the gateway-served console', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const resolveTicket = vi.fn().mockResolvedValue('/api/v1/artifacts/download/c/t')
+    const { deps } = chartRendererDeps({ resolveTicket })
+
+    await createArtifactRenderer(deps).downloadArtifact(REPORT)
+
+    expect(resolveTicket).toHaveBeenCalledWith('/api/v1/artifacts/x-1', {
+      sessionKey: 'agent:main:webchat:test',
+    })
+    expect(clicked).toEqual(['/api/v1/artifacts/download/c/t report.xlsx'])
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('fetches the ticket without a header off gateway', async () => {
+    window.__AGENTOS_ENV__ = { apiOrigin: 'http://127.0.0.1:18791' }
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(['x']) })
+    vi.stubGlobal('fetch', fetchMock)
+    const resolveTicket = vi
+      .fn()
+      .mockResolvedValue('http://127.0.0.1:18791/api/v1/artifacts/download/c/t')
+    const { deps } = chartRendererDeps({ resolveTicket })
+
+    await createArtifactRenderer(deps).downloadArtifact(REPORT)
+
+    expect(fetchMock).toHaveBeenCalledWith('http://127.0.0.1:18791/api/v1/artifacts/download/c/t', {
+      method: 'GET',
+      headers: {},
+      credentials: 'same-origin',
+    })
+    expect(clicked).toEqual(['blob:x report.xlsx'])
+  })
+
+  it('falls back to the authenticated fetch when no ticket can be had', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(['x']) })
+    vi.stubGlobal('fetch', fetchMock)
+    const { deps } = chartRendererDeps({ resolveTicket: vi.fn().mockResolvedValue(null) })
+
+    await createArtifactRenderer(deps).downloadArtifact(REPORT)
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/v1/artifacts/x-1?sessionKey='),
+      expect.objectContaining({
+        headers: {
+          Authorization: 'Bearer tok',
+          'x-agentos-session-key': 'agent:main:webchat:test',
+        },
+      }),
+    )
+  })
+
+  it('tells the user when the gateway refuses the file', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const toast = vi.fn()
+    const { deps } = chartRendererDeps({
+      resolveTicket: vi.fn().mockRejectedValue(new Error('artifact not found')),
+      toast,
+    })
+
+    await createArtifactRenderer(deps).downloadArtifact(REPORT)
+
+    expect(toast).toHaveBeenCalledWith('Download failed: artifact not found', 'warn', 3500)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(clicked).toEqual([])
   })
 })

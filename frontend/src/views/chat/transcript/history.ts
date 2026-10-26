@@ -750,6 +750,28 @@ export function createHistoryRenderer(deps: HistoryRenderDeps) {
           if (full.role === 'assistant' && fullTools.length > 0) {
             deps.reconstructToolCalls(row, fullTools)
           }
+          // The re-rendered body dropped the row's attachments and artifacts:
+          // put them back, and let the mount pass fill their media (ticketed
+          // URLs, charts) as on any replayed row.
+          const fullBody = row.querySelector<HTMLElement>('.msg-body')
+          if (fullBody) {
+            const fullAttachments = historyMessageRecords(full, 'attachments')
+            if (fullAttachments.length > 0) {
+              fullBody.classList.add('msg-body--has-attachments')
+              const chips = fullAttachments
+                .map((attachment) => deps.renderMessageAttachmentHtml(attachment))
+                .join('')
+              fullBody.insertAdjacentHTML(
+                'beforeend',
+                `<div class="msg-attachments">${chips}</div>`,
+              )
+            }
+            const fullArtifacts = historyMessageArtifacts(full)
+            if (fullArtifacts.length > 0) {
+              fullBody.insertAdjacentHTML('beforeend', deps.renderArtifacts(fullArtifacts))
+              deps.mountCharts?.(fullBody)
+            }
+          }
           deps.attachHoverActions(row, full.role)
         })
       }

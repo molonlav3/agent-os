@@ -11,7 +11,6 @@ from urllib.parse import urlsplit
 import structlog
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Route, WebSocketRoute
@@ -67,45 +66,31 @@ def rpc_status_code(result: Any, default: int = 500) -> int:
 
 
 def resolve_trusted_hosts(config: GatewayConfig) -> list[str]:
-    """Return the ``LoopbackHostMiddleware`` allowlist for the current bind.
+    """Return the extra hostnames ``LoopbackHostMiddleware`` admits.
 
-    On a loopback bind the middleware itself admits every literal loopback
-    ``Host`` via the shared ``access.is_loopback_address`` predicate — the
-    same one the startup guard and the WS-origin guard use, so any bind the
-    gateway blesses as loopback (all of ``127.0.0.0/8``, ``::1``,
-    ``localhost``, IPv4-mapped forms) is reachable at its own address. This
-    list only carries the extra hostnames from ``control_ui.allowed_origins``
-    (a reverse-proxied UI on another name). A DNS-rebinding page can use none
-    of them: its request carries the attacker's foreign hostname in ``Host``
-    (CVE-2026-53869 class).
+    Every literal loopback ``Host`` is admitted by the middleware itself via
+    the shared ``access.is_loopback_address`` predicate — the same one the
+    startup guard and the origin policy use — and off loopback the policy
+    adds IP literals and private names (``OriginPolicy.host_allowed``). This
+    list carries the hostnames of the declared origins on top:
+    ``control_ui.allowed_origins``, explicit ``cors.allowed_origins`` entries
+    and ``[gateway] public_origin`` (a reverse-proxied UI on another name). A
+    DNS-rebinding page can use none of them: its request carries the
+    attacker's foreign hostname in ``Host`` (CVE-2026-53869 class).
 
-    On a non-loopback bind the gateway only starts past
-    ``enforce_public_bind_auth_guard`` — authentication is enabled — and the
-    deployment deliberately serves other names,
-    so we do not constrain ``Host`` (``["*"]``).
+    Before the origin policy, a non-loopback bind answered ``["*"]`` and took
+    any ``Host``; it now gets the same declared list.
     """
-    from agentos.gateway.access import is_loopback_bind
+    from agentos.gateway.origin_policy import configured_origins, warn_unparseable_origins
 
-    if not is_loopback_bind(config.host):
-        return ["*"]
-
+    warn_unparseable_origins(config)
     hosts: list[str] = []
-    for origin in config.control_ui.allowed_origins:
+    for origin in configured_origins(config):
         try:
             hostname = urlsplit(origin).hostname
         except ValueError:
             hostname = None
-        if not hostname:
-            # A dead entry would silently match nothing here AND in the
-            # WS-origin guard — tell the operator at startup instead.
-            log.warning(
-                "gateway.allowed_origin_unparseable",
-                origin=origin,
-                hint="control_ui.allowed_origins entries must be full origins: "
-                "scheme://host[:port], e.g. https://agent.example.com",
-            )
-            continue
-        if hostname not in hosts:
+        if hostname and hostname not in hosts:
             hosts.append(hostname)
     return hosts
 
@@ -302,8 +287,11 @@ def create_gateway_app(
                 if operator:
                     agent_auth["operatorSecret"] = operator
             access = get_agent_surface().attach(access, agent_auth)
+        return _rpc_ctx(access)
+
+    def _rpc_ctx(access: Any, conn_id: str = "http") -> RpcContext:
         return RpcContext(
-            conn_id="http",
+            conn_id=conn_id,
             access=access,
             session_manager=session_manager,
             config=config,
@@ -530,12 +518,14 @@ def create_gateway_app(
             status_code=_rpc_status_code(result),
         )
 
-    # Capture the bind posture once, at app-build time. config.apply mutates
-    # config.host in place without rebinding the live socket, so the guards
-    # must not re-read it per request (P2).
+    # Capture the bind posture and the origin policy once, at app-build time.
+    # config.apply mutates config.host in place without rebinding the live
+    # socket, so the guards must not re-read it per request (P2).
     from agentos.gateway.access import is_loopback_bind
+    from agentos.gateway.origin_policy import OriginPolicyCORSMiddleware, build_origin_policy
 
     bind_is_loopback = is_loopback_bind(config.host)
+    origin_policy = build_origin_policy(config, bind_is_loopback=bind_is_loopback)
 
     async def ws_endpoint(ws: WebSocket) -> None:
         await handle_ws_connection(
@@ -561,6 +551,7 @@ def create_gateway_app(
             memory_retrievers=memory_retrievers,
             bind_is_loopback=bind_is_loopback,
             auth_guard=auth_guard,
+            origin_policy=origin_policy,
         )
 
     # ── Routes ───────────────────────────────────────────────────────────────
@@ -606,21 +597,27 @@ def create_gateway_app(
 
     middleware = [
         Middleware(ErrorHandlingMiddleware, debug=config.debug),
-        # DNS-rebinding guard: reject foreign Host headers on a loopback bind
-        # (no-op ["*"] on a public bind, which is already auth-gated).
-        Middleware(LoopbackHostMiddleware, allowed_hosts=resolve_trusted_hosts(config)),
+        # DNS-rebinding guard: reject Host headers naming a host this gateway
+        # never declared (loopback, declared origins, and off loopback its own
+        # addresses and private names).
+        Middleware(
+            LoopbackHostMiddleware,
+            allowed_hosts=resolve_trusted_hosts(config),
+            policy=origin_policy,
+        ),
         # Cross-site browser guard for the HTTP surface: reject foreign page
-        # Origins before CORS can reflect them (same predicate as the WS
-        # handshake guard). No-op without an Origin header, and on
-        # non-loopback (auth-gated) binds.
+        # Origins before CORS can reflect them (the same OriginPolicy as the WS
+        # handshake guard, on every bind). No-op without an Origin header.
         Middleware(
             LoopbackOriginMiddleware,
             config=config,
             bind_is_loopback=bind_is_loopback,
+            policy=origin_policy,
         ),
+        # CORS reflects only origins the policy allows; never ``*``.
         Middleware(
-            CORSMiddleware,
-            allow_origins=config.cors.allowed_origins,
+            OriginPolicyCORSMiddleware,
+            policy=origin_policy,
             allow_credentials=config.cors.allow_credentials,
             allow_methods=config.cors.allowed_methods,
             allow_headers=config.cors.allowed_headers,
@@ -673,6 +670,11 @@ def create_gateway_app(
     @contextlib.asynccontextmanager
     async def _lifespan(_app: Starlette) -> AsyncIterator[None]:
         yield
+        # SIGTERM ends uvicorn without GatewayServer.close(); shutdown hooks
+        # still get their turn (once per process, whichever path is first).
+        from agentos.gateway.lifecycle_hooks import run_shutdown_hooks_once
+
+        await run_shutdown_hooks_once(config, "lifespan")
         _close_browser_sessions()
         _record_clean_shutdown(_app)
 
@@ -684,6 +686,7 @@ def create_gateway_app(
     )
     app.state.diagnostics_state = diagnostics_state
     app.state.auth_guard = auth_guard
+    app.state.origin_policy = origin_policy
 
     # Bridge upload endpoint: self-hosted multipart sink that
     # returns an opaque file_uuid the chat.send validator can resolve.
@@ -708,6 +711,71 @@ def create_gateway_app(
         app,
         config=config,
         session_manager=session_manager,
+    )
+    from agentos.gateway.download_grants import register_download_routes  # noqa: PLC0415
+
+    register_download_routes(app, config=config, session_manager=session_manager)
+    from agentos.gateway.inbound_hooks import register_inbound_hook_routes  # noqa: PLC0415
+
+    async def _hook_dispatch(
+        session_key: str, message: str, provenance: dict[str, Any]
+    ) -> dict[str, Any]:
+        # The hooks token is not a Control credential: the turn runs under an
+        # admitted but unbound context, which every operator-only check (the
+        # trading guardrails) treats as an agent's.
+        from agentos.gateway.access import ConnectionSurface
+        from agentos.gateway.agent_surface import AgentBinding
+        from agentos.gateway.auth import AccessContext
+
+        access = AccessContext(
+            surface=ConnectionSurface.CONTROL,
+            admitted=True,
+            credential_verified=True,
+            agent=AgentBinding(via="unbound"),
+        )
+        result = await dispatcher.dispatch(
+            "_hook",
+            "chat.send",
+            {"sessionKey": session_key, "message": message, "inputProvenance": provenance},
+            _rpc_ctx(access, conn_id="hook"),
+        )
+        if result.ok:
+            return dict(result.payload or {})
+        error = result.error
+        details = error.details if error is not None else None
+        return {
+            "ok": False,
+            "error": error.message if error else "error",
+            "code": error.code if error else ErrorCode.INTERNAL_ERROR.value,
+            "detail": details.get("code") if isinstance(details, dict) else None,
+        }
+
+    def _hook_wake(reason: str) -> bool:
+        if heartbeat_loop is None:
+            return False
+        heartbeat_loop.request_now(reason=reason)
+        return True
+
+    register_inbound_hook_routes(
+        app,
+        config=config,
+        dispatch_message=_hook_dispatch,
+        wake=_hook_wake,
+        auth_guard=auth_guard,
+    )
+    from agentos.gateway.tools_invoke import register_tools_invoke_route  # noqa: PLC0415
+
+    register_tools_invoke_route(
+        app,
+        config=config,
+        make_ctx=_make_ctx,
+        tool_registry=tool_registry,
+        runtime={
+            "session_manager": session_manager,
+            "task_runtime": task_runtime,
+            "cron_scheduler": cron_scheduler,
+            "channel_manager": channel_manager,
+        },
     )
     register_audio_transcription_routes(app, config=config)
 

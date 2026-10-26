@@ -783,6 +783,30 @@ describe('oversized history rows (chat.history placeholders → chat.entry)', ()
     expect(thread.querySelector('.msg-truncated')).toBeNull()
   })
 
+  it('puts the artifacts and attachments of the full row back and mounts their media', async () => {
+    const thread = document.createElement('div')
+    document.body.appendChild(thread)
+    const full = {
+      role: 'assistant',
+      text: 'The whole answer, all of it',
+      message_id: 'msg-big',
+      attachments: [{ name: 'notes.txt', type: 'text/plain' }],
+      artifacts: [{ id: 'art-1', name: 'plot.png', mime: 'image/png' }],
+    }
+    const fetchEntry = vi.fn().mockResolvedValue(full)
+    const mountCharts = vi.fn()
+    const renderer = createHistoryRenderer(historyDeps(thread, { fetchEntry, mountCharts }))
+    renderer.renderHistoryMessages([placeholder], pagingState([placeholder]))
+
+    thread.querySelector<HTMLButtonElement>('.msg-truncated__show')!.click()
+    await vi.waitFor(() => expect(thread.textContent).toContain('The whole answer, all of it'))
+    const body = thread.querySelector<HTMLElement>('.msg-body')!
+    expect(body.querySelector('.msg-artifact-chip')?.textContent).toBe('plot.png')
+    expect(body.querySelector('.msg-attachments .msg-file-chip')?.textContent).toBe('notes.txt')
+    // The mount pass is what trades gateway URLs for tickets.
+    expect(mountCharts).toHaveBeenCalledWith(body)
+  })
+
   it('keeps the notice and reports a failed fetch', async () => {
     const thread = document.createElement('div')
     document.body.appendChild(thread)

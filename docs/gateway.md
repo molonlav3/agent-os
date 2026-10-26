@@ -201,6 +201,27 @@ agentos gateway run --port 18792
 agentos gateway status --port 18792
 ```
 
+Pick where the gateway listens with a bind mode:
+
+| Mode | Listens on | Notes |
+| --- | --- | --- |
+| `loopback` | `127.0.0.1` | The default. Only this machine can connect. |
+| `lan` | `0.0.0.0` (every interface) | Token auth is required; the gateway refuses to start without it. |
+| `tailnet` | the Tailscale IPv4 **and** `127.0.0.1` | Reads the address from `tailscale ip -4`. Fails to start if Tailscale is missing, stopped or logged out — it never falls back to `0.0.0.0`. Token auth is required. |
+| `custom` | the `host` you configured | What `--listen` / `--bind` select. |
+
+```sh
+agentos gateway run --bind-mode tailnet
+agentos gateway start --bind-mode lan
+```
+
+Or persist it:
+
+```toml
+[gateway]
+bind = "tailnet"
+```
+
 Bind to a specific host:
 
 ```sh
@@ -208,7 +229,12 @@ agentos gateway run --listen 127.0.0.1 --port 18791
 ```
 
 `--listen` is an alias for the bind host and wins over `--bind` when both are
-provided.
+provided; either one means bind mode `custom`. `gateway start` records the
+bind mode it used, so a plain `gateway status`, `gateway stop` or `gateway
+restart` finds that gateway again (`--bind-mode` is accepted there too). On
+macOS the Tailscale app's bundled CLI is used when `tailscale` is not on PATH. Precedence, highest first:
+`--listen`, `--bind`, `--bind-mode`, `AGENTOS_LISTEN`, `AGENTOS_GATEWAY_HOST`,
+`[gateway] bind`, the `host` key, `127.0.0.1`.
 
 ## Safety Defaults
 
@@ -218,7 +244,7 @@ gateway controls chat, tools, sessions, channels, approvals, and configuration.
 Public binding is opt-in:
 
 ```sh
-agentos gateway run --listen 0.0.0.0 --port 18791
+agentos gateway run --bind-mode lan --port 18791
 ```
 
 Do not expose a gateway to an untrusted network without token auth and a network
@@ -226,6 +252,46 @@ boundary you understand. To reach a gateway from another machine, prefer
 keeping it on loopback and tunnelling in (SSH, Tailscale Serve) or putting an
 authenticating reverse proxy in front: see [`remote-access.md`](remote-access.md).
 `agentos doctor` flags risky exposure settings.
+
+### Browser origins
+
+Every bind applies the same origin policy to the WebSocket handshake, to
+`/api/*` requests that carry an `Origin` header, and to CORS. A browser page may
+drive the gateway when its origin is:
+
+1. listed in `control_ui.allowed_origins`, `cors.allowed_origins` or
+   `[gateway] public_origin`, or is the gateway's own `http://localhost:<port>` /
+   `http://127.0.0.1:<port>` (always allowed, so a LAN bind never locks out the
+   browser on the gateway's machine);
+2. the same origin as the address the request was sent to, when that address is
+   private: loopback, `10/8`, `172.16/12`, `192.168/16`, link-local,
+   `100.64.0.0/10` (tailnet addresses), IPv6 `fc00::/7`, or a `.local` /
+   `.ts.net` name. Opening `http://192.168.1.20:18791/control/` on a LAN bind
+   works with no configuration;
+3. a loopback origin on another port (a dev server) when the connection itself
+   comes from this machine and not through a proxy.
+
+Anything else is refused with `403` — for a WebSocket, at the handshake, before
+the upgrade — and CORS never answers `*`. On a loopback bind only loopback addresses count for
+rule 2. Requests without an `Origin` header — the CLI, `curl`, scripts — are not
+affected; token auth still applies.
+
+The `Host` header is checked too (a DNS-rebinding guard): the gateway answers to
+loopback, to the hostnames of the declared origins, and off loopback to any IP
+address and `.local` / `.ts.net` names. A request for any other name gets `400`
+naming the setting to change.
+
+When you serve the console from a public address or a DNS name, declare the
+origin you open it at:
+
+```toml
+[gateway]
+public_origin = "https://agent.example.com"
+```
+
+Without it, the gateway refuses to start the Control UI on a specific public
+address (it would load and then fail every request). The fix is in the error
+message; `control_ui.enabled = false` keeps the API running without the console.
 
 ## Configuration Path
 

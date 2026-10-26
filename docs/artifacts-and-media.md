@@ -30,6 +30,20 @@ Create a one-page HTML dashboard from this data and publish it as an artifact.
 Generate a PDF briefing with sources and publish the final file.
 ```
 
+### Download URLs
+
+Clients fetch an artifact or an attached file through a ticketed URL: the
+`artifacts.download` RPC returns `/api/v1/artifacts/download/<conn_id>/<ticket>`,
+good for five minutes and for as long as the WebSocket connection that asked
+for it stays open. The URL needs no header, serves byte ranges and a PNG
+thumbnail (`?variant=thumbnail`, still images up to 1200 px), and is served
+with a sandboxing `Content-Security-Policy` and `Content-Disposition:
+attachment`, so a generated HTML file never runs as a page of the gateway.
+The older `/api/v1/artifacts/{id}?sessionKey=` and
+`/api/v1/attachments/{sha256}?sessionKey=` URLs still work for this release
+(`[artifacts] legacy_session_key_urls`); see
+[HTTP API → Ticketed downloads](http-api.md#ticketed-downloads).
+
 ## When to Use Artifacts Instead of Chat
 
 Use artifacts for:

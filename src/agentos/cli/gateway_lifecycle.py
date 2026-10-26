@@ -121,8 +121,18 @@ class GatewayLifecycleManager:
         health_timeout: float = 60.0,
         shutdown_timeout: float = 10.0,
         poll_interval: float = 0.2,
+        bind_mode: str | None = None,
+        follow_record: bool = False,
     ) -> None:
         self.host = host
+        # No explicit host or bind mode was given: a record written by
+        # ``gateway start --bind-mode`` names the target (its host is resolved
+        # at start, e.g. the tailnet address), so stop/status/restart adopt it
+        # instead of reporting a target mismatch.
+        self.follow_record = follow_record
+        # Forwarded to the spawned ``gateway run`` instead of ``--listen``
+        # when set (``tailnet`` must resolve its own listeners).
+        self.bind_mode = bind_mode if bind_mode and bind_mode != "custom" else None
         self.probe_host = _health_probe_host(host)
         self.port = port
         self.config_path = str(config_path) if config_path else None
@@ -132,8 +142,25 @@ class GatewayLifecycleManager:
         self.pidfile = gateway_pidfile_path()
         self.log_path = gateway_log_path()
 
+    def _adopt_record(self, record: dict[str, Any] | None) -> None:
+        if not self.follow_record or not isinstance(record, dict):
+            return
+        mode = record.get("bindMode")
+        host = record.get("host")
+        if not isinstance(mode, str) or not mode or not isinstance(host, str) or not host:
+            return
+        try:
+            if int(record.get("port", -1)) != self.port:
+                return
+        except (TypeError, ValueError):
+            return
+        self.host = host
+        self.probe_host = _health_probe_host(host)
+        self.bind_mode = mode if mode != "custom" else None
+
     def status(self) -> GatewayLifecycleResult:
         record, error = self._read_pidfile()
+        self._adopt_record(record)
         if error is not None:
             return self._result(
                 "status",
@@ -444,6 +471,8 @@ class GatewayLifecycleManager:
             record["probeHost"] = self.probe_host
         if self.config_path:
             record["configPath"] = self.config_path
+        if self.bind_mode:
+            record["bindMode"] = self.bind_mode
         return record
 
     def _record_matches_target(self, record: dict[str, Any]) -> bool:
@@ -479,8 +508,7 @@ class GatewayLifecycleManager:
             "agentos.cli.main",
             "gateway",
             "run",
-            "--listen",
-            self.host,
+            *(["--bind-mode", self.bind_mode] if self.bind_mode else ["--listen", self.host]),
             "--port",
             str(self.port),
         ]

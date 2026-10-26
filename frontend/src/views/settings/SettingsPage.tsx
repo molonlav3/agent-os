@@ -20,6 +20,7 @@ import '@/i18n/en/settings'
 import { SetupPage } from '@/views/setup/SetupPage'
 import { ENV_QUERY_KEY, type EnvListResponse } from '@/views/env/logic'
 import { ConfigPage } from '@/views/config/ConfigPage'
+import { WebPushToggle } from './WebPushToggle'
 import {
   loadSettingsSnapshot,
   readinessFromSnapshot,
@@ -240,6 +241,8 @@ export function SettingsPage() {
           </button>
         </div>
       </section>
+
+      <WebPushToggle />
 
       {snapshot?.diskDiverged ? (
         <div className="settings-load-error tone-danger" role="alert">

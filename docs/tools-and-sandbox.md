@@ -66,6 +66,35 @@ Approvals are most important for:
 Use the Web UI approvals page when you want durable review outside the chat
 scrollback.
 
+## Calling a Tool Directly
+
+`POST /api/v1/tools/invoke` runs one tool without a model turn, for scripts,
+CI and the desktop: `{"tool": "web_search", "args": {...}}`. It applies the
+same policy an agent's tool call gets — the `[tools]` profile, allow and deny
+lists, the agent's own entry, the runtime capability surface and the dispatch
+policy chain — in an unattended, sandboxed context, so a tool that needs an
+approval refuses (`403` with `details.code = "APPROVAL_REQUIRED"` and the
+`details.approval_id` when one was queued). `dry_run: true` returns the
+resolved policy without running anything.
+
+It denies by default: only tools whose registration declares them read-only
+run. A name floor holds on top, whatever the configuration says: shell,
+terminal and code execution, file and memory writes (including the `memory`
+tool, `http_request` downloads, document creation, `publish_artifact`,
+`env_set`), project and session renames, `sessions_spawn`, `sessions_send`,
+`subagents`, `acp`, `message`, `cron` and scheduler tools, `gateway`,
+`browser`, `router_control`, paid media generation and trading tools. Those
+answer `404`, exactly like a tool that does not exist, and arguments that write
+a file (`output_path` and the like) are refused for every tool. Lift one tool
+at a time in `agentos.toml` (config RPC writes cannot add an entry):
+
+```toml
+[tools.invoke]
+allow = ["create_pdf_report"]   # tool names, never patterns
+```
+
+Full status table: [HTTP API → Direct tool calls](http-api.md#direct-tool-calls).
+
 ## Workspace Controls
 
 Read-side restriction:

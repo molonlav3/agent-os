@@ -21,7 +21,12 @@ import '@/i18n/en/chat'
 
 import type { StreamEventPayload } from '../types'
 import { createToolRenderer, type ToolRenderer, type ToolRendererDeps } from './tools'
-import { createArtifactRenderer, type Artifact, type ArtifactRenderer } from './artifacts'
+import {
+  createArtifactRenderer,
+  type Artifact,
+  type ArtifactRenderer,
+  type ArtifactRendererDeps,
+} from './artifacts'
 import {
   createRouterFxRenderer,
   createRouterFxRegistry,
@@ -341,6 +346,11 @@ export interface StreamControllerDeps {
    * artifact preview/download URLs (chat.js:7575/7599/7657). Default: "".
    */
   getAuthToken?: () => string
+  /**
+   * Ticketed file URLs for artifact previews and downloads (artifacts.ts
+   * `resolveTicket`, lib/artifact-tickets.ts). Default: absent (legacy URLs).
+   */
+  resolveTicket?: ArtifactRendererDeps['resolveTicket']
   /**
    * chat.js `UI.toast` — a transient toast surface (used by the artifact
    * download-failure path, chat.js:7667). Production injects Sonner; the default
@@ -1584,6 +1594,7 @@ export function createStreamController(
     toast,
     diag,
     mountCharts: deps.mountCharts,
+    resolveTicket: deps.resolveTicket,
   })
 
   /* ── compaction renderer (chat.js:2916-3397 + 8654-8710, compaction.ts) ── */

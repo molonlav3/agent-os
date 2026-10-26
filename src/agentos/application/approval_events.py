@@ -9,7 +9,7 @@ the frames to Control connections as ``approval.requested`` /
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import structlog
@@ -93,6 +93,9 @@ def approval_display_item(pending: dict[str, Any], *, mode: str) -> dict[str, An
             params.get("pluginId", params.get("action_kind", "Unknown")),
         ),
         "sessionKey": params.get("sessionKey", ""),
+        # The requesting session and its subagent / coding-agent ancestors:
+        # a parent's view matches a child's prompt on this.
+        "audienceSessionKeys": list(pending.get("audience_session_keys") or []),
         "agent": params.get("agent", ""),
         "args": params.get("args", params.get("permissions")),
         "command": _command(params),
@@ -113,14 +116,22 @@ def approval_requested_payload(
     created_at: float | None,
     expires_at: float | None,
     mode: str,
+    audience_session_keys: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """``approval.requested``: summary fields (unknown ones omitted) plus the display item."""
+    """``approval.requested``: summary fields (unknown ones omitted) plus the display item.
+
+    ``audience_session_keys`` lists the sessions whose viewers should see the
+    prompt (the requester first, then its ancestors); omitted when empty.
+    """
 
     p = params if isinstance(params, dict) else {}
     payload: dict[str, Any] = {"id": approval_id, "namespace": namespace}
     session_key = p.get("sessionKey") or p.get("session_key")
     if isinstance(session_key, str) and session_key:
         payload["session_key"] = session_key
+    audience = [key for key in audience_session_keys if key]
+    if audience:
+        payload["audience_session_keys"] = audience
     if created_at is not None:
         payload["created_at"] = created_at
     if expires_at is not None:
@@ -138,6 +149,7 @@ def approval_requested_payload(
             "namespace": namespace,
             "params": p,
             "created_at": created_at,
+            "audience_session_keys": audience,
         },
         mode=mode,
     )

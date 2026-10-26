@@ -716,12 +716,18 @@ def gateway_run(
     ),
     debug: bool = typer.Option(False, "--debug", help="Enable debug mode"),
     config_path: str | None = typer.Option(None, "--config", help="Override config path."),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (overrides [gateway] bind)",
+    ),
 ) -> None:
     """Start the ASGI gateway server.
 
-    Precedence for the bind address: --listen > --bind > AGENTOS_LISTEN >
-    AGENTOS_GATEWAY_HOST > default (127.0.0.1). Binding to 0.0.0.0 or :: is
-    opt-in only — the gateway's default auth assumes loopback scope.
+    Precedence for the bind address: --listen > --bind > --bind-mode >
+    AGENTOS_LISTEN > AGENTOS_GATEWAY_HOST > [gateway] bind > host > default
+    (127.0.0.1). Binding to 0.0.0.0 or :: is opt-in only — the gateway's
+    default auth assumes loopback scope.
     """
     from agentos.cli.gateway_cmd import run_gateway
 
@@ -731,6 +737,7 @@ def gateway_run(
         listen=listen,
         debug=debug,
         config_path=config_path,
+        bind_mode=bind_mode,
     )
 
 
@@ -752,6 +759,11 @@ def gateway_start(
     config_path: str | None = typer.Option(None, "--config", help="Override config path."),
     health_timeout: float = typer.Option(60.0, "--timeout", help="Readiness wait timeout"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (overrides [gateway] bind)",
+    ),
 ) -> None:
     """Start the gateway in the background and wait for readiness."""
     from agentos.cli.gateway_cmd import start_gateway
@@ -763,6 +775,7 @@ def gateway_start(
         config_path=config_path,
         health_timeout=health_timeout,
         json_output=json_output,
+        bind_mode=bind_mode,
     )
 
 
@@ -793,6 +806,11 @@ def gateway_status(
         "--deep",
         help="Also report the installed launchd/systemd service (agentos gateway install).",
     ),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (default: what gateway start recorded)",
+    ),
 ) -> None:
     """Inspect the managed gateway process without mutating state."""
     from agentos.cli.gateway_cmd import status_gateway
@@ -805,6 +823,7 @@ def gateway_status(
         gateway_url=gateway_url,
         json_output=json_output,
         deep=deep,
+        bind_mode=bind_mode,
     )
 
 
@@ -864,6 +883,11 @@ def gateway_stop(
     config_path: str | None = typer.Option(None, "--config", help="Override config path."),
     shutdown_timeout: float = typer.Option(10.0, "--timeout", help="Shutdown wait timeout"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (default: what gateway start recorded)",
+    ),
 ) -> None:
     """Stop the recorded gateway process."""
     from agentos.cli.gateway_cmd import stop_gateway
@@ -875,6 +899,7 @@ def gateway_stop(
         config_path=config_path,
         shutdown_timeout=shutdown_timeout,
         json_output=json_output,
+        bind_mode=bind_mode,
     )
 
 
@@ -904,6 +929,11 @@ def gateway_restart(
         help="In-place restart only: cancel active turns instead of draining them",
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    bind_mode: str | None = typer.Option(
+        None,
+        "--bind-mode",
+        help="loopback | lan | tailnet | custom (default: what gateway start recorded)",
+    ),
 ) -> None:
     """Restart the gateway: the recorded process, or a healthy unmanaged one in place."""
     from agentos.cli.gateway_cmd import restart_gateway
@@ -917,6 +947,7 @@ def gateway_restart(
         shutdown_timeout=shutdown_timeout,
         force=force,
         json_output=json_output,
+        bind_mode=bind_mode,
     )
 
 

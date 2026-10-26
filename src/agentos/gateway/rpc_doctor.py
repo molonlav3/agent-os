@@ -607,6 +607,54 @@ def _safe_mode_findings() -> list[HealthFinding]:
     ]
 
 
+def _config_reload_findings(ctx: RpcContext) -> list[HealthFinding]:
+    """Restart-only config changes still pending, and a config file edit that was refused."""
+    from agentos.gateway.config_commit import pending_restart_metadata
+    from agentos.gateway.config_watcher import last_reload_status
+
+    findings: list[HealthFinding] = []
+    config = getattr(ctx, "config", None)
+    pending, reasons = pending_restart_metadata(config) if config is not None else (False, [])
+    status = last_reload_status()
+    if pending:
+        findings.append(
+            HealthFinding(
+                id="gateway.config.restart_pending",
+                severity="warn",
+                surface="gateway",
+                title="Config changes wait for a gateway restart",
+                detail=(
+                    "Changes to "
+                    + ", ".join(reasons)
+                    + " are saved, but parts of the gateway read them only at startup; "
+                    "they take full effect after a restart."
+                ),
+                evidence={"reasons": reasons, "paths": list(status.restart_paths)},
+                fix_steps=[FixStep(label="Restart the gateway", command="agentos gateway restart")],
+                restart_required=True,
+            )
+        )
+    if status.status == "invalid":
+        findings.append(
+            HealthFinding(
+                id="gateway.config.reload_skipped",
+                severity="warn",
+                surface="gateway",
+                title="The config file has an error; the gateway kept its last good config",
+                detail=status.error or "The edited config file did not validate.",
+                evidence={"at": status.at},
+                fix_steps=[
+                    FixStep(
+                        label="Fix the file",
+                        detail="Correct the setting named above and save; the gateway "
+                        "applies the file again on the next save.",
+                    )
+                ],
+            )
+        )
+    return findings
+
+
 @_d.method("doctor.status")
 async def _handle_doctor_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if params is not None and not isinstance(params, dict):
@@ -660,6 +708,7 @@ async def _handle_doctor_status(params: dict | None, ctx: RpcContext) -> dict[st
 
     for surface, collect, evaluate in collectors:
         findings.extend(await _evaluate_collection(surface, collect, evaluate))
+    findings.extend(_config_reload_findings(ctx))
 
     config_path = _config_path(ctx)
     findings = _with_config_recovery_steps(findings, config_path)

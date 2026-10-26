@@ -78,8 +78,16 @@ lockout_seconds = 300
 exempt_loopback = true
 ```
 
-`/health`, `/ready` and `/startupz` never require a token. Cross-origin browser requests are
-governed by CORS configuration regardless of auth mode.
+`/health`, `/ready` and `/startupz` never require a token. Browser requests
+that carry an `Origin` header follow the gateway's origin policy on every bind
+— declared origins, a private address opened as itself, or a loopback origin
+on this machine — and CORS reflects only those origins, never `*`; see
+[Gateway → Browser origins](gateway.md#browser-origins).
+
+Two route families authenticate themselves instead of with the gateway token:
+ticketed downloads (`/api/v1/artifacts/download/...`, the ticket is the
+credential) and inbound webhooks (`/api/v1/hooks/...`, their own `[hooks]
+token`).
 
 ## Liveness and Readiness
 
@@ -136,9 +144,12 @@ Queue changes are also pushed over the WebSocket to Control connections (never
 to channel or node connections, nor to a connection holding an agent token),
 for every namespace (`exec`, `plugin`, `acp`, `acp_elicitation`):
 
-- `approval.requested` — `{id, namespace, session_key, created_at, expires_at,
-  summary, tool, command, approval}` (fields that do not apply are omitted;
-  `approval` is the item exactly as `GET /api/approvals` lists it).
+- `approval.requested` — `{id, namespace, session_key, audience_session_keys,
+  created_at, expires_at, summary, tool, command, approval}` (fields that do
+  not apply are omitted; `approval` is the item exactly as `GET /api/approvals`
+  lists it, with the same audience as `audienceSessionKeys`).
+  `audience_session_keys` is the requesting session followed by the sessions
+  that spawned it, so a parent session's view can match a child's prompt.
 - `approval.resolved` — `{id, namespace, decision, resolved_by, resolved_at}`,
   `decision` being `approved`, `denied`, `expired` or `cancelled` (its run was
   aborted); `resolved_by` is `operator`, `policy`, `session_elevation`,
@@ -154,9 +165,44 @@ catch up on what happened while the socket was down.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/api/v1/files/upload` | Upload a file; returns an opaque id for `chat.send`. |
-| `GET` | `/api/v1/attachments/{sha256}` | Fetch an attachment by content hash. |
-| `GET` | `/api/v1/artifacts/{artifact_id}` | Fetch a generated artifact. |
+| `GET`, `HEAD` | `/api/v1/artifacts/download/{conn_id}/{ticket}` | Fetch an artifact or attachment through a ticket minted with the `artifacts.download` RPC. No `Authorization` header. |
+| `GET` | `/api/v1/attachments/{sha256}?sessionKey=` | Deprecated: fetch an attachment by content hash. |
+| `GET` | `/api/v1/artifacts/{artifact_id}?sessionKey=` | Deprecated: fetch a generated artifact. |
 | `POST` | `/api/audio/transcribe` | Transcribe audio to text. |
+
+### Ticketed downloads
+
+Over the WebSocket, ask for a download URL:
+
+```json
+{"type": "req", "id": "1", "method": "artifacts.download",
+ "params": {"session_key": "agent:main:webchat:default",
+            "artifact_id": "art-…", "transport": "http"}}
+```
+
+Use `attachment_sha256` (plus the display `name` and `mime`) instead of
+`artifact_id` for a file a user attached. The answer carries `url`
+(`/api/v1/artifacts/download/<conn_id>/<ticket>`), `expiresAt` (epoch ms),
+`ttlSeconds`, `name`, `mime` and `size`. The ticket is 32 random bytes, lives
+five minutes, is bound to the WebSocket connection that minted it and dies
+when that connection closes; a connection holds at most 128 live tickets (the
+oldest goes first). The URL works for `<img>`, `<audio>`, `fetch()` and plain
+links without a header.
+
+The route answers `HEAD`, one byte range (`Range: bytes=0-1023` → `206`;
+several ranges get the whole file), and `?variant=thumbnail` for a PNG, JPEG or
+WebP still image: a PNG no larger than 1200 px on its longest side. Every response carries `Content-Security-Policy: default-src
+'none'; sandbox`, `Content-Disposition: attachment`, `Cache-Control: no-store`
+and `X-Content-Type-Options: nosniff`, so an HTML or SVG file opened directly
+cannot run script. An unknown, expired, revoked or foreign ticket is `404`; a
+file that no longer matches its recorded hash is `409` with
+`details.code = "INTEGRITY_ERROR"` (the RPC answers `INTERNAL_ERROR` with the
+same reason), and a thumbnail of anything else `415` with
+`details.code = "UNSUPPORTED_MEDIA_TYPE"`.
+
+The `?sessionKey=` routes keep working for this release, with a deprecation
+line in the log the first time each is used, and go away in the next. Turn
+them off now with `[artifacts] legacy_session_key_urls = false`.
 
 ## RPC over HTTP
 
@@ -200,6 +246,84 @@ deletes and approval decisions stay on the WebSocket. Any other method answers `
 `details.code = "METHOD_NOT_ALLOWED_OVER_HTTP"`. The full list is
 `HTTP_RPC_METHODS` in
 [`src/agentos/gateway/http_rpc.py`](../src/agentos/gateway/http_rpc.py).
+
+## Direct tool calls
+
+`POST /api/v1/tools/invoke` runs one tool without an LLM turn (bearer auth,
+Control surface):
+
+```sh
+curl -X POST -H "Authorization: Bearer $AGENTOS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tool": "web_search", "args": {"query": "agentos release notes"}}' \
+  http://127.0.0.1:18791/api/v1/tools/invoke
+```
+
+Body: `tool` (required), `args` (object), `action` (merged into `args` for
+tools that take one), `session_key` (runs the tool in that session's context
+and agent), `idempotency_key`, `dry_run`.
+
+Errors have the typed shape `{"ok": false, "error", "code", "details"}`: `code`
+is a category (`INVALID_REQUEST`, `FORBIDDEN`, `NOT_FOUND`, …) and
+`details.code` the specific reason.
+
+| Status | Meaning |
+| --- | --- |
+| `200` `{"ok": true, "result": …}` | The tool ran. A tool that ran and failed answers `200` with `ok: false` and the tool's error class. |
+| `200` `{"dryRun": true, "allowed": …, "policy": {…}}` | `dry_run`: the resolved policy (profile, caller, sandboxed, read-only, may-require-approval); nothing ran. |
+| `403` `FORBIDDEN` / `POLICY_DENIED` | The configured tool policy (`[tools]` profile/allow/deny, the agent's own entry) refuses it; `details.error_class` names the refusal. |
+| `403` `FORBIDDEN` / `APPROVAL_REQUIRED` | The tool needs a human approval. HTTP calls run unattended, so the tool refuses as on any unattended run; `details.approval_id` is included when it queued one. |
+| `400` `INVALID_REQUEST` | Bad body, or an argument that writes a file (`output_path`, `save_path`, `output_file`, `destination`, …), refused for every tool. |
+| `404` `NOT_FOUND` | Unknown tool **or** one the endpoint does not run — the two look the same. |
+| `409` `INVALID_REQUEST` / `REQUEST_CONFLICT` | The `idempotency_key` was used for a different request in the last ten minutes (a repeat of the same request replays its first answer with `idempotentReplay: true`). |
+| `504` `UNAVAILABLE` / `TOOL_TIMEOUT` | The tool did not finish within the tool timeout. |
+
+The endpoint denies by default: it runs only tools whose registration
+declares them read-only (`read_file`, `list_dir`, `grep_search`, `web_search`,
+`web_fetch`, `memory_search`, `sessions_list`, …). Every other tool — anything
+that may write, send, spend or change state, every MCP tool, and anything
+registered later without the read-only flag — answers `404`. On top of that, a
+name floor holds even if a flag changes: shell, terminal and code execution,
+file writes, deletes and moves (including `memory`, memory and skill writes,
+document creation, `publish_artifact`, `env_set`, `http_request`), project and
+session renames, `sessions_spawn`, `sessions_send`, `subagents`, `acp`,
+`message`, `cron` and scheduler tools, `gateway`, `browser`,
+`router_control`, the paid media generators (`image_generate`, `tts`,
+`music_generate`, `song_generate`, `voice_clone`, `voice_convert`,
+`dubbing_*`), and any `trade*`/`trading*` tool. Lift a single tool with
+`[tools.invoke] allow = ["create_pdf_report"]` — in `agentos.toml` only: config
+RPC writes refuse to add an entry, and a connection the gateway recognizes as an
+agent's cannot touch the setting at all. Tools run sandboxed in an unattended
+context; an agent's connection (an agent token or an open exec window) is
+refused with `403`.
+
+## Inbound webhooks
+
+External automation can reach the agent without a chat channel. These routes
+take their own bearer, `[hooks] token`, sent as `Authorization: Bearer <token>`
+or `X-AgentOS-Hook-Token`; the gateway token is refused there. Without a hooks
+token they answer `404`.
+
+| Method | Path | Body | Effect |
+| --- | --- | --- | --- |
+| `POST` | `/api/v1/hooks/agent` | `{message, agent?, session_key?}` | Enqueues `message` as a user message in `agent:<agent>:hook:agent`, or in `session_key` when it is under `agent:<agent>:hook:`. |
+| `POST` | `/api/v1/hooks/wake` | `{reason?}` | Asks the heartbeat to run now (`503` when there is none). |
+| `POST` | `/api/v1/hooks/<name>` | any JSON | Delivers to the agent and session of `[hooks.routes.<name>]`, message rendered from its `template`. |
+
+Delivery answers `202` with `sessionKey`. Per hook name: `429` past
+`rate_limit_per_minute` (default 60, with `Retry-After`); an `idempotency_key`
+in the body or an `Idempotency-Key` header replays the first answer for five
+minutes (`duplicate: true`), and the same key with a different body is `409`
+with `details.code = "REQUEST_CONFLICT"`; and `409` with `details.code =
+"FANOUT_LIMIT"` once the hook has delivered into `max_sessions_per_hook`
+(default 1) distinct sessions within the last hour. A malformed or wrong token
+is `401`, never an error page. Wrong tokens (the gateway token presented here
+included) count against `[auth.rate_limit]` like wrong gateway tokens, in a
+budget of their own: past it the address gets `429` with
+`details.code = "AUTH_RATE_LIMITED"` on the hooks, while the rest of the API
+is unaffected. Errors have the same typed shape as above. See
+[Configuration → Inbound webhooks](configuration.md#inbound-webhooks) and
+[Scheduling → Automation](scheduling.md#automation-from-outside).
 
 ## Streaming (WebSocket)
 
@@ -394,7 +518,9 @@ The full route table is defined in `create_gateway_app`:
 [`src/agentos/gateway/app.py`](../src/agentos/gateway/app.py) (the `routes`
 list). File-and-media routes are registered just below it via
 `register_upload_routes`, `register_attachment_routes`,
-`register_artifact_routes`, and `register_audio_transcription_routes`.
+`register_artifact_routes`, `register_download_routes` and
+`register_audio_transcription_routes`; then `register_inbound_hook_routes`
+and `register_tools_invoke_route`.
 
 Read next:
 

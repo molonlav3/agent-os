@@ -117,6 +117,75 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   only the new messages on reconnect (#3696).
 - Gateway: `hello-ok.features.capabilities` also lists `terminal-replay`,
   `approval-events`, `inflight-snapshot` and `idempotency-keys`.
+- Gateway bind modes: `[gateway] bind = "loopback" | "lan" | "tailnet" | "custom"`
+  and `agentos gateway run|start --bind-mode`. `tailnet` listens on the
+  `tailscale ip -4` address and on `127.0.0.1` in one process, and fails to
+  start instead of falling back to `0.0.0.0` when Tailscale is unavailable.
+  `--listen` / `--bind` keep working and count as `custom`; `status`, `stop`
+  and `restart` follow the bind mode `start` recorded (#3692).
+- `[gateway] public_origin` declares the browser origin a public deployment is
+  opened at. The gateway refuses to start the Control UI on a specific public
+  address without it (or `control_ui.allowed_origins`), with the fix in the
+  error (#3692).
+- Ticketed downloads: the `artifacts.download` RPC mints
+  `/api/v1/artifacts/download/<conn_id>/<ticket>` for an artifact or an
+  attached file — 32 random bytes, five minutes, bound to the WebSocket
+  connection that asked and revoked when it closes, at most 128 live per
+  connection. The URL needs no `Authorization` header, answers `HEAD`, one byte
+  range and `?variant=thumbnail` (PNG up to 1200 px for still images), and is
+  served with `Content-Security-Policy: default-src 'none'; sandbox`,
+  `Content-Disposition: attachment`, `Cache-Control: no-store` and
+  `X-Content-Type-Options: nosniff`. The web console and the desktop app load
+  previews, audio, cards and downloads through it, so no token appears in a
+  page URL any more and image previews work on token-auth gateways. A file is
+  verified once per change of size, mtime or inode, off the event loop
+  (#3693).
+- Web Push for approvals: Settings → *Push notifications for approvals* in the
+  web console subscribes the browser (RPCs `push.web.vapid_public_key`,
+  `push.web.subscribe`, `push.web.unsubscribe`). Each approval is pushed with a
+  deep link and a TTL equal to its remaining lifetime, and replaced when it is
+  resolved by a notice saying how (granted, denied, expired, or cancelled
+  because its run stopped), sent from the same queue write as
+  `approval.resolved`. RFC 8291/8292 with a VAPID key
+  generated once into the state directory; endpoints must resolve to public
+  addresses at subscribe time and are dialled through the connect-time SSRF
+  guard; `[push] web_enabled = false` turns it off (#3694).
+- An approval raised by a subagent or coding-harness child now names its
+  parent sessions as well (`audience_session_keys` in the queue, the
+  `approval.requested` event, the `/api/approvals` listing and
+  `approval.list`). The parent's chat view shows
+  its turn as waiting for approval, and when the parent is a Telegram, Discord
+  or Slack conversation the prompt with buttons is sent there too (#3694).
+- `POST /api/v1/tools/invoke` runs one tool without a model turn under the
+  same policy chain as an agent's tool call, unattended and sandboxed:
+  `dry_run` returns the resolved policy, an approval requirement answers `403`
+  with the `approval_id`, `idempotency_key` replays or answers `409` with
+  `details.code = "REQUEST_CONFLICT"`; errors use the typed shape (a category
+  in `code`, the reason in `details.code`). Deny by default: only tools declared read-only run; shell
+  and code execution, file and memory writes, session spawning/sending,
+  scheduling, gateway control, outbound messages, browser, paid media and
+  trading tools answer `404` whatever the flags say, file-writing arguments are
+  refused, and only `[tools.invoke] allow` in `agentos.toml` lifts a tool
+  (config RPC writes cannot) (#3695).
+- Config file hot reload (`[gateway] config_reload`, default on): edits of the
+  active config file are validated and applied while the gateway runs; keys
+  read only at startup are reported as pending (`config.changed` event,
+  `agentos doctor`), and an invalid edit keeps the last good config and logs
+  `config.reload_skipped` (#3697).
+- Lifecycle hooks `gateway:startup`, `gateway:shutdown` (5 s budget) and
+  `gateway:pre-restart` (10 s) for in-process code
+  (`lifecycle_hooks.register_lifecycle_hook`) and for file-only shell commands
+  in `[hooks.lifecycle]`, run after in-flight turns drain; a command that runs
+  past the budget is killed with its whole process group (#3697).
+- Inbound webhooks `POST /api/v1/hooks/agent`, `/wake` and `/<name>` with their
+  own `[hooks] token` (the gateway token is refused; wrong tokens count
+  against `[auth.rate_limit]` in a budget separate from the gateway token's,
+  so a locked-out sender gets `429` without locking the gateway), five-minute
+  `idempotency_key` dedupe (`409` for a reused key with another body), a
+  per-hook rate limit (`429`), a fan-out cap per rolling hour, and
+  `[hooks.routes.<name>]` agent / session / message template mapping (#3697).
+- `hello-ok.features.capabilities` advertises `artifact-tickets`,
+  `config-reload`, `tools-invoke` and `web-push`.
 
 ### Changed
 - Gateway: requests on one WebSocket no longer run strictly one at a time. Up
@@ -158,6 +227,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Discord and Slack replies are cleaned the same way as the web console (#3696).
 - Gateway: a `chat.history` page stays under 6 MiB; a message over 128 KiB
   comes back as a short placeholder instead of one huge frame (#3696).
+- One browser-origin policy now guards the WebSocket handshake, `/api/*`
+  requests and CORS on every bind, not only on loopback: declared origins, then
+  a private address opened as itself (`http://192.168.1.20:18791` on a LAN
+  bind), then a loopback origin on this machine. A non-loopback bind used to
+  accept every Origin and reflect it through CORS with credentials. CORS never
+  answers `*`; `cors.allowed_origins = ["*"]` (the old default) adds nothing.
+  The gateway's own `http://localhost:<port>` and `http://127.0.0.1:<port>`
+  are always allowed, so a LAN bind never locks out the local browser (#3692).
+- Off loopback the `Host` guard answers to IP addresses, `.local` / `.ts.net`
+  names and the hostnames of declared origins instead of any name; another
+  name gets `400` naming `[gateway] public_origin` (#3692).
+- `agentos doctor` reports `gateway.cors_wildcard_with_credentials` as `info`
+  instead of `warn`: under the origin policy a `*` CORS entry allows nothing
+  on any bind (#3692).
+- Approval buttons on Telegram, Discord and Slack resolve a request only in the
+  chat its session is delivered to (a child session's parent chat, the main DM
+  session's last chat). A paired sender could previously approve any request
+  whose session key named no channel, a web console or desktop prompt
+  included (#3694).
+
+### Deprecated
+- `GET /api/v1/artifacts/{id}?sessionKey=` and
+  `GET /api/v1/attachments/{sha256}?sessionKey=`: they keep working for this
+  release, log a deprecation warning on first use, and can be turned off now
+  with `[artifacts] legacy_session_key_urls = false` (#3693).
 
 ### Fixed
 - Gateway: SIGTERM — what `agentos gateway stop`, the desktop app, launchd

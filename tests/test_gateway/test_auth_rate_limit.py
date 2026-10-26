@@ -310,9 +310,16 @@ def test_ws_missing_token_never_consumes_budget() -> None:
     assert _ws_attempt(client, _TOKEN)["type"] == "hello-ok"
 
 
+def _declared_origins_config(count: int) -> GatewayConfig:
+    """A non-loopback bind that declares every attacker origin, so the origin
+    policy admits each of them and only the limiter stands."""
+    config = _config(host="0.0.0.0")
+    config.control_ui.allowed_origins = [f"https://attacker-{i}.example" for i in range(count)]
+    return config
+
+
 def test_http_rotating_origins_cannot_bypass_the_lockout() -> None:
-    # A non-loopback bind accepts any browser Origin, so only the limiter stands.
-    client = _http(_config(host="0.0.0.0"))
+    client = _http(_declared_origins_config(40))
     for i in range(10):
         headers = {"Authorization": "Bearer nope", "Origin": f"https://attacker-{i}.example"}
         assert client.get("/api/system/status", headers=headers).status_code == 401
@@ -324,7 +331,7 @@ def test_http_rotating_origins_cannot_bypass_the_lockout() -> None:
 
 
 def test_ws_rotating_origins_cannot_bypass_the_lockout() -> None:
-    client = _http(_config(host="0.0.0.0"))
+    client = _http(_declared_origins_config(20))
     for _ in range(10):
         assert _ws_attempt(client, "nope")["error"]["details"] is None
     for i in range(20):
@@ -334,7 +341,10 @@ def test_ws_rotating_origins_cannot_bypass_the_lockout() -> None:
 
 def test_ws_attacker_using_the_console_origin_does_not_lock_out_the_operator() -> None:
     app = create_gateway_app(_config(host="0.0.0.0"))
-    console = {"origin": "http://192.168.1.20:18791"}
+    # The console opened at the gateway's LAN address: a private same-origin
+    # page the origin policy admits from any peer (the test client's
+    # WebSocket sends Host: testserver unless told otherwise).
+    console = {"origin": "http://192.168.1.20:18791", "host": "192.168.1.20:18791"}
     attacker = TestClient(app, client=(_REMOTE, 50000))
     operator = TestClient(app, client=("192.168.1.20", 50000))
     for _ in range(10):

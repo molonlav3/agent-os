@@ -1,0 +1,522 @@
+"""Inbound webhooks: ``POST /api/v1/hooks/agent``, ``/wake`` and ``/<name>``.
+
+External automation -- CI, a repository's webhooks, a no-code workflow -- can
+reach the agent without a chat channel:
+
+* ``/api/v1/hooks/agent`` ``{message, agent?, session_key?}`` enqueues a user
+  message into a session, exactly as the console's send would.
+* ``/api/v1/hooks/wake`` ``{reason?}`` asks the heartbeat to run now.
+* ``/api/v1/hooks/<name>`` takes any JSON body and turns it into a message for
+  the agent and session ``[hooks.routes.<name>]`` names, through that route's
+  ``template`` (``{{ payload.pull_request.title }}``).
+
+They authenticate with their own bearer, ``[hooks] token`` (``Authorization:
+Bearer`` or ``X-AgentOS-Hook-Token``), never the gateway token -- presenting
+that one is refused, so a leaked webhook secret is not a Control credential
+and vice versa. With no hooks token configured the routes answer ``404``. A
+wrong hooks token counts against the gateway's failed-auth limiter
+(``[auth.rate_limit]``) in a budget of its own, so guessing it locks the
+address out of the hooks, not out of the gateway.
+
+Guard rails, per hook name: ``rate_limit_per_minute`` (default 60) answered
+with ``429``; ``idempotency_key`` (body) or an ``Idempotency-Key`` header
+replays the first response for five minutes; and a fan-out cap,
+``max_sessions_per_hook`` (default 1), on the distinct sessions a hook may
+deliver into within any rolling hour. Reusing an idempotency key for a
+different body is ``409`` with ``details.code = REQUEST_CONFLICT``. A
+caller-chosen ``session_key`` must stay in the hook namespace
+``agent:<agent>:hook:...``; only a route's own ``session_key`` (written by the
+operator) can point a hook at an existing conversation.
+
+Errors have the gateway's typed shape: ``code`` is a category
+(:class:`~agentos.gateway.protocol.ErrorCode`), ``details.code`` the specific
+reason (:class:`~agentos.gateway.protocol.ErrorDetailCode`).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import time
+from collections import OrderedDict, deque
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+import structlog
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+from agentos.gateway.auth_rate_limit import AuthGuard, retry_after_seconds
+from agentos.gateway.config import GatewayConfig
+from agentos.gateway.protocol import ErrorCode, ErrorDetailCode, error_category
+
+log = structlog.get_logger(__name__)
+
+HOOKS_PREFIX = "/api/v1/hooks"
+#: Failed-auth budget the hooks token is guessed against, apart from the
+#: gateway token's so a misbehaving sender cannot lock the gateway itself.
+HOOKS_TOKEN_SCOPE = "hooks-token"
+IDEMPOTENCY_TTL_SECONDS = 300.0
+IDEMPOTENCY_MAX_ENTRIES = 2048
+RATE_WINDOW_SECONDS = 60.0
+#: The fan-out cap counts distinct sessions delivered into within this window.
+FANOUT_WINDOW_SECONDS = 3600.0
+MAX_MESSAGE_CHARS = 32_000
+MAX_BODY_BYTES = 256 * 1024
+_TEMPLATE_FIELD = re.compile(r"\{\{\s*([A-Za-z0-9_.\-]+)\s*\}\}")
+_HOOK_SEGMENT = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+
+
+def _error_body(
+    code: ErrorCode | str,
+    message: str,
+    detail: ErrorDetailCode | str | None = None,
+    **details: Any,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {"ok": False, "error": message, "code": str(code)}
+    extra = dict(details)
+    if detail is not None:
+        extra = {"code": str(detail), **extra}
+    if extra:
+        body["details"] = extra
+    return body
+
+
+def _json_error(
+    status: int,
+    code: ErrorCode,
+    message: str,
+    detail: ErrorDetailCode | None = None,
+    *,
+    headers: dict[str, str] | None = None,
+    **details: Any,
+) -> JSONResponse:
+    return JSONResponse(
+        _error_body(code, message, detail, **details), status_code=status, headers=headers
+    )
+
+
+def _not_found() -> JSONResponse:
+    return _json_error(404, ErrorCode.NOT_FOUND, "Not found")
+
+
+def render_template(template: str, payload: Any) -> str:
+    """Fill ``{{ payload.a.b }}`` / ``{{ a.b }}`` placeholders from ``payload``.
+
+    No expressions, filters or code: a placeholder is a dotted path, list
+    indexes allowed (``commits.0.message``). A missing path renders empty; a
+    nested object renders as compact JSON.
+    """
+
+    def lookup(match: re.Match[str]) -> str:
+        parts = match.group(1).split(".")
+        if parts and parts[0] == "payload":
+            parts = parts[1:]
+        node: Any = payload
+        for part in parts:
+            if isinstance(node, dict):
+                node = node.get(part)
+            elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+                node = node[int(part)]
+            else:
+                return ""
+            if node is None:
+                return ""
+        if isinstance(node, str):
+            return node
+        return json.dumps(node, ensure_ascii=False, separators=(",", ":"))
+
+    return _TEMPLATE_FIELD.sub(lookup, template)
+
+
+@dataclass
+class _Replay:
+    created_at: float
+    status: int
+    body: dict[str, Any]
+    fingerprint: str = ""
+
+
+class HookGuards:
+    """Per-hook rate windows, idempotency replays and fan-out bookkeeping."""
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._windows: dict[str, deque[float]] = {}
+        self._replays: OrderedDict[tuple[str, str], _Replay] = OrderedDict()
+        # hook -> {session key -> last delivery}, pruned to the fan-out window.
+        self._sessions: dict[str, dict[str, float]] = {}
+
+    def throttled(self, hook: str, limit: int) -> float | None:
+        """Seconds until ``hook`` may be called again, or None to admit (and count) it."""
+        now = self._clock()
+        window = self._windows.setdefault(hook, deque())
+        while window and now - window[0] >= RATE_WINDOW_SECONDS:
+            window.popleft()
+        if len(window) >= limit:
+            return max(1.0, RATE_WINDOW_SECONDS - (now - window[0]))
+        window.append(now)
+        return None
+
+    def replay(self, hook: str, key: str) -> _Replay | None:
+        now = self._clock()
+        for stale in [
+            k for k, v in self._replays.items() if now - v.created_at >= IDEMPOTENCY_TTL_SECONDS
+        ]:
+            self._replays.pop(stale, None)
+        return self._replays.get((hook, key))
+
+    def remember(
+        self, hook: str, key: str, status: int, body: dict[str, Any], fingerprint: str = ""
+    ) -> None:
+        self._replays[(hook, key)] = _Replay(self._clock(), status, body, fingerprint)
+        while len(self._replays) > IDEMPOTENCY_MAX_ENTRIES:
+            self._replays.popitem(last=False)
+
+    def admit_session(self, hook: str, session_key: str, cap: int) -> bool:
+        """At most ``cap`` distinct sessions per hook within any rolling window."""
+        now = self._clock()
+        seen = self._sessions.setdefault(hook, {})
+        for stale in [k for k, at in seen.items() if now - at >= FANOUT_WINDOW_SECONDS]:
+            seen.pop(stale, None)
+        if session_key not in seen and len(seen) >= cap:
+            return False
+        seen[session_key] = now
+        return True
+
+
+def _body_fingerprint(body: Any) -> str:
+    """Stable digest of a hook body, its own ``idempotency_key`` left out."""
+    import hashlib
+
+    material = body
+    if isinstance(body, dict):
+        material = {k: v for k, v in body.items() if k != "idempotency_key"}
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _presented_token(request: Request) -> str:
+    header = request.headers.get("authorization", "")
+    if header.startswith("Bearer "):
+        return header[7:].strip()
+    return request.headers.get("x-agentos-hook-token", "").strip()
+
+
+def _hooks_config(config: Any) -> Any:
+    return getattr(config, "hooks", None)
+
+
+def _check_hook_token(config: Any, presented: str) -> JSONResponse | None:
+    """``None`` when ``presented`` is the hooks token, else the refusal to send.
+
+    Every ``401`` is charged to the caller's failed-auth budget, the gateway
+    token presented here included: its distinct message must not make this
+    route an unthrottled oracle for the gateway token. ``404`` (no hooks
+    token configured) is not charged.
+    """
+    from agentos.gateway.auth import token_matches
+
+    hooks = _hooks_config(config)
+    expected = getattr(hooks, "token", "") or ""
+    if not isinstance(expected, str) or not expected:
+        return _not_found()
+    gateway_token = getattr(getattr(config, "auth", None), "token", "") or ""
+    if isinstance(gateway_token, str) and gateway_token and token_matches(expected, gateway_token):
+        log.error(
+            "gateway.hooks_token_reuses_gateway_token",
+            hint="set a [hooks] token different from the gateway token",
+        )
+        return _not_found()
+    if isinstance(gateway_token, str) and gateway_token and token_matches(presented, gateway_token):
+        return _json_error(
+            401,
+            ErrorCode.UNAUTHORIZED,
+            "The gateway token is not accepted here; use the hooks token",
+        )
+    if not token_matches(presented, expected):
+        return _json_error(401, ErrorCode.UNAUTHORIZED, "Unauthorized")
+    return None
+
+
+def _contained(handler: Callable[[Request], Any]) -> Callable[[Request], Any]:
+    """Answer a generic 500 for anything a hook handler did not expect.
+
+    The default error path logs a full traceback, and the console renderer
+    prints each frame's locals -- the gateway config and its tokens among
+    them. A hook route is reachable by anyone who can reach the port, so its
+    failures are logged by type and redacted message only.
+    """
+
+    async def wrapped(request: Request) -> JSONResponse:
+        try:
+            response: JSONResponse = await handler(request)
+            return response
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            from agentos.redact import redact_sensitive_text
+
+            log.warning(
+                "gateway.hook_failed",
+                path=request.url.path,
+                error_type=type(exc).__name__,
+                error=(redact_sensitive_text(str(exc)) or "")[:300],
+            )
+            return _json_error(500, ErrorCode.INTERNAL_ERROR, "The hook could not be handled")
+
+    return wrapped
+
+
+def default_hook_session(agent_id: str, name: str) -> str:
+    return f"agent:{agent_id}:hook:{name}"
+
+
+def _in_hook_namespace(session_key: str, agent_id: str) -> bool:
+    prefix = f"agent:{agent_id}:hook:"
+    if not session_key.startswith(prefix):
+        return False
+    rest = session_key[len(prefix) :]
+    return all(_HOOK_SEGMENT.fullmatch(part) for part in rest.split(":")) if rest else False
+
+
+def register_inbound_hook_routes(
+    app: Starlette,
+    *,
+    config: GatewayConfig,
+    dispatch_message: Callable[[str, str, dict[str, Any]], Any],
+    wake: Callable[[str], Any] | None = None,
+    guards: HookGuards | None = None,
+    auth_guard: AuthGuard | None = None,
+) -> None:
+    """Register the hook routes.
+
+    ``dispatch_message(session_key, message, provenance)`` enqueues a turn and
+    returns its result dict (awaitable); ``wake(reason)`` nudges the heartbeat
+    and returns whether one is wired. ``auth_guard`` is the app's failed-auth
+    limiter; wrong hooks tokens are counted in ``HOOKS_TOKEN_SCOPE``.
+    """
+    from agentos.gateway.middleware import request_client_ip
+    from agentos.session.keys import normalize_agent_id
+
+    state = guards or HookGuards()
+
+    async def authenticate(request: Request) -> JSONResponse | None:
+        # ``token_matches`` compares UTF-8 bytes in constant time and never
+        # raises: a header the client controls (any bytes, any length) must
+        # not turn into an exception whose traceback carries the secrets.
+        presented = _presented_token(request)
+        limiter = auth_guard.limiter if auth_guard is not None else None
+        if limiter is None or not presented:
+            return _check_hook_token(config, presented)
+        client_ip = request_client_ip(request, config)
+        origin = request.headers.get("origin") or None
+        decision = limiter.check(client_ip, HOOKS_TOKEN_SCOPE, origin=origin)
+        if not decision.allowed:
+            return _json_error(
+                429,
+                ErrorCode.RATE_LIMITED,
+                "Too many failed authentication attempts",
+                ErrorDetailCode.AUTH_RATE_LIMITED,
+                headers={"Retry-After": str(retry_after_seconds(decision.retry_after_ms))},
+                retry_after_ms=decision.retry_after_ms,
+            )
+        refusal = _check_hook_token(config, presented)
+        if refusal is None:
+            limiter.record_success(client_ip, HOOKS_TOKEN_SCOPE, origin=origin)
+        elif refusal.status_code == 401:
+            decision = limiter.record_failure(client_ip, HOOKS_TOKEN_SCOPE, origin=origin)
+            if decision.delay_s > 0:
+                await asyncio.sleep(decision.delay_s)
+        return refusal
+
+    async def read_body(request: Request) -> tuple[Any, JSONResponse | None]:
+        raw = await request.body()
+        if len(raw) > MAX_BODY_BYTES:
+            return None, _json_error(
+                413,
+                ErrorCode.INVALID_REQUEST,
+                f"body exceeds {MAX_BODY_BYTES} bytes",
+                ErrorDetailCode.PAYLOAD_TOO_LARGE,
+                limit_bytes=MAX_BODY_BYTES,
+            )
+        if not raw.strip():
+            return {}, None
+        try:
+            return json.loads(raw), None
+        except ValueError:
+            return None, _json_error(400, ErrorCode.INVALID_REQUEST, "body must be JSON")
+
+    def idempotency_key(request: Request, body: Any) -> str | None:
+        key = body.get("idempotency_key") if isinstance(body, dict) else None
+        key = key or request.headers.get("idempotency-key")
+        if isinstance(key, str) and key.strip():
+            return key.strip()[:200]
+        return None
+
+    async def deliver(
+        hook: str, agent_id: str, session_key: str, message: str, provenance: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        if not message.strip():
+            return 400, _error_body(ErrorCode.INVALID_REQUEST, "message is empty")
+        hooks = _hooks_config(config)
+        cap = int(getattr(hooks, "max_sessions_per_hook", 1) or 1)
+        if not state.admit_session(hook, session_key, cap):
+            return 409, _error_body(
+                ErrorCode.INVALID_REQUEST,
+                f"hook {hook!r} already delivers into {cap} session(s)",
+                ErrorDetailCode.FANOUT_LIMIT,
+                limit=cap,
+            )
+        if len(message) > MAX_MESSAGE_CHARS:
+            message = message[:MAX_MESSAGE_CHARS]
+        result = await dispatch_message(session_key, message, provenance)
+        if isinstance(result, dict) and result.get("ok") is False:
+            # The turn's own error code (a category, or a reason such as
+            # QUEUE_FULL) keeps its category; the reason goes in details.
+            raw = str(result.get("code") or "")
+            category = error_category(raw) or ErrorCode.UNAVAILABLE
+            detail = result.get("detail") or (raw if raw and raw != category else None)
+            return 502, _error_body(
+                category,
+                str(result.get("error") or "the turn could not be queued"),
+                str(detail) if detail else None,
+            )
+        log.info("gateway.hook_delivered", hook=hook, agent_id=agent_id, session_key=session_key)
+        payload = {"ok": True, "hook": hook, "sessionKey": session_key}
+        if isinstance(result, dict):
+            for key in ("runId", "run_id", "taskId", "status"):
+                if key in result:
+                    payload[key] = result[key]
+        return 202, payload
+
+    async def guarded(
+        request: Request,
+        hook: str,
+        handler: Callable[[Any], Any],
+    ) -> JSONResponse:
+        refusal = await authenticate(request)
+        if refusal is not None:
+            return refusal
+        hooks = _hooks_config(config)
+        retry = state.throttled(hook, int(getattr(hooks, "rate_limit_per_minute", 60) or 60))
+        if retry is not None:
+            return _json_error(
+                429,
+                ErrorCode.RATE_LIMITED,
+                "Too many requests for this hook",
+                headers={"Retry-After": str(int(retry))},
+            )
+        body, error = await read_body(request)
+        if error is not None:
+            return error
+        key = idempotency_key(request, body)
+        fingerprint = _body_fingerprint(body)
+        if key is not None:
+            replay = state.replay(hook, key)
+            if replay is not None:
+                if replay.fingerprint != fingerprint:
+                    return _json_error(
+                        409,
+                        ErrorCode.INVALID_REQUEST,
+                        "idempotency_key was already used for a different request",
+                        ErrorDetailCode.REQUEST_CONFLICT,
+                    )
+                return JSONResponse({**replay.body, "duplicate": True}, status_code=replay.status)
+        status, payload = await handler(body)
+        if key is not None and status < 500:
+            state.remember(hook, key, status, payload, fingerprint)
+        return JSONResponse(payload, status_code=status)
+
+    async def agent_hook(request: Request) -> JSONResponse:
+        async def handle(body: Any) -> tuple[int, dict[str, Any]]:
+            if not isinstance(body, dict):
+                return 400, _error_body(ErrorCode.INVALID_REQUEST, "body must be an object")
+            message = body.get("message")
+            if not isinstance(message, str):
+                return 400, _error_body(ErrorCode.INVALID_REQUEST, "message is required")
+            agent_id = normalize_agent_id(str(body.get("agent") or "main"))
+            requested = body.get("session_key", body.get("sessionKey"))
+            if requested is None:
+                session_key = default_hook_session(agent_id, "agent")
+            elif isinstance(requested, str) and _in_hook_namespace(requested.strip(), agent_id):
+                session_key = requested.strip()
+            else:
+                return 403, _error_body(
+                    ErrorCode.FORBIDDEN, f"session_key must be under agent:{agent_id}:hook:"
+                )
+            return await deliver(
+                "agent",
+                agent_id,
+                session_key,
+                message,
+                {"kind": "external_user", "source": "webhook", "hook": "agent"},
+            )
+
+        return await guarded(request, "agent", handle)
+
+    async def wake_hook(request: Request) -> JSONResponse:
+        async def handle(body: Any) -> tuple[int, dict[str, Any]]:
+            reason = body.get("reason") if isinstance(body, dict) else None
+            reason = str(reason)[:200] if reason else "webhook"
+            if wake is None:
+                return 503, _error_body(ErrorCode.UNAVAILABLE, "no heartbeat to wake")
+            woke = wake(f"hook:{reason}")
+            if not woke:
+                return 503, _error_body(ErrorCode.UNAVAILABLE, "no heartbeat to wake")
+            log.info("gateway.hook_wake", reason=reason)
+            return 202, {"ok": True, "hook": "wake", "reason": reason}
+
+        return await guarded(request, "wake", handle)
+
+    async def named_hook(request: Request) -> JSONResponse:
+        name = str(request.path_params.get("name", ""))
+        hooks = _hooks_config(config)
+        routes = getattr(hooks, "routes", None) or {}
+        route = routes.get(name)
+        if route is None:
+            # Authenticate first so an unauthenticated caller cannot map names.
+            refusal = await authenticate(request)
+            return refusal if refusal is not None else _not_found()
+
+        async def handle(body: Any) -> tuple[int, dict[str, Any]]:
+            agent_id = normalize_agent_id(str(getattr(route, "agent", "main") or "main"))
+            session_key = str(getattr(route, "session_key", "") or "") or default_hook_session(
+                agent_id, name
+            )
+            template = str(getattr(route, "template", "") or "")
+            if template:
+                message = render_template(template, body)
+            elif isinstance(body, dict) and isinstance(body.get("message"), str):
+                message = body["message"]
+            else:
+                message = json.dumps(body, ensure_ascii=False)
+            return await deliver(
+                name,
+                agent_id,
+                session_key,
+                message,
+                {"kind": "external_user", "source": "webhook", "hook": name},
+            )
+
+        return await guarded(request, name, handle)
+
+    app.router.routes.extend(
+        [
+            Route(f"{HOOKS_PREFIX}/agent", _contained(agent_hook), methods=["POST"]),
+            Route(f"{HOOKS_PREFIX}/wake", _contained(wake_hook), methods=["POST"]),
+            Route(f"{HOOKS_PREFIX}/{{name}}", _contained(named_hook), methods=["POST"]),
+        ]
+    )
+
+
+__all__ = [
+    "HOOKS_PREFIX",
+    "HOOKS_TOKEN_SCOPE",
+    "HookGuards",
+    "default_hook_session",
+    "register_inbound_hook_routes",
+    "render_template",
+]

@@ -1304,10 +1304,33 @@ Bind precedence:
 
 1. `--listen`
 2. `--bind`
-3. `AGENTOS_LISTEN`
-4. `AGENTOS_GATEWAY_HOST`
-5. config host
-6. `127.0.0.1`
+3. `--bind-mode`
+4. `AGENTOS_LISTEN`
+5. `AGENTOS_GATEWAY_HOST`
+6. `[gateway] bind`
+7. config host
+8. `127.0.0.1`
+
+```toml
+[gateway]
+bind = "loopback"          # loopback | lan | tailnet | custom; unset = use `host`
+public_origin = ""         # e.g. "https://agent.example.com" for a public console
+config_reload = true       # apply edits to this file without a restart
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `gateway.bind` | unset | `loopback` = `127.0.0.1`; `lan` = `0.0.0.0` (token auth required); `tailnet` = the `tailscale ip -4` address plus `127.0.0.1`, never a wildcard (startup fails when Tailscale is unavailable); `custom` = the `host` key. Unset keeps `host` in charge. `--listen` / `--bind` count as `custom`. Restart to apply. |
+| `gateway.public_origin` | `""` | The browser origin a public deployment is opened at. Joins the origin allowlist and the `Host` guard. Required before the Control UI starts on a specific public address. Restart to apply. |
+| `gateway.config_reload` | `true` | Watch the config file; see [Editing the file while the gateway runs](#editing-the-file-while-the-gateway-runs). |
+
+Browser access follows one origin policy on every bind (allowlist, then
+private same-origin, then a loopback origin on a local socket); see
+[Gateway → Browser origins](gateway.md#browser-origins).
+`cors.allowed_origins` entries join that allowlist; its old default `["*"]`
+adds nothing, and CORS never answers `*`. Environment overrides:
+`AGENTOS_GATEWAY_GATEWAY__BIND`, `AGENTOS_GATEWAY_GATEWAY__PUBLIC_ORIGIN`,
+`AGENTOS_GATEWAY_GATEWAY__CONFIG_RELOAD`.
 
 ## Gateway Control
 
@@ -1392,13 +1415,98 @@ log_retention_sweep_interval_s = 3600.0
 - **OTLP Trace Export**: `otlp_enabled` (default `false`) sends trace events as OTLP spans over HTTP to `otlp_endpoint` (e.g. OpenTelemetry Collector).
 - **Log Retention**: `log_retention_days` (TTL) and `log_retention_max_total_mb` (total size cap) bound disk growth in `~/.agentos/logs`. Background sweeps run every `log_retention_sweep_interval_s`.
 
+## Downloads, Web Push and Direct Tool Calls
+
+```toml
+[artifacts]
+legacy_session_key_urls = true    # keep the deprecated ?sessionKey= download URLs this release
+
+[push]
+web_enabled = true                # browsers may subscribe to approval notifications
+vapid_subject = "https://useagentos.dev"   # VAPID `sub`: a mailto: or https: contact
+
+[tools.invoke]
+allow = []                        # tools lifted off POST /api/v1/tools/invoke's hard deny list
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `artifacts.legacy_session_key_urls` | `true` | `false` makes `/api/v1/artifacts/{id}?sessionKey=` and `/api/v1/attachments/{sha256}?sessionKey=` answer `404`. Clients use ticketed URLs from `artifacts.download`; see [HTTP API](http-api.md#ticketed-downloads). |
+| `push.web_enabled` | `true` | Web Push for approvals. The VAPID key pair is generated once into `<state_dir>/web_push_vapid.json` (0600); subscriptions live in `<state_dir>/web_push.sqlite`. |
+| `push.vapid_subject` | `https://useagentos.dev` | Contact push services may use to reach the sender. |
+| `tools.invoke.allow` | `[]` | Exact tool names `POST /api/v1/tools/invoke` may run although it would refuse them (not declared read-only, or on its name floor). The configured `[tools]` policy still applies. File-only: config RPC writes cannot add an entry. |
+
+All three are read per request: no restart.
+
+## Inbound Webhooks
+
+```toml
+[hooks]
+token = "<long random secret, not the gateway token>"
+rate_limit_per_minute = 60        # per hook name; 429 beyond it
+max_sessions_per_hook = 1         # distinct sessions one hook may deliver into per hour
+
+[hooks.routes.github]             # POST /api/v1/hooks/github
+agent = "main"
+session_key = ""                  # empty: agent:main:hook:github
+template = "PR {{ payload.pull_request.title }} was {{ payload.action }}"
+
+[hooks.lifecycle]                 # shell commands, run with a time budget
+startup = []
+shutdown = ["/usr/local/bin/backup-agentos"]
+pre_restart = []
+```
+
+- `hooks.token` admits `POST /api/v1/hooks/agent`, `/wake` and `/<name>`
+  (`Authorization: Bearer` or `X-AgentOS-Hook-Token`). The gateway token is
+  refused there, and a hooks token equal to it disables the routes. Unset: the
+  routes answer `404`. Wrong tokens are throttled by `[auth.rate_limit]` in a
+  budget of their own: a sender that keeps guessing is locked out of the hooks
+  (`429`), not out of the gateway.
+- A route's `template` fills `{{ payload.a.b }}` placeholders (dotted paths,
+  list indexes like `commits.0.id`) from the posted JSON; no expressions. Empty:
+  the body's `message`, else the JSON body itself. A route's `session_key` is
+  the only way to deliver into an existing conversation; a caller may only
+  choose a key under `agent:<agent>:hook:`.
+- `[hooks.lifecycle]` commands run through `/bin/sh -c` without the gateway's
+  credentials in their environment, with `AGENTOS_LIFECYCLE_EVENT` and
+  `AGENTOS_LIFECYCLE_REASON` set. Budgets: `startup` 10 s, `shutdown` 5 s,
+  `pre_restart` 10 s, shared by every command and in-process hook of that event.
+- `hooks.token` and `hooks.lifecycle` are file-only: `config.set`,
+  `config.patch` and `config.apply` refuse to set a token or add a command
+  (clearing them is allowed).
+
+Route names are 1-64 of `a-z 0-9 _ -` and cannot be `agent` or `wake`. Hooks
+settings apply on the next request. See [HTTP API → Inbound
+webhooks](http-api.md#inbound-webhooks).
+
 ## Raw Config Editing
 
 For advanced settings, inspect `agentos.toml.example` and edit the active
 config file directly. Use CLI commands for routine provider, router, search,
 channel, and sandbox changes because they avoid common key-shape mistakes.
 
-After changing files by hand, restart the gateway and run:
+### Editing the file while the gateway runs
+
+With `[gateway] config_reload = true` (the default) the gateway checks the
+active config file every 2 seconds and, once a change has been still for half
+a second, applies it like a config write from the console: validated, applied
+in place, hot settings live at once. Settings that are only read at startup
+(bind, channels, sandbox, memory backend, middleware, and anything not on the
+audited live list) are recorded as pending instead: `agentos doctor` reports
+`gateway.config.restart_pending` and the console gets a `config.changed`
+event listing `hot` and `restartRequired` paths. Restart to apply those.
+
+An edit that does not parse or validate never replaces the running config: the
+gateway keeps its last good settings, logs `config.reload_skipped`, sends
+`config.changed` with `status: "invalid"`, and `agentos doctor` reports
+`gateway.config.reload_skipped` until a good save (fixing the file back to
+the running settings sends `config.changed` with `status: "recovered"`). `--listen` / `--port`
+overrides and runtime-only secrets (an auto-generated token, keys from the
+environment) carry over a reload. The gateway's own writes are recognized and
+cause no reload.
+
+When `config_reload` is off, restart after changing the file. Either way, check:
 
 ```sh
 agentos doctor

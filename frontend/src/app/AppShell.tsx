@@ -35,6 +35,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { Toaster } from '@/components/ui/sonner'
+import { listenForPushNavigation } from '@/services/web-push-navigation'
 import { Button } from '@/components/ui/button'
 import { AsciiField } from '@/components/AsciiField'
 import {
@@ -307,6 +308,9 @@ export function AppShell() {
     },
     [navigate, closeMobileDrawer],
   )
+
+  // A clicked approval notification (public/sw.js) routes this console to it.
+  useEffect(() => listenForPushNavigation((path) => navigate(path)), [navigate])
 
   useEffect(() => {
     const mq = mobileQuery()

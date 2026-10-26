@@ -5,6 +5,7 @@
 // against static/js/views/chat.js.
 
 import { urlBase } from '@/lib/api-origin'
+import { parseDownloadUrl } from '@/lib/artifact-tickets'
 import { t } from '@/i18n'
 import '@/i18n/en/chat'
 
@@ -1012,7 +1013,12 @@ export function renderMessageAttachmentHtml(attachment: unknown): string {
     `<span class="msg-file-chip__meta">${esc(mime || 'attachment')}</span>`
   if (href) {
     const downloadName = attachmentDownloadName({ name })
-    return `<a class="msg-file-chip msg-file-chip--download" title="${esc(name)}" href="${esc(href)}" download="${esc(downloadName)}">${inner}</a>`
+    // A gateway-stored attachment downloads like an artifact, through the
+    // transcript's delegated click (a ticket, or the header-authenticated
+    // fetch): its plain link cannot authenticate. Inline `data:`/`blob:`
+    // chips stay plain links.
+    const gatewayFile = parseDownloadUrl(href) ? ` data-artifact-download="${esc(href)}"` : ''
+    return `<a class="msg-file-chip msg-file-chip--download" title="${esc(name)}" href="${esc(href)}" download="${esc(downloadName)}"${gatewayFile}>${inner}</a>`
   }
   return `<span class="msg-file-chip msg-file-chip--disabled" title="${esc(name)}">${inner}</span>`
 }

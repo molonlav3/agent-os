@@ -9,6 +9,7 @@ import logging
 import os
 import secrets
 import signal
+import socket
 import tempfile
 import threading
 import time
@@ -1297,6 +1298,10 @@ class GatewayServer:
     # ``gateway.restart.GatewayRestarter`` once wired; ``run_gateway`` awaits
     # its task after the server task ends so the exec happens outside the loop.
     _restarter: Any = field(default=None, repr=False)
+    # Approval delivery wired at boot (Web Push, parent-chat relay); undone on close.
+    _web_push: Any = field(default=None, repr=False)
+    # ``gateway.config_watcher.ConfigWatcher`` for the active config file.
+    _config_watcher: Any = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
     # Signal-driven shutdown (``install_signal_handlers``): the first SIGTERM
     # / SIGINT starts ``close()`` in ``_shutdown_task``; a second sets
@@ -1469,6 +1474,12 @@ class GatewayServer:
 
             if get_maintenance() is self._maintenance:
                 set_maintenance(None)
+        if self._config_watcher is not None:
+            try:
+                await self._config_watcher.stop()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
+            self._config_watcher = None
         # Drain in-flight turns FIRST so replies are not lost.
         # task_runtime.shutdown() waits for all running turns to complete before
         # returning; only then do we stop channel delivery.
@@ -1489,6 +1500,20 @@ class GatewayServer:
                             graceful.cancel()
             except Exception:
                 pass
+
+        # Lifecycle hooks run once the turns have drained -- nothing is still
+        # writing the state they flush -- and while channels and services are
+        # still up (bounded: 10 s pre-restart, 5 s shutdown; never raises).
+        from agentos.gateway.lifecycle_hooks import (
+            PRE_RESTART,
+            run_lifecycle_hooks,
+            run_shutdown_hooks_once,
+        )
+
+        config = getattr(self, "config", None)
+        if reason.startswith("restart"):
+            await run_lifecycle_hooks(PRE_RESTART, config=config, reason=reason)
+        await run_shutdown_hooks_once(config, reason)
 
         if self._background_completion_manager is not None:
             try:
@@ -1559,6 +1584,8 @@ class GatewayServer:
         if self._services is not None:
             await self._services.close()
 
+        _unwire_approval_delivery(self._web_push)
+        self._web_push = None
         if self._boot_tracker is not None:
             self._boot_tracker.mark_clean(reason)
             from agentos.gateway.boot_lifecycle import get_boot_tracker, set_boot_tracker
@@ -1573,6 +1600,83 @@ class GatewayServer:
 
         self.remove_signal_handlers()
         log.info("gateway.stopped", reason=reason, forced=self._forced)
+
+
+@dataclass
+class ApprovalDeliveryWiring:
+    push: Any = None
+    relay: Any = None
+
+
+def wire_approval_delivery(
+    config: GatewayConfig, *, channel_manager_ref: Callable[[], Any] | None = None
+) -> ApprovalDeliveryWiring:
+    """Point the approval queue at session lineage, Web Push and the parent-chat relay.
+
+    The queue asks for a request's audience (its session plus subagent /
+    coding-agent ancestors) through a read-only view of ``sessions.db``; the
+    channel custody check and the relay read delivery routes from the same
+    view. The relay sends a child session's prompt to the chat its parent is
+    delivered to.
+    """
+    from agentos.application import approval_delivery
+    from agentos.gateway.approval_queue import get_approval_queue
+    from agentos.gateway.session_index import SessionIndex, set_session_index
+    from agentos.gateway.web_push import get_web_push_service
+
+    index = SessionIndex(_state_path(config, "sessions.db"))
+    set_session_index(index)
+    approval_delivery.set_lineage_resolver(index.parents)
+    try:
+        service = get_web_push_service(config)
+    except Exception:  # noqa: BLE001 - push is best-effort, never a boot blocker
+        log.warning("gateway.web_push_unavailable", exc_info=True)
+        service = None
+    if service is not None:
+        service._loop = asyncio.get_running_loop()
+        service._lifespan_end = lambda entry: get_approval_queue().lifespan_end(entry)
+        approval_delivery.register_listener(service)
+    relay = None
+    if channel_manager_ref is not None:
+        from agentos.gateway.approval_channel_relay import ChannelApprovalRelay
+
+        relay = ChannelApprovalRelay(channel_manager_ref, loop=asyncio.get_running_loop())
+        approval_delivery.register_listener(relay)
+    return ApprovalDeliveryWiring(push=service, relay=relay)
+
+
+def _unwire_approval_delivery(wiring: Any) -> None:
+    from agentos.application import approval_delivery
+    from agentos.gateway.session_index import set_session_index
+    from agentos.gateway.web_push import set_web_push_service
+
+    service = getattr(wiring, "push", None)
+    relay = getattr(wiring, "relay", None)
+    if relay is not None:
+        approval_delivery.unregister_listener(relay)
+    if service is not None:
+        approval_delivery.unregister_listener(service)
+        try:
+            service.close()
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            pass
+        set_web_push_service(None)
+    approval_delivery.set_lineage_resolver(None)
+    set_session_index(None)
+
+
+def bind_listen_socket(host: str, port: int) -> socket.socket:
+    """Bind one TCP listener the way uvicorn does for its own ``host``/``port``."""
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host.strip("[]"), port))
+    except OSError as exc:
+        sock.close()
+        raise ValueError(f"cannot listen on {host}:{port}: {exc}") from exc
+    sock.set_inheritable(True)
+    return sock
 
 
 def emit_skill_filter_banner(skills_cfg: Any) -> None:
@@ -2636,8 +2740,12 @@ async def start_gateway_server(
     compaction_hooks: Sequence[Any] | None = None,
     tool_hooks: Sequence[Any] | None = None,
     boot_tracker: Any = None,
+    extra_listen_hosts: Sequence[str] = (),
 ) -> GatewayServer:
     """
+    ``extra_listen_hosts`` are further addresses the same app listens on
+    (``[gateway] bind = "tailnet"`` adds ``127.0.0.1`` beside the tailnet IP).
+
     Boot sequence:
     1. Load/validate config
     2. Ensure auth token exists
@@ -2672,6 +2780,11 @@ async def start_gateway_server(
     # Runs before any side effect (file logging, PID lock, services) so a
     # refused start leaves no partial state.
     enforce_public_bind_auth_guard(config)
+    # A Control UI on a public address needs a declared browser origin, or
+    # every console request would be refused by the origin policy.
+    from agentos.gateway.origin_policy import enforce_public_bind_origin_guard
+
+    enforce_public_bind_origin_guard(config)
 
     _setup_file_logging(config)
     if config.config_path:
@@ -3240,7 +3353,13 @@ async def start_gateway_server(
             # handlers are restored: the process died before close() ran.
             setattr(server, "capture_signals", contextlib.nullcontext)
 
-        task = create_background_task(server.serve())
+        listen_hosts = list(dict.fromkeys([config.host, *extra_listen_hosts]))
+        if len(listen_hosts) > 1:
+            # One app, several listeners: uvicorn serves pre-bound sockets.
+            sockets = [bind_listen_socket(host, config.port) for host in listen_hosts]
+            task = create_background_task(server.serve(sockets=sockets))
+        else:
+            task = create_background_task(server.serve())
         server_handle._task = task
 
         # Warn loudly before the normal started line so operators
@@ -3256,7 +3375,12 @@ async def start_gateway_server(
                     "a trusted reverse proxy or VPN."
                 ),
             )
-        log.info("gateway.started", host=config.host, port=config.port)
+        log.info(
+            "gateway.started",
+            host=config.host,
+            port=config.port,
+            extra_hosts=list(extra_listen_hosts) or None,
+        )
 
     # Start channels (after app is ready to receive webhooks)
     channel_start_error: str | None = None
@@ -3304,6 +3428,23 @@ async def start_gateway_server(
     boot_tracker.set_resume_hook(_resume_after_safe_mode)
 
     if run:
+        server_handle._web_push = wire_approval_delivery(
+            config, channel_manager_ref=lambda: _cm_holder[0]
+        )
+        if config.config_path:
+            from types import SimpleNamespace
+
+            from agentos.gateway.config_watcher import ConfigWatcher, broadcast_to_control
+
+            watcher = ConfigWatcher(
+                lambda: SimpleNamespace(config=config, provider_selector=svc.provider_selector),
+                emit=broadcast_to_control,
+            )
+            watcher.start()
+            server_handle._config_watcher = watcher
+        from agentos.gateway.lifecycle_hooks import STARTUP, run_lifecycle_hooks
+
+        create_background_task(run_lifecycle_hooks(STARTUP, config=config, reason="boot"))
         readiness.begin_sidecar(SIDECAR_ROUTER)
         create_background_task(_router_preload_sidecar(config, readiness, SIDECAR_ROUTER))
         # If the previous image restarted in place on request, tell the chat

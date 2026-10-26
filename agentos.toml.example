@@ -682,19 +682,67 @@ cron_default_mode = "bypass"            # off | bypass | full
 # lockout_seconds = 300
 # exempt_loopback = true
 
+# [gateway]
+# Where the gateway listens. Unset: the top-level `host` decides (127.0.0.1).
+#   loopback = 127.0.0.1
+#   lan      = 0.0.0.0, every interface (token auth required)
+#   tailnet  = the `tailscale ip -4` address plus 127.0.0.1; never 0.0.0.0
+#   custom   = the top-level `host` (what --listen / --bind select)
+# bind = "tailnet"
+# The browser origin a public deployment is opened at. Required before the
+# Control UI starts on a specific public address.
+# public_origin = "https://agent.example.com"
+# Apply edits to this file while the gateway runs (restart-only keys are
+# reported as pending instead).
+# config_reload = true
+
 # [control_ui]
-# On a loopback bind the WebSocket handshake, cross-origin HTTP requests, and
-# the HTTP Host header are pinned to loopback origins to block cross-site
-# WebSocket hijacking, drive-by API calls, and DNS rebinding from a page in
-# the operator's browser. When serving the Control UI through a reverse proxy
-# on another host, add that browser origin here (scheme + host [+ port];
-# default ports 80/443 are normalized, so "https://agent.example.com" and
+# On every bind the WebSocket handshake, cross-origin HTTP requests, CORS and
+# the HTTP Host header follow one origin policy, to block cross-site WebSocket
+# hijacking, drive-by API calls, and DNS rebinding from a page in the
+# operator's browser: declared origins, then a private address opened as
+# itself (http://192.168.1.20:18791 on a LAN bind), then a loopback origin on
+# this machine. When serving the Control UI through a reverse proxy on another
+# host, add that browser origin here (scheme + host [+ port]; default ports
+# 80/443 are normalized, so "https://agent.example.com" and
 # "https://agent.example.com:443" are equivalent):
 # allowed_origins = ["https://agent.example.com"]
 # Stream model reasoning ("thinking") into the WebUI live and expose it in chat
 # history as collapsible blocks. WebUI-only: channel adapters (Slack, Telegram,
 # ...) never receive thinking regardless of this flag. Default: true.
 # show_thinking = true
+
+# [artifacts]
+# Keep the deprecated /api/v1/artifacts/{id}?sessionKey= and
+# /api/v1/attachments/{sha256}?sessionKey= URLs this release. Clients use
+# ticketed URLs from the artifacts.download RPC.
+# legacy_session_key_urls = true
+
+# [push]
+# Web Push for approval prompts (Settings -> "Push notifications for approvals").
+# web_enabled = true
+# vapid_subject = "https://useagentos.dev"
+
+# [tools.invoke]
+# Tools POST /api/v1/tools/invoke may run although they are on its hard deny
+# list (shell, file writes, session spawning/sending, cron, gateway, trading).
+# allow = ["create_pdf_report"]
+
+# [hooks]
+# Inbound webhooks: POST /api/v1/hooks/agent | wake | <name>. Their own bearer,
+# never the gateway token; unset = the routes answer 404.
+# token = "<long random secret>"
+# rate_limit_per_minute = 60
+# max_sessions_per_hook = 1
+# [hooks.routes.github]
+# agent = "main"
+# session_key = ""          # empty: agent:main:hook:github
+# template = "PR {{ payload.pull_request.title }} was {{ payload.action }}"
+# [hooks.lifecycle]
+# Shell commands on gateway events (file-only; budgets 10/5/10 s).
+# startup = []
+# shutdown = ["/usr/local/bin/backup-agentos"]
+# pre_restart = []
 
 # [channels]
 # [[channels.channels]]
