@@ -188,11 +188,14 @@ links without a header.
 
 The route answers `HEAD`, one byte range (`Range: bytes=0-1023` → `206`;
 several ranges get the whole file), and `?variant=thumbnail` for a PNG, JPEG or
-WebP still image: a PNG no larger than 1200 px on its longest side (`415` for
-anything else). Every response carries `Content-Security-Policy: default-src
+WebP still image: a PNG no larger than 1200 px on its longest side. Every response carries `Content-Security-Policy: default-src
 'none'; sandbox`, `Content-Disposition: attachment`, `Cache-Control: no-store`
 and `X-Content-Type-Options: nosniff`, so an HTML or SVG file opened directly
-cannot run script. An unknown, expired, revoked or foreign ticket is `404`.
+cannot run script. An unknown, expired, revoked or foreign ticket is `404`; a
+file that no longer matches its recorded hash is `409` with
+`details.code = "INTEGRITY_ERROR"` (the RPC answers `INTERNAL_ERROR` with the
+same reason), and a thumbnail of anything else `415` with
+`details.code = "UNSUPPORTED_MEDIA_TYPE"`.
 
 The `?sessionKey=` routes keep working for this release, with a deprecation
 line in the log the first time each is used, and go away in the next. Turn
@@ -257,15 +260,20 @@ Body: `tool` (required), `args` (object), `action` (merged into `args` for
 tools that take one), `session_key` (runs the tool in that session's context
 and agent), `idempotency_key`, `dry_run`.
 
+Errors have the typed shape `{"ok": false, "error", "code", "details"}`: `code`
+is a category (`INVALID_REQUEST`, `FORBIDDEN`, `NOT_FOUND`, …) and
+`details.code` the specific reason.
+
 | Status | Meaning |
 | --- | --- |
 | `200` `{"ok": true, "result": …}` | The tool ran. A tool that ran and failed answers `200` with `ok: false` and the tool's error class. |
 | `200` `{"dryRun": true, "allowed": …, "policy": {…}}` | `dry_run`: the resolved policy (profile, caller, sandboxed, read-only, may-require-approval); nothing ran. |
-| `403` `POLICY_DENIED` | The configured tool policy (`[tools]` profile/allow/deny, the agent's own entry) refuses it. |
-| `403` `APPROVAL_REQUIRED` | The tool needs a human approval. HTTP calls run unattended, so the tool refuses as on any unattended run; `approval_id` is included when it queued one. |
+| `403` `FORBIDDEN` / `POLICY_DENIED` | The configured tool policy (`[tools]` profile/allow/deny, the agent's own entry) refuses it; `details.error_class` names the refusal. |
+| `403` `FORBIDDEN` / `APPROVAL_REQUIRED` | The tool needs a human approval. HTTP calls run unattended, so the tool refuses as on any unattended run; `details.approval_id` is included when it queued one. |
 | `400` `INVALID_REQUEST` | Bad body, or an argument that writes a file (`output_path`, `save_path`, `output_file`, `destination`, …), refused for every tool. |
 | `404` `NOT_FOUND` | Unknown tool **or** one the endpoint does not run — the two look the same. |
-| `409` `REQUEST_CONFLICT` | The `idempotency_key` was used for a different request in the last ten minutes (a repeat of the same request replays its first answer with `idempotentReplay: true`). |
+| `409` `INVALID_REQUEST` / `REQUEST_CONFLICT` | The `idempotency_key` was used for a different request in the last ten minutes (a repeat of the same request replays its first answer with `idempotentReplay: true`). |
+| `504` `UNAVAILABLE` / `TOOL_TIMEOUT` | The tool did not finish within the tool timeout. |
 
 The endpoint denies by default: it runs only tools whose registration
 declares them read-only (`read_file`, `list_dir`, `grep_search`, `web_search`,
@@ -302,10 +310,11 @@ token they answer `404`.
 Delivery answers `202` with `sessionKey`. Per hook name: `429` past
 `rate_limit_per_minute` (default 60, with `Retry-After`); an `idempotency_key`
 in the body or an `Idempotency-Key` header replays the first answer for five
-minutes (`duplicate: true`), and the same key with a different body is `409
-REQUEST_CONFLICT`; and `409 FANOUT_LIMIT` once the hook has delivered into
-`max_sessions_per_hook` (default 1) distinct sessions within the last hour. A
-malformed or wrong token is `401`, never an error page. See
+minutes (`duplicate: true`), and the same key with a different body is `409`
+with `details.code = "REQUEST_CONFLICT"`; and `409` with `details.code =
+"FANOUT_LIMIT"` once the hook has delivered into `max_sessions_per_hook`
+(default 1) distinct sessions within the last hour. A malformed or wrong token
+is `401`, never an error page. Errors have the same typed shape as above. See
 [Configuration → Inbound webhooks](configuration.md#inbound-webhooks) and
 [Scheduling → Automation](scheduling.md#automation-from-outside).
 

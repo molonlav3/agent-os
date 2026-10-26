@@ -156,8 +156,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `POST /api/v1/tools/invoke` runs one tool without a model turn under the
   same policy chain as an agent's tool call, unattended and sandboxed:
   `dry_run` returns the resolved policy, an approval requirement answers `403`
-  with the `approval_id`, `idempotency_key` replays or answers `409
-  REQUEST_CONFLICT`. Deny by default: only tools declared read-only run; shell
+  with the `approval_id`, `idempotency_key` replays or answers `409` with
+  `details.code = "REQUEST_CONFLICT"`; errors use the typed shape (a category
+  in `code`, the reason in `details.code`). Deny by default: only tools declared read-only run; shell
   and code execution, file and memory writes, session spawning/sending,
   scheduling, gateway control, outbound messages, browser, paid media and
   trading tools answer `404` whatever the flags say, file-writing arguments are

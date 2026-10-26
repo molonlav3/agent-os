@@ -20,10 +20,14 @@ with ``429``; ``idempotency_key`` (body) or an ``Idempotency-Key`` header
 replays the first response for five minutes; and a fan-out cap,
 ``max_sessions_per_hook`` (default 1), on the distinct sessions a hook may
 deliver into within any rolling hour. Reusing an idempotency key for a
-different body is ``409 REQUEST_CONFLICT``. A caller-chosen ``session_key``
-must stay in the hook namespace ``agent:<agent>:hook:...``; only a route's
-own ``session_key`` (written by the operator) can point a hook at an existing
-conversation.
+different body is ``409`` with ``details.code = REQUEST_CONFLICT``. A
+caller-chosen ``session_key`` must stay in the hook namespace
+``agent:<agent>:hook:...``; only a route's own ``session_key`` (written by the
+operator) can point a hook at an existing conversation.
+
+Errors have the gateway's typed shape: ``code`` is a category
+(:class:`~agentos.gateway.protocol.ErrorCode`), ``details.code`` the specific
+reason (:class:`~agentos.gateway.protocol.ErrorDetailCode`).
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from agentos.gateway.config import GatewayConfig
+from agentos.gateway.protocol import ErrorCode, ErrorDetailCode, error_category
 
 log = structlog.get_logger(__name__)
 
@@ -58,16 +63,37 @@ _TEMPLATE_FIELD = re.compile(r"\{\{\s*([A-Za-z0-9_.\-]+)\s*\}\}")
 _HOOK_SEGMENT = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
 
-def _json_error(status: int, code: str, message: str, **headers: str) -> JSONResponse:
+def _error_body(
+    code: ErrorCode | str,
+    message: str,
+    detail: ErrorDetailCode | str | None = None,
+    **details: Any,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {"ok": False, "error": message, "code": str(code)}
+    extra = dict(details)
+    if detail is not None:
+        extra = {"code": str(detail), **extra}
+    if extra:
+        body["details"] = extra
+    return body
+
+
+def _json_error(
+    status: int,
+    code: ErrorCode,
+    message: str,
+    detail: ErrorDetailCode | None = None,
+    *,
+    headers: dict[str, str] | None = None,
+    **details: Any,
+) -> JSONResponse:
     return JSONResponse(
-        {"ok": False, "error": message, "code": code},
-        status_code=status,
-        headers=headers or None,
+        _error_body(code, message, detail, **details), status_code=status, headers=headers
     )
 
 
 def _not_found() -> JSONResponse:
-    return _json_error(404, "NOT_FOUND", "Not found")
+    return _json_error(404, ErrorCode.NOT_FOUND, "Not found")
 
 
 def render_template(template: str, payload: Any) -> str:
@@ -194,10 +220,12 @@ def _check_hook_token(config: Any, presented: str) -> JSONResponse | None:
         return _not_found()
     if isinstance(gateway_token, str) and gateway_token and token_matches(presented, gateway_token):
         return _json_error(
-            401, "UNAUTHORIZED", "The gateway token is not accepted here; use the hooks token"
+            401,
+            ErrorCode.UNAUTHORIZED,
+            "The gateway token is not accepted here; use the hooks token",
         )
     if not token_matches(presented, expected):
-        return _json_error(401, "UNAUTHORIZED", "Unauthorized")
+        return _json_error(401, ErrorCode.UNAUTHORIZED, "Unauthorized")
     return None
 
 
@@ -223,7 +251,7 @@ def _contained(handler: Callable[[Request], Any]) -> Callable[[Request], Any]:
                 error_type=type(exc).__name__,
                 error=(redact_sensitive_text(str(exc)) or "")[:300],
             )
-            return _json_error(500, "INTERNAL_ERROR", "The hook could not be handled")
+            return _json_error(500, ErrorCode.INTERNAL_ERROR, "The hook could not be handled")
 
     return wrapped
 
@@ -267,13 +295,19 @@ def register_inbound_hook_routes(
     async def read_body(request: Request) -> tuple[Any, JSONResponse | None]:
         raw = await request.body()
         if len(raw) > MAX_BODY_BYTES:
-            return None, _json_error(413, "TOO_LARGE", f"body exceeds {MAX_BODY_BYTES} bytes")
+            return None, _json_error(
+                413,
+                ErrorCode.INVALID_REQUEST,
+                f"body exceeds {MAX_BODY_BYTES} bytes",
+                ErrorDetailCode.PAYLOAD_TOO_LARGE,
+                limit_bytes=MAX_BODY_BYTES,
+            )
         if not raw.strip():
             return {}, None
         try:
             return json.loads(raw), None
         except ValueError:
-            return None, _json_error(400, "INVALID_REQUEST", "body must be JSON")
+            return None, _json_error(400, ErrorCode.INVALID_REQUEST, "body must be JSON")
 
     def idempotency_key(request: Request, body: Any) -> str | None:
         key = body.get("idempotency_key") if isinstance(body, dict) else None
@@ -286,24 +320,30 @@ def register_inbound_hook_routes(
         hook: str, agent_id: str, session_key: str, message: str, provenance: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
         if not message.strip():
-            return 400, {"ok": False, "error": "message is empty", "code": "INVALID_REQUEST"}
+            return 400, _error_body(ErrorCode.INVALID_REQUEST, "message is empty")
         hooks = _hooks_config(config)
         cap = int(getattr(hooks, "max_sessions_per_hook", 1) or 1)
         if not state.admit_session(hook, session_key, cap):
-            return 409, {
-                "ok": False,
-                "error": f"hook {hook!r} already delivers into {cap} session(s)",
-                "code": "FANOUT_LIMIT",
-            }
+            return 409, _error_body(
+                ErrorCode.INVALID_REQUEST,
+                f"hook {hook!r} already delivers into {cap} session(s)",
+                ErrorDetailCode.FANOUT_LIMIT,
+                limit=cap,
+            )
         if len(message) > MAX_MESSAGE_CHARS:
             message = message[:MAX_MESSAGE_CHARS]
         result = await dispatch_message(session_key, message, provenance)
         if isinstance(result, dict) and result.get("ok") is False:
-            return 502, {
-                "ok": False,
-                "error": str(result.get("error") or "the turn could not be queued"),
-                "code": str(result.get("code") or "UNAVAILABLE"),
-            }
+            # The turn's own error code (a category, or a reason such as
+            # QUEUE_FULL) keeps its category; the reason goes in details.
+            raw = str(result.get("code") or "")
+            category = error_category(raw) or ErrorCode.UNAVAILABLE
+            detail = result.get("detail") or (raw if raw and raw != category else None)
+            return 502, _error_body(
+                category,
+                str(result.get("error") or "the turn could not be queued"),
+                str(detail) if detail else None,
+            )
         log.info("gateway.hook_delivered", hook=hook, agent_id=agent_id, session_key=session_key)
         payload = {"ok": True, "hook": hook, "sessionKey": session_key}
         if isinstance(result, dict):
@@ -325,9 +365,9 @@ def register_inbound_hook_routes(
         if retry is not None:
             return _json_error(
                 429,
-                "RATE_LIMITED",
+                ErrorCode.RATE_LIMITED,
                 "Too many requests for this hook",
-                **{"Retry-After": str(int(retry))},
+                headers={"Retry-After": str(int(retry))},
             )
         body, error = await read_body(request)
         if error is not None:
@@ -340,8 +380,9 @@ def register_inbound_hook_routes(
                 if replay.fingerprint != fingerprint:
                     return _json_error(
                         409,
-                        "REQUEST_CONFLICT",
+                        ErrorCode.INVALID_REQUEST,
                         "idempotency_key was already used for a different request",
+                        ErrorDetailCode.REQUEST_CONFLICT,
                     )
                 return JSONResponse({**replay.body, "duplicate": True}, status_code=replay.status)
         status, payload = await handler(body)
@@ -352,14 +393,10 @@ def register_inbound_hook_routes(
     async def agent_hook(request: Request) -> JSONResponse:
         async def handle(body: Any) -> tuple[int, dict[str, Any]]:
             if not isinstance(body, dict):
-                return 400, {
-                    "ok": False,
-                    "error": "body must be an object",
-                    "code": "INVALID_REQUEST",
-                }
+                return 400, _error_body(ErrorCode.INVALID_REQUEST, "body must be an object")
             message = body.get("message")
             if not isinstance(message, str):
-                return 400, {"ok": False, "error": "message is required", "code": "INVALID_REQUEST"}
+                return 400, _error_body(ErrorCode.INVALID_REQUEST, "message is required")
             agent_id = normalize_agent_id(str(body.get("agent") or "main"))
             requested = body.get("session_key", body.get("sessionKey"))
             if requested is None:
@@ -367,11 +404,9 @@ def register_inbound_hook_routes(
             elif isinstance(requested, str) and _in_hook_namespace(requested.strip(), agent_id):
                 session_key = requested.strip()
             else:
-                return 403, {
-                    "ok": False,
-                    "error": f"session_key must be under agent:{agent_id}:hook:",
-                    "code": "FORBIDDEN",
-                }
+                return 403, _error_body(
+                    ErrorCode.FORBIDDEN, f"session_key must be under agent:{agent_id}:hook:"
+                )
             return await deliver(
                 "agent",
                 agent_id,
@@ -387,10 +422,10 @@ def register_inbound_hook_routes(
             reason = body.get("reason") if isinstance(body, dict) else None
             reason = str(reason)[:200] if reason else "webhook"
             if wake is None:
-                return 503, {"ok": False, "error": "no heartbeat to wake", "code": "UNAVAILABLE"}
+                return 503, _error_body(ErrorCode.UNAVAILABLE, "no heartbeat to wake")
             woke = wake(f"hook:{reason}")
             if not woke:
-                return 503, {"ok": False, "error": "no heartbeat to wake", "code": "UNAVAILABLE"}
+                return 503, _error_body(ErrorCode.UNAVAILABLE, "no heartbeat to wake")
             log.info("gateway.hook_wake", reason=reason)
             return 202, {"ok": True, "hook": "wake", "reason": reason}
 

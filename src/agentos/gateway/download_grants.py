@@ -39,6 +39,7 @@ from starlette.types import Send
 
 from agentos.gateway.access import CONTROL_ONLY
 from agentos.gateway.config import GatewayConfig
+from agentos.gateway.protocol import ErrorCode, ErrorDetailCode
 from agentos.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 
 log = structlog.get_logger(__name__)
@@ -245,18 +246,18 @@ async def _handle_artifacts_download(params: dict | None, ctx: RpcContext) -> di
                 config, session_manager, session_key, artifact_id
             )
         except ArtifactIntegrityError as exc:
-            raise RpcHandlerError("INTEGRITY_ERROR", str(exc)) from exc
+            raise _integrity_error(exc) from exc
         except ArtifactNotFoundError as exc:
-            raise RpcHandlerError("NOT_FOUND", "artifact not found") from exc
+            raise RpcHandlerError(ErrorCode.NOT_FOUND, "artifact not found") from exc
         grant = grants.mint(conn_id, "artifact", ref.id, session_key, name=ref.name, mime=ref.mime)
         size = ref.size
     else:
         try:
             path = await resolve_attachment_download(config, session_manager, session_key, sha)
         except AttachmentIntegrityError as exc:
-            raise RpcHandlerError("INTEGRITY_ERROR", str(exc)) from exc
+            raise _integrity_error(exc) from exc
         except AttachmentNotFoundError as exc:
-            raise RpcHandlerError("NOT_FOUND", "attachment not found") from exc
+            raise RpcHandlerError(ErrorCode.NOT_FOUND, "attachment not found") from exc
         grant = grants.mint(
             conn_id,
             "attachment",
@@ -302,14 +303,27 @@ def content_disposition(name: str) -> str:
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(cleaned, safe='')}"
 
 
+def _integrity_error(exc: Exception) -> RpcHandlerError:
+    return RpcHandlerError(
+        ErrorCode.INTERNAL_ERROR,
+        str(exc),
+        details={"code": ErrorDetailCode.INTEGRITY_ERROR.value},
+    )
+
+
+def _json_error(
+    status: int, code: ErrorCode, message: str, detail: ErrorDetailCode | None = None
+) -> JSONResponse:
+    body: dict[str, Any] = {"error": message, "code": code.value}
+    if detail is not None:
+        body["details"] = {"code": detail.value}
+    return JSONResponse(body, status_code=status, headers={"Cache-Control": "no-store"})
+
+
 def _not_found() -> JSONResponse:
     # One answer for an unknown, expired, revoked or foreign ticket: the
     # route never tells a caller which of those it hit.
-    return JSONResponse(
-        {"error": "Download not found", "code": "NOT_FOUND"},
-        status_code=404,
-        headers={"Cache-Control": "no-store"},
-    )
+    return _json_error(404, ErrorCode.NOT_FOUND, "Download not found")
 
 
 def make_thumbnail(path: Path, max_edge: int = THUMBNAIL_MAX_EDGE) -> bytes | None:
@@ -383,10 +397,12 @@ def register_download_routes(
         except (ArtifactNotFoundError, AttachmentNotFoundError):
             return _not_found()
         except (ArtifactIntegrityError, AttachmentIntegrityError):
-            return JSONResponse(
-                {"error": "Download integrity check failed", "code": "INTEGRITY_ERROR"},
-                status_code=409,
-                headers={"Cache-Control": "no-store"},
+            # 409 as on the legacy ?sessionKey= routes; the reason is typed.
+            return _json_error(
+                409,
+                ErrorCode.INTERNAL_ERROR,
+                "Download integrity check failed",
+                ErrorDetailCode.INTEGRITY_ERROR,
             )
 
         headers = dict(SANDBOX_HEADERS)
@@ -394,10 +410,11 @@ def register_download_routes(
         if variant == "thumbnail":
             thumbnail = await anyio.to_thread.run_sync(make_thumbnail, path)
             if thumbnail is None:
-                return JSONResponse(
-                    {"error": "No thumbnail for this file", "code": "UNSUPPORTED_MEDIA_TYPE"},
-                    status_code=415,
-                    headers={"Cache-Control": "no-store"},
+                return _json_error(
+                    415,
+                    ErrorCode.INVALID_REQUEST,
+                    "No thumbnail for this file",
+                    ErrorDetailCode.UNSUPPORTED_MEDIA_TYPE,
                 )
             stem = name.rsplit(".", 1)[0] if "." in name else name
             headers["Content-Disposition"] = content_disposition(f"{stem or 'image'}-thumb.png")
@@ -405,11 +422,7 @@ def register_download_routes(
             headers["Content-Length"] = str(len(thumbnail))
             return Response(body, media_type="image/png", headers=headers)
         if variant:
-            return JSONResponse(
-                {"error": f"Unknown variant {variant!r}", "code": "INVALID_REQUEST"},
-                status_code=400,
-                headers={"Cache-Control": "no-store"},
-            )
+            return _json_error(400, ErrorCode.INVALID_REQUEST, f"Unknown variant {variant!r}")
         headers["Content-Disposition"] = content_disposition(name)
         return _SingleRangeFileResponse(path, media_type=mime, headers=headers)
 
@@ -427,11 +440,7 @@ def register_download_routes(
                 error_type=type(exc).__name__,
                 error=(redact_sensitive_text(str(exc)) or "")[:300],
             )
-            return JSONResponse(
-                {"error": "Download failed", "code": "INTERNAL_ERROR"},
-                status_code=500,
-                headers={"Cache-Control": "no-store"},
-            )
+            return _json_error(500, ErrorCode.INTERNAL_ERROR, "Download failed")
 
     app.router.routes.append(
         Route(

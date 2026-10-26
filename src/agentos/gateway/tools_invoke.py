@@ -17,13 +17,17 @@ directly. The call goes through the same chain as an agent's tool call:
    ``403``;
 4. the tool itself, inside an unattended, sandboxed tool context. A tool that
    needs a human approval does what it does on any unattended run: it
-   refuses, and the endpoint answers ``403`` with ``APPROVAL_REQUIRED`` (and
-   the ``approval_id`` when the tool queued one).
+   refuses, and the endpoint answers ``403`` with ``details.code =
+   APPROVAL_REQUIRED`` (and the ``approval_id`` when the tool queued one).
 
 ``dry_run`` stops after step 3 and returns the resolved policy.
 ``idempotency_key`` replays the first response for the same request for ten
-minutes and answers ``409 REQUEST_CONFLICT`` when the key is reused for a
-different one.
+minutes and answers ``409`` with ``details.code = REQUEST_CONFLICT`` when the
+key is reused for a different one.
+
+Errors have the gateway's typed shape: ``code`` is a category
+(:class:`~agentos.gateway.protocol.ErrorCode`) and ``details.code`` the
+specific reason (:class:`~agentos.gateway.protocol.ErrorDetailCode`).
 """
 
 from __future__ import annotations
@@ -45,11 +49,11 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from agentos.gateway.config import GatewayConfig
+from agentos.gateway.protocol import ErrorCode, ErrorDetailCode
 
 log = structlog.get_logger(__name__)
 
 INVOKE_PATH = "/api/v1/tools/invoke"
-REQUEST_CONFLICT = "REQUEST_CONFLICT"
 IDEMPOTENCY_TTL_SECONDS = 600.0
 IDEMPOTENCY_MAX_ENTRIES = 1024
 DEFAULT_INVOKE_TIMEOUT_SECONDS = 120.0
@@ -243,12 +247,33 @@ def request_fingerprint(body: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _error(status: int, code: str, message: str, **extra: Any) -> tuple[int, dict[str, Any]]:
-    return status, {"ok": False, "error": message, "code": code, **extra}
+def _error(
+    status: int,
+    code: ErrorCode,
+    message: str,
+    detail: ErrorDetailCode | None = None,
+    **details: Any,
+) -> tuple[int, dict[str, Any]]:
+    """``(status, body)`` in the typed shape: a category in ``code``, the
+    reason and its data in ``details``."""
+    body: dict[str, Any] = {"ok": False, "error": message, "code": code.value}
+    extra = {key: value for key, value in details.items() if value is not None}
+    if detail is not None:
+        extra = {"code": detail.value, **extra}
+    if extra:
+        body["details"] = extra
+    return status, body
+
+
+def _respond(
+    status: int, code: ErrorCode, message: str, detail: ErrorDetailCode | None = None
+) -> JSONResponse:
+    status, body = _error(status, code, message, detail)
+    return JSONResponse(body, status_code=status)
 
 
 def _not_found() -> tuple[int, dict[str, Any]]:
-    return _error(404, "NOT_FOUND", "Tool not found")
+    return _error(404, ErrorCode.NOT_FOUND, "Tool not found")
 
 
 def build_invoke_tool_context(
@@ -345,21 +370,21 @@ async def invoke_tool(
 
     tool = body.get("tool")
     if not isinstance(tool, str) or not tool.strip():
-        return _error(400, "INVALID_REQUEST", "tool is required")
+        return _error(400, ErrorCode.INVALID_REQUEST, "tool is required")
     tool = tool.strip()
     args = body.get("args", {})
     if args is None:
         args = {}
     if not isinstance(args, dict):
-        return _error(400, "INVALID_REQUEST", "args must be an object")
+        return _error(400, ErrorCode.INVALID_REQUEST, "args must be an object")
     action = body.get("action")
     if action is not None:
         if not isinstance(action, str) or not action.strip():
-            return _error(400, "INVALID_REQUEST", "action must be a non-empty string")
+            return _error(400, ErrorCode.INVALID_REQUEST, "action must be a non-empty string")
         args = {**args, "action": action.strip()} if "action" not in args else args
     session_key = body.get("session_key", body.get("sessionKey"))
     if session_key is not None and (not isinstance(session_key, str) or not session_key.strip()):
-        return _error(400, "INVALID_REQUEST", "session_key must be a non-empty string")
+        return _error(400, ErrorCode.INVALID_REQUEST, "session_key must be a non-empty string")
     session_key = session_key.strip() if isinstance(session_key, str) else None
     dry_run = bool(body.get("dry_run", body.get("dryRun", False)))
 
@@ -371,7 +396,7 @@ async def invoke_tool(
     if writes:
         return _error(
             400,
-            "INVALID_REQUEST",
+            ErrorCode.INVALID_REQUEST,
             f"argument {writes[0]!r} writes a file, which this endpoint does not do",
         )
 
@@ -396,9 +421,10 @@ async def invoke_tool(
         envelope = _envelope(denial)
         return _error(
             403,
-            "POLICY_DENIED",
+            ErrorCode.FORBIDDEN,
             str(envelope.get("user_message") or "Tool not available in this context."),
-            errorClass=envelope.get("error_class"),
+            ErrorDetailCode.POLICY_DENIED,
+            error_class=envelope.get("error_class"),
         )
 
     capture = _ApprovalCapture()
@@ -408,7 +434,12 @@ async def invoke_tool(
     try:
         result = await asyncio.wait_for(handler(call), timeout=limit)
     except TimeoutError:
-        return _error(504, "TIMEOUT", f"tool {tool!r} did not finish within {limit:.0f}s")
+        return _error(
+            504,
+            ErrorCode.UNAVAILABLE,
+            f"tool {tool!r} did not finish within {limit:.0f}s",
+            ErrorDetailCode.TOOL_TIMEOUT,
+        )
     duration_ms = int((time.monotonic() - started) * 1000)
     value = _result_value(result.content)
     approval = _approval_gate(result, value, capture.approval_id)
@@ -455,7 +486,7 @@ class _ApprovalCapture:
 def _approval_gate(
     result: Any, value: Any, captured_id: str | None
 ) -> tuple[int, dict[str, Any]] | None:
-    """A tool that stopped for a human approval, mapped to ``403 APPROVAL_REQUIRED``."""
+    """A tool that stopped for a human approval: ``403``, ``APPROVAL_REQUIRED``."""
     status = getattr(result, "execution_status", None) or {}
     pending = status.get("reason") == "approval_pending" if isinstance(status, dict) else False
     message = "This call needs a human approval."
@@ -468,8 +499,13 @@ def _approval_gate(
             pending = pending or "approval" in message.lower()
     if not pending:
         return None
-    extra = {"approval_id": str(captured_id)} if captured_id else {}
-    return _error(403, "APPROVAL_REQUIRED", message, **extra)
+    return _error(
+        403,
+        ErrorCode.FORBIDDEN,
+        message,
+        ErrorDetailCode.APPROVAL_REQUIRED,
+        approval_id=str(captured_id) if captured_id else None,
+    )
 
 
 def _tool_timeout(config: Any) -> float:
@@ -504,9 +540,7 @@ def register_tools_invoke_route(
         rpc_ctx = make_ctx(request)
         access = rpc_ctx.access
         if not access.admitted or access.surface is not ConnectionSurface.CONTROL:
-            return JSONResponse(
-                {"ok": False, "error": "Unauthorized", "code": "UNAUTHORIZED"}, status_code=401
-            )
+            return _respond(401, ErrorCode.UNAUTHORIZED, "Unauthorized")
         binding = agent_binding(rpc_ctx)
         if binding is not None and binding.via != "unbound":
             # A connection the gateway recognizes as an agent's (its token, an
@@ -514,31 +548,19 @@ def register_tools_invoke_route(
             # policy; a side door that resolves a fresh context is not one.
             # An unbound caller -- a script holding the gateway token -- is
             # who this endpoint is for.
-            return JSONResponse(
-                {"ok": False, "error": "Not available to an agent", "code": "FORBIDDEN"},
-                status_code=403,
-            )
+            return _respond(403, ErrorCode.FORBIDDEN, "Not available to an agent")
         try:
             body = await request.json()
         except Exception:
-            return JSONResponse(
-                {"ok": False, "error": "Invalid JSON body", "code": "INVALID_REQUEST"},
-                status_code=400,
-            )
+            return _respond(400, ErrorCode.INVALID_REQUEST, "Invalid JSON body")
         if not isinstance(body, dict):
-            return JSONResponse(
-                {"ok": False, "error": "body must be an object", "code": "INVALID_REQUEST"},
-                status_code=400,
-            )
+            return _respond(400, ErrorCode.INVALID_REQUEST, "body must be an object")
         from agentos.tools.registry import get_default_registry
 
         registry = tool_registry or get_default_registry()
         key = body.get("idempotency_key", body.get("idempotencyKey"))
         if key is not None and (not isinstance(key, str) or not key.strip() or len(key) > 200):
-            return JSONResponse(
-                {"ok": False, "error": "invalid idempotency_key", "code": "INVALID_REQUEST"},
-                status_code=400,
-            )
+            return _respond(400, ErrorCode.INVALID_REQUEST, "invalid idempotency_key")
 
         async def run() -> tuple[int, dict[str, Any]]:
             return await invoke_tool(
@@ -551,13 +573,11 @@ def register_tools_invoke_route(
 
         verdict, future = idempotency.claim(key.strip(), request_fingerprint(body))
         if verdict == "conflict":
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": "idempotency_key was already used for a different request",
-                    "code": REQUEST_CONFLICT,
-                },
-                status_code=409,
+            return _respond(
+                409,
+                ErrorCode.INVALID_REQUEST,
+                "idempotency_key was already used for a different request",
+                ErrorDetailCode.REQUEST_CONFLICT,
             )
         if verdict == "replay":
             status, payload = await asyncio.shield(future)
@@ -587,14 +607,7 @@ def register_tools_invoke_route(
                 error_type=type(exc).__name__,
                 error=(redact_sensitive_text(str(exc)) or "")[:300],
             )
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": "The tool call could not be handled",
-                    "code": "INTERNAL_ERROR",
-                },
-                status_code=500,
-            )
+            return _respond(500, ErrorCode.INTERNAL_ERROR, "The tool call could not be handled")
 
     app.router.routes.append(Route(INVOKE_PATH, contained, methods=["POST"]))
 
@@ -603,7 +616,6 @@ __all__ = [
     "HARD_DENY_PREFIXES",
     "HARD_DENY_TOOLS",
     "INVOKE_PATH",
-    "REQUEST_CONFLICT",
     "IdempotencyCache",
     "build_invoke_tool_context",
     "invoke_tool",

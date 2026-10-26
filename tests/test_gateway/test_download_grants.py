@@ -307,6 +307,8 @@ class TestRoute:
         url = await _artifact_url(tmp_path, config)
         resp = TestClient(_route_app(config)).get(url + "?variant=thumbnail")
         assert resp.status_code == 415
+        assert resp.json()["code"] == "INVALID_REQUEST"
+        assert resp.json()["details"] == {"code": "UNSUPPORTED_MEDIA_TYPE"}
 
     @pytest.mark.asyncio
     async def test_unknown_variant(self, tmp_path: Path) -> None:
@@ -485,8 +487,15 @@ class TestVerificationIsCached:
         assert len(hashed) == 1
         # A changed file is verified again (and here fails the integrity check).
         Path(path).write_bytes(b"y" * 4096)
-        assert client.get(res.payload["url"]).status_code == 409
+        changed = client.get(res.payload["url"])
+        assert changed.status_code == 409
+        assert changed.json()["details"] == {"code": "INTEGRITY_ERROR"}
         assert len(hashed) == 2
+        # Minting a ticket for the altered file is refused with the same reason.
+        again = await _mint(config, {"session_key": SESSION_KEY, "attachment_sha256": sha})
+        assert again.error is not None
+        assert again.error.code == "INTERNAL_ERROR"
+        assert again.error.details == {"code": "INTEGRITY_ERROR"}
 
     @pytest.mark.asyncio
     async def test_artifact_is_resolved_once_while_unchanged(

@@ -327,7 +327,8 @@ class TestInboundHooks:
             headers=_auth(),
         )
         assert (first.status_code, again.status_code, other.status_code) == (202, 202, 409)
-        assert other.json()["code"] == "FANOUT_LIMIT"
+        assert other.json()["code"] == "INVALID_REQUEST"
+        assert other.json()["details"] == {"code": "FANOUT_LIMIT", "limit": 1}
 
     def test_idempotency_key_replays_the_first_response(self) -> None:
         client, recorder = _hooks_client()
@@ -422,6 +423,8 @@ class TestInboundHooks:
         client, _ = _hooks_client()
         too_big = client.post("/api/v1/hooks/agent", content=b"x" * (300 * 1024), headers=_auth())
         assert too_big.status_code == 413
+        assert too_big.json()["code"] == "INVALID_REQUEST"
+        assert too_big.json()["details"]["code"] == "PAYLOAD_TOO_LARGE"
         not_json = client.post("/api/v1/hooks/agent", content=b"{nope", headers=_auth())
         assert not_json.status_code == 400
 
@@ -501,7 +504,8 @@ class TestHookAuthHardening:
             "/api/v1/hooks/agent", json={"message": "b", "idempotency_key": "k"}, headers=_auth()
         )
         assert (first.status_code, second.status_code) == (202, 409)
-        assert second.json()["code"] == "REQUEST_CONFLICT"
+        assert second.json()["code"] == "INVALID_REQUEST"
+        assert second.json()["details"] == {"code": "REQUEST_CONFLICT"}
         assert len(recorder.messages) == 1
 
     def test_fan_out_cap_is_a_rolling_window(self) -> None:

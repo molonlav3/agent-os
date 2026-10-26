@@ -73,8 +73,9 @@ CI and the desktop: `{"tool": "web_search", "args": {...}}`. It applies the
 same policy an agent's tool call gets — the `[tools]` profile, allow and deny
 lists, the agent's own entry, the runtime capability surface and the dispatch
 policy chain — in an unattended, sandboxed context, so a tool that needs an
-approval refuses (`403 APPROVAL_REQUIRED`, with the `approval_id` when one was
-queued). `dry_run: true` returns the resolved policy without running anything.
+approval refuses (`403` with `details.code = "APPROVAL_REQUIRED"` and the
+`details.approval_id` when one was queued). `dry_run: true` returns the
+resolved policy without running anything.
 
 It denies by default: only tools whose registration declares them read-only
 run. A name floor holds on top, whatever the configuration says: shell,

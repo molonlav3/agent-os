@@ -117,6 +117,13 @@ class ErrorDetailCode(StrEnum):
     INVALID_CONNECT_PARAMS = "INVALID_CONNECT_PARAMS"
     PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
     METHOD_NOT_ALLOWED_OVER_HTTP = "METHOD_NOT_ALLOWED_OVER_HTTP"
+    # Direct tool calls, inbound hooks and ticketed downloads.
+    POLICY_DENIED = "POLICY_DENIED"
+    APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
+    TOOL_TIMEOUT = "TOOL_TIMEOUT"
+    FANOUT_LIMIT = "FANOUT_LIMIT"
+    INTEGRITY_ERROR = "INTEGRITY_ERROR"
+    UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE"
 
 
 #: The canonical categories: what a client may branch on without knowing

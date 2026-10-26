@@ -742,10 +742,12 @@ def create_gateway_app(
         if result.ok:
             return dict(result.payload or {})
         error = result.error
+        details = error.details if error is not None else None
         return {
             "ok": False,
             "error": error.message if error else "error",
-            "code": error.code if error else "INTERNAL_ERROR",
+            "code": error.code if error else ErrorCode.INTERNAL_ERROR.value,
+            "detail": details.get("code") if isinstance(details, dict) else None,
         }
 
     def _hook_wake(reason: str) -> bool:
@@ -755,7 +757,10 @@ def create_gateway_app(
         return True
 
     register_inbound_hook_routes(
-        app, config=config, dispatch_message=_hook_dispatch, wake=_hook_wake
+        app,
+        config=config,
+        dispatch_message=_hook_dispatch,
+        wake=_hook_wake,
     )
     from agentos.gateway.tools_invoke import register_tools_invoke_route  # noqa: PLC0415
 

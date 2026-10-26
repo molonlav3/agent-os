@@ -210,7 +210,11 @@ class TestInvoke:
         tools = ToolsConfig(deny=["lookup"])
         resp = _invoke(_client(_registry([]), tools=tools), {"tool": "lookup"})
         assert resp.status_code == 403
-        assert resp.json()["code"] == "POLICY_DENIED"
+        body = resp.json()
+        # Typed shape: the category on top, the reason in details.
+        assert body["code"] == "FORBIDDEN"
+        assert body["details"]["code"] == "POLICY_DENIED"
+        assert body["details"]["error_class"] == "PolicyDenied"
 
     def test_profile_allowlist_applies(self) -> None:
         tools = ToolsConfig(profile="minimal")
@@ -240,8 +244,9 @@ class TestInvoke:
     def test_approval_requirement_is_403_with_the_approval_id(self) -> None:
         resp = _invoke(_client(_registry([])), {"tool": "needs_human"})
         assert resp.status_code == 403
-        assert resp.json()["code"] == "APPROVAL_REQUIRED"
-        assert resp.json()["approval_id"] == "abc123"
+        body = resp.json()
+        assert body["code"] == "FORBIDDEN"
+        assert body["details"] == {"code": "APPROVAL_REQUIRED", "approval_id": "abc123"}
 
     def test_tool_failure_is_reported_without_internals(self) -> None:
         resp = _invoke(_client(_registry([])), {"tool": "boom"})
@@ -292,7 +297,8 @@ class TestIdempotency:
             client, {"tool": "lookup", "args": {"query": "b"}, "idempotency_key": "k-2"}
         )
         assert conflict.status_code == 409
-        assert conflict.json()["code"] == "REQUEST_CONFLICT"
+        assert conflict.json()["code"] == "INVALID_REQUEST"
+        assert conflict.json()["details"] == {"code": "REQUEST_CONFLICT"}
 
     def test_entries_expire(self) -> None:
         now = [0.0]
