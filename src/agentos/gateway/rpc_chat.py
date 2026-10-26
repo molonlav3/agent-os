@@ -15,6 +15,7 @@ from agentos.gateway.access import CONTROL_AND_CHANNEL, CONTROL_ONLY
 from agentos.gateway.config import GatewayConfig
 from agentos.gateway.context_overflow import apply_context_overflow_policy
 from agentos.gateway.idempotency import get_idempotency_cache, idempotency_key, request_fingerprint
+from agentos.gateway.protocol import ErrorCode, ErrorDetailCode
 from agentos.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
 from agentos.gateway.session_events import build_sessions_changed_payload
 from agentos.session.compaction import (
@@ -821,9 +822,13 @@ async def _handle_chat_entry(params: dict | None, ctx: RpcContext) -> dict:
         size = _message_size(message)
         if size > _CHAT_ENTRY_MAX_BYTES:
             raise RpcHandlerError(
-                "ENTRY_TOO_LARGE",
+                ErrorCode.INVALID_REQUEST,
                 "This message is too large to send in one frame.",
-                details={"entry_id": entry_id, "byte_size": size},
+                details={
+                    "code": ErrorDetailCode.PAYLOAD_TOO_LARGE.value,
+                    "entry_id": entry_id,
+                    "byte_size": size,
+                },
             )
         _annotate_transcript_attachment_downloads([message], session_key=session_key)
         return {

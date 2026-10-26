@@ -25,7 +25,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from agentos.gateway.protocol import DEDUPE_MAX_ENTRIES, DEDUPE_TTL_MS, ERROR_INVALID_REQUEST
+from agentos.gateway.protocol import (
+    DEDUPE_MAX_ENTRIES,
+    DEDUPE_TTL_MS,
+    ErrorCode,
+    ErrorDetailCode,
+)
 from agentos.gateway.rpc import RpcHandlerError
 
 #: Request fields that are not part of the request's meaning.
@@ -61,9 +66,9 @@ def request_fingerprint(params: Any) -> str:
 
 def request_conflict(key: str) -> RpcHandlerError:
     return RpcHandlerError(
-        ERROR_INVALID_REQUEST,
+        ErrorCode.INVALID_REQUEST,
         "This idempotency_key was already used for a different request.",
-        details={"code": "REQUEST_CONFLICT", "idempotency_key": key},
+        details={"code": ErrorDetailCode.REQUEST_CONFLICT.value, "idempotency_key": key},
     )
 
 

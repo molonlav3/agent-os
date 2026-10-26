@@ -337,7 +337,7 @@ client's cursor or `replay_gap_reason: "cursor_ahead_of_stream"`.
 `chat.history` answers stay under 6 MiB. A message over 128 KiB arrives as a
 placeholder (`placeholder: true`, `byte_size`, `entry_id`, the tool calls'
 identity, a short text preview); `chat.entry {sessionKey, entryId}` returns the
-full row. `delta_cursor` (a `newest_cursor` from an earlier answer) returns only
+full row (over 20 MiB it answers `INVALID_REQUEST` with `PAYLOAD_TOO_LARGE`). `delta_cursor` (a `newest_cursor` from an earlier answer) returns only
 the rows after it (`kind: "delta"`, at most 200 rows / 1 MiB, `has_more` when
 there are more), or `kind: "reset"` with the latest page when the cursor no
 longer names a row. Assistant text, in history and in `text_delta` frames, is
