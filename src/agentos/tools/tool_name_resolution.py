@@ -20,6 +20,7 @@ wrapped in a namespace prefix or call counter.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import structlog
@@ -28,7 +29,7 @@ from agentos.tools.registry import ToolRegistry
 from agentos.tools.types import ToolContext
 from agentos.tools.visibility import is_tool_visible
 
-__all__ = ["ToolNameResolution", "resolve_tool_name"]
+__all__ = ["ToolNameResolution", "resolve_tool_name", "resolve_tool_name_among"]
 
 log = structlog.get_logger("agentos.tools.dispatch")
 
@@ -90,12 +91,29 @@ def resolve_tool_name(
 
     if not isinstance(requested, str) or not requested.strip():
         return None
+    visible = [rt.spec.name for rt in registry.all_tools() if is_tool_visible(rt, ctx)]
+    return resolve_tool_name_among(requested, visible)
+
+
+def resolve_tool_name_among(
+    requested: str,
+    offered: Iterable[str],
+) -> ToolNameResolution | None:
+    """Return the single name in ``offered`` that ``requested`` unambiguously means.
+
+    ``offered`` is the set of tool names the caller may use (for a model turn,
+    the tool definitions sent with the request). An exact hit is not a
+    resolution: callers check that first.
+    """
+
+    if not isinstance(requested, str) or not requested.strip():
+        return None
     name, rules = _strip_decorations(requested)
     if not name:
         return None
 
-    visible = [rt.spec.name for rt in registry.all_tools() if is_tool_visible(rt, ctx)]
-    if name != requested and name in visible:
+    names = list(dict.fromkeys(offered))
+    if name != requested and name in names:
         return ToolNameResolution(requested=requested, resolved=name, rules=tuple(rules))
 
     if _is_mcp_name(name):
@@ -103,7 +121,7 @@ def resolve_tool_name(
     key = _loose_key(name)
     candidates = [
         candidate
-        for candidate in visible
+        for candidate in names
         if not _is_mcp_name(candidate) and _loose_key(candidate) == key
     ]
     if len(candidates) != 1:

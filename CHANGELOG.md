@@ -11,6 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   tool it means: a `functions.`/`tools.` prefix and a `:<n>` counter are
   dropped, case is ignored and `/` reads as `_`. The match must be unique among
   the tools the session can see; MCP tool names are only ever matched exactly.
+  The engine resolves the name as the call arrives, so concurrency, timeouts,
+  approvals, stream events and the saved `tool_use` block use the real name.
 - Tools: arguments are validated against the tool's schema before hooks,
   policy and approvals. Lossless mistakes (`"5"` for an integer, `"true"` for
   a boolean, a JSON-encoded string for an array or object) are coerced;

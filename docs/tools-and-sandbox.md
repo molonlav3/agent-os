@@ -79,7 +79,9 @@ checked once:
   match must be unique; two tools that differ only by case, or no match at all,
   still answer `ToolNotFound`. MCP tool names (`mcp_…`) are never matched
   loosely, only exactly (a namespace prefix or counter around the exact name is
-  still dropped).
+  still dropped). The name is resolved against the tools offered to the model
+  as soon as the call arrives, so scheduling, timeouts, approvals, stream
+  events and the saved transcript all use the real tool name.
 - **Arguments.** They are validated against the tool's schema (`type`,
   `properties`, `required`, `items`, `enum`, `additionalProperties`,
   `anyOf`/`oneOf`). Lossless mistakes are repaired: `"5"` for an integer or

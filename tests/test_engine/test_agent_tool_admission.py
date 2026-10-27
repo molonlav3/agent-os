@@ -161,3 +161,174 @@ def _args_hash(arguments: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
+
+
+class _BatchProvider:
+    """Emits one batch of tool calls, then answers in text."""
+
+    provider_name = "fake"
+
+    def __init__(self, calls: list[tuple[str, str, dict[str, Any]]]) -> None:
+        self.batch = calls
+        self.calls: list[list[Message]] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls.append(messages)
+        return self._stream(len(self.calls))
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number > 1:
+            yield ProviderText(text="done")
+            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+            return
+        for tool_use_id, name, arguments in self.batch:
+            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name=name)
+            yield ProviderToolUseEnd(tool_use_id=tool_use_id, tool_name=name, arguments=arguments)
+        yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+async def test_misnamed_calls_are_scheduled_and_approved_under_their_real_names(
+    monkeypatch: Any,
+) -> None:
+    import asyncio
+
+    import agentos.engine.agent as agent_module
+    from agentos.engine.tool_batch import registry_spec_lookup
+    from agentos.engine.types import ToolUseStartEvent
+
+    active: set[str] = set()
+    peak_reads = 0
+    exec_runs: list[dict[str, Any]] = []
+
+    async def _read(path: str) -> str:
+        nonlocal peak_reads
+        active.add(path)
+        peak_reads = max(peak_reads, len(active))
+        await asyncio.sleep(0.05)
+        active.discard(path)
+        return f"read {path}"
+
+    async def _exec(command: str, approval_id: str | None = None) -> str:
+        exec_runs.append({"command": command, "approval_id": approval_id, "others": set(active)})
+        if approval_id is None:
+            return json.dumps(
+                {"status": "approval_required", "approval_id": "ap-1", "command": command}
+            )
+        return "exit_code=0"
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="read_file",
+            description="Read.",
+            parameters={"path": {"type": "string"}},
+            required=["path"],
+            concurrency="parallel",
+            read_only=True,
+        ),
+        _read,
+    )
+    registry.register(
+        ToolSpec(
+            name="exec_command",
+            description="Run.",
+            parameters={"command": {"type": "string"}, "approval_id": {"type": "string"}},
+            required=["command"],
+            concurrency="exclusive",
+            requires_approval=True,
+            early_approval=True,
+        ),
+        _exec,
+    )
+    looked_up: list[str] = []
+
+    def _spying_lookup(source: Any) -> Any:
+        inner = registry_spec_lookup(source)
+
+        def _lookup(name: str) -> Any:
+            looked_up.append(name)
+            return inner(name)
+
+        return _lookup
+
+    monkeypatch.setattr(agent_module, "registry_spec_lookup", _spying_lookup)
+    provider = _BatchProvider(
+        [
+            ("r1", "functions.Read_File:0", {"path": "a"}),
+            ("r2", "READ_FILE", {"path": "b"}),
+            ("x1", "functions.Exec_Command", {"command": "ls"}),
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=registry.to_tool_definitions(),
+        tool_registry=registry,
+        tool_handler=build_tool_handler(registry, ToolContext()),
+    )
+
+    events = [event async for event in agent.run_turn("look and run")]
+
+    # Spec lookups (concurrency, early approval) only ever saw canonical names.
+    assert looked_up
+    assert set(looked_up) <= {"read_file", "exec_command"}
+    # Parallel reads overlapped; the exclusive exec ran alone, after approval.
+    assert peak_reads == 2
+    assert exec_runs == [
+        {"command": "ls", "approval_id": None, "others": set()},
+        {"command": "ls", "approval_id": "ap-1", "others": set()},
+    ]
+    # Stream events and the persisted tool_use blocks carry the real names.
+    starts = [event.tool_name for event in events if isinstance(event, ToolUseStartEvent)]
+    assert starts == ["read_file", "read_file", "exec_command"]
+    replayed = provider.calls[1]
+    tool_uses = [
+        (block.id, block.name)
+        for message in replayed
+        if not isinstance(message.content, str)
+        for block in message.content
+        if getattr(block, "type", None) == "tool_use"
+    ]
+    tool_results = [
+        block.tool_use_id
+        for message in replayed
+        if not isinstance(message.content, str)
+        for block in message.content
+        if getattr(block, "type", None) == "tool_result"
+    ]
+    assert tool_uses == [("r1", "read_file"), ("r2", "read_file"), ("x1", "exec_command")]
+    assert sorted(tool_results) == ["r1", "r2", "x1"]
+
+
+async def test_unresolvable_names_reach_dispatch_unchanged() -> None:
+    from agentos.engine.types import ToolUseStartEvent
+
+    registry = _registry([])
+    registry.register(ToolSpec(name="Count_Things", description="Twin.", parameters={}), _noop)
+    provider = _BatchProvider([("u1", "COUNT_THINGS", {"n": 1})])
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=2),
+        tool_definitions=registry.to_tool_definitions(),
+        tool_registry=registry,
+        tool_handler=build_tool_handler(registry, ToolContext()),
+    )
+
+    events = [event async for event in agent.run_turn("count")]
+
+    starts = [event.tool_name for event in events if isinstance(event, ToolUseStartEvent)]
+    assert starts == ["COUNT_THINGS"]
+    results = _tool_results(events)
+    assert json.loads(results[0].result)["error_class"] == "ToolNotFound"
+
+
+async def _noop(**_kwargs: Any) -> str:
+    return "noop"
