@@ -1025,7 +1025,8 @@ estimate_calibration = true      # scale the size estimate by what providers rep
   read (`read_file`, `read_spreadsheet`, `pdf`) and modified (`write_file`,
   `edit_file`, `apply_patch`), merged with the previous summary's lists and
   capped to the newest 20 of each. Shell commands are not parsed for paths.
-  Both the in-turn and the proactive path write this format.
+  The in-turn, the proactive and the manual (`/compact`, `sessions.compact`)
+  compaction all write this format.
 - When the summarizer fails or times out, a deterministic digest bounded to an
   eighth of the context window is used instead, so a compaction still shrinks
   the history.

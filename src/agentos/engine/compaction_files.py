@@ -6,11 +6,14 @@ compactions that is how a long coding session starts re-reading files and
 redoing finished steps. This module keeps that record out of the model's
 hands:
 
-* :func:`file_activity_from_messages` reads the tool calls being compacted and
-  lists the files they read and the files they modified. Only calls whose
-  result came back without an error count. The mutating tools are the ones the
-  verification ledger tracks (:data:`~agentos.engine.verification_ledger.MUTATING_TOOL_NAMES`);
-  shell and code-execution commands are not parsed for paths, so a file that
+* :func:`file_activity_from_messages` (provider messages) and
+  :func:`file_activity_from_entries` (persisted transcript rows, for the
+  session-level ``/compact``) read the tool calls being compacted and list
+  the files they read and the files they modified. Only calls whose result
+  came back without an error count. The mutating tools are the ones the
+  verification ledger tracks
+  (:data:`~agentos.engine.verification_ledger.MUTATING_TOOL_NAMES`); shell
+  and code-execution commands are not parsed for paths, so a file that
   only a shell command touched is not listed.
 * :func:`merge_file_activity` folds the new lists into the ones carried by the
   previous summary. A modified file is listed once, under "Modified", even if
@@ -27,9 +30,11 @@ summary's token budget together with the model's text.
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from agentos.engine.verification_ledger import MUTATING_TOOL_NAMES, mutated_paths
 from agentos.provider.types import ContentBlockToolResult, ContentBlockToolUse, Message
@@ -88,40 +93,94 @@ def _touch(paths: dict[str, None], path: str) -> None:
     paths[path] = None
 
 
+def _activity_from_calls(
+    calls: Iterable[tuple[str, str, dict[str, Any]]], failed: dict[str, bool]
+) -> FileActivity:
+    """Files touched by *calls* (``(id, tool name, arguments)``), in call order.
+
+    *failed* maps a call id to whether its result was an error; a call with
+    no result never ran, and counts as much as a failed one: not at all.
+    """
+    read: dict[str, None] = {}
+    modified: dict[str, None] = {}
+    for call_id, name, arguments in calls:
+        if failed.get(call_id, True):
+            continue
+        if name in MUTATING_TOOL_NAMES:
+            for raw in mutated_paths(arguments):
+                path = _clean_path(raw)
+                if path is not None:
+                    _touch(modified, path)
+        elif name in READ_TOOL_NAMES:
+            path = _clean_path(arguments.get("path") or arguments.get("file_path"))
+            if path is not None:
+                _touch(read, path)
+    return FileActivity(
+        read=tuple(path for path in read if path not in modified),
+        modified=tuple(modified),
+    )
+
+
 def file_activity_from_messages(messages: Sequence[Message]) -> FileActivity:
     """Files read and modified by the successful tool calls in *messages*."""
     failed: dict[str, bool] = {}
+    calls: list[tuple[str, str, dict[str, Any]]] = []
     for message in messages:
         if not isinstance(message.content, list):
             continue
         for block in message.content:
             if isinstance(block, ContentBlockToolResult):
                 failed[block.tool_use_id] = bool(block.is_error)
-    read: dict[str, None] = {}
-    modified: dict[str, None] = {}
-    for message in messages:
-        if message.role != "assistant" or not isinstance(message.content, list):
+            elif isinstance(block, ContentBlockToolUse) and message.role == "assistant":
+                arguments = block.input if isinstance(block.input, dict) else {}
+                calls.append((block.id, block.name, arguments))
+    return _activity_from_calls(calls, failed)
+
+
+def _segment_arguments(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def file_activity_from_entries(entries: Sequence[Mapping[str, Any]]) -> FileActivity:
+    """The same lists from persisted transcript rows (``tool_calls`` segments).
+
+    Assistant rows carry ``tool_use`` and ``tool_result`` segments; rows in
+    the chat-completions shape carry ``function`` calls, answered by
+    ``role: tool`` rows.
+    """
+    failed: dict[str, bool] = {}
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+    for entry in entries:
+        if entry.get("role") == "tool" and entry.get("tool_call_id"):
+            failed[str(entry["tool_call_id"])] = bool(entry.get("is_error"))
+        segments = entry.get("tool_calls")
+        if not isinstance(segments, list):
             continue
-        for block in message.content:
-            if not isinstance(block, ContentBlockToolUse):
+        for segment in segments:
+            if not isinstance(segment, dict):
                 continue
-            if failed.get(block.id, True):
-                # No result (never ran) or an error: nothing was read or changed.
-                continue
-            arguments = block.input if isinstance(block.input, dict) else {}
-            if block.name in MUTATING_TOOL_NAMES:
-                for raw in mutated_paths(arguments):
-                    path = _clean_path(raw)
-                    if path is not None:
-                        _touch(modified, path)
-            elif block.name in READ_TOOL_NAMES:
-                path = _clean_path(arguments.get("path") or arguments.get("file_path"))
-                if path is not None:
-                    _touch(read, path)
-    return FileActivity(
-        read=tuple(path for path in read if path not in modified),
-        modified=tuple(modified),
-    )
+            kind = segment.get("type")
+            function = segment.get("function")
+            if kind == "tool_result":
+                call_id = segment.get("tool_use_id")
+                if call_id:
+                    failed[str(call_id)] = bool(segment.get("is_error"))
+            elif kind == "tool_use" or isinstance(function, dict):
+                call_id = segment.get("tool_use_id") or segment.get("id")
+                fn = function if isinstance(function, dict) else {}
+                name = segment.get("name") or fn.get("name")
+                raw = segment.get("input") if "input" in segment else fn.get("arguments")
+                if call_id and isinstance(name, str):
+                    calls.append((str(call_id), name, _segment_arguments(raw)))
+    return _activity_from_calls(calls, failed)
 
 
 def _cap(

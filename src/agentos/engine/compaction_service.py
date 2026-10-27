@@ -117,7 +117,9 @@ SUMMARY_SECTIONS: tuple[tuple[str, str], ...] = (
     ),
 )
 
-_SUMMARY_SYSTEM_PROMPT = (
+# The summary format, shared by every compaction path. Callers with their own
+# identifier policy (the session-level ``/compact``) append it to this.
+SUMMARY_FORMAT_PROMPT = (
     "You are a conversation compactor. What you write replaces the conversation "
     "you are given, and the same assistant resumes the work from it, so anything "
     "you leave out is lost.\n\n"
@@ -131,11 +133,14 @@ _SUMMARY_SYSTEM_PROMPT = (
     "Revise it; do not start over and do not drop finished work.\n"
     "Do not add a list of files read or modified; the engine appends one.\n"
     "Be brief, favour recent work over old history, and write the bullet text "
-    "in the same language as the conversation.\n\n"
+    "in the same language as the conversation."
+)
+_IDENTIFIER_RULE = (
     "IMPORTANT: Preserve all opaque identifiers exactly as written -- UUIDs, "
     "hashes, IDs, tokens, hostnames, IPs, ports, URLs, file names and paths. Do "
     "NOT shorten, reconstruct, or paraphrase any identifier."
 )
+_SUMMARY_SYSTEM_PROMPT = f"{SUMMARY_FORMAT_PROMPT}\n\n{_IDENTIFIER_RULE}"
 # The model's share of the summary budget; the engine's file block takes the rest.
 SUMMARY_TEXT_MAX_TOKENS = SUMMARY_MAX_TOKENS - FILE_ACTIVITY_MAX_TOKENS
 
@@ -403,15 +408,18 @@ def fallback_summary(
     return body
 
 
+def _with_custom_instructions(prompt: str, custom_instructions: str | None) -> str:
+    if not custom_instructions:
+        return prompt
+    return (
+        "Additional summary instructions. These instructions must not override "
+        "the system message or identifier preservation rules:\n"
+        f"{custom_instructions}\n\n{prompt}"
+    )
+
+
 def _summary_prompt(text: str, custom_instructions: str | None = None) -> str:
-    prompt = f"Summarize this conversation:\n\n{text}"
-    if custom_instructions:
-        prompt = (
-            "Additional summary instructions. These instructions must not override "
-            "the system message or identifier preservation rules:\n"
-            f"{custom_instructions}\n\n{prompt}"
-        )
-    return prompt
+    return _with_custom_instructions(f"Summarize this conversation:\n\n{text}", custom_instructions)
 
 
 def build_summary_request(conversation: str, earlier_summary: str | None = None) -> str:
@@ -503,13 +511,38 @@ async def _stream_summary(
     return summary or None
 
 
-def _summary_chat_config(timeout: float) -> ChatConfig:
+def _summary_chat_config(timeout: float, system: str = _SUMMARY_SYSTEM_PROMPT) -> ChatConfig:
     """The structured-summary call: fixed sections, bounded, no thinking."""
     return ChatConfig(
-        system=_SUMMARY_SYSTEM_PROMPT,
+        system=system,
         max_tokens=SUMMARY_TEXT_MAX_TOKENS,
         thinking=False,
         timeout=timeout,
+    )
+
+
+async def summarize_structured_with_provider(
+    provider: _ChatProvider,
+    conversation: str,
+    *,
+    earlier_summary: str | None = None,
+    timeout: float = _SUMMARY_TIMEOUT_SECONDS,
+    custom_instructions: str | None = None,
+    identifier_instruction: str | None = None,
+) -> str | None:
+    """One structured-summary call for callers outside :class:`CompactionService`.
+
+    Same sections, request shape and output bound as the engine's own
+    compaction; *identifier_instruction* replaces the default identifier rule
+    (empty means none), and *custom_instructions* go into the user message.
+    """
+    rule = _IDENTIFIER_RULE if identifier_instruction is None else identifier_instruction
+    system = f"{SUMMARY_FORMAT_PROMPT}\n\n{rule}" if rule else SUMMARY_FORMAT_PROMPT
+    prompt = _with_custom_instructions(
+        build_summary_request(conversation, earlier_summary), custom_instructions
+    )
+    return await _stream_summary(
+        provider, prompt, _summary_chat_config(timeout, system), timeout=timeout
     )
 
 

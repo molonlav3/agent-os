@@ -143,3 +143,44 @@ def test_merge_keeps_the_block_inside_its_size_bound_dropping_reads_first() -> N
     # Reads are dropped before any modification is.
     assert merged.modified_omitted == 0 or not merged.read
     assert merged.modified[-1] == f"{long}mod_19.py"
+
+
+def test_persisted_rows_in_both_shapes_give_the_same_lists() -> None:
+    from agentos.engine.compaction_files import file_activity_from_entries
+
+    entries = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"type": "tool_use", "tool_use_id": "a", "name": "read_file", "input": ""},
+                {"type": "tool_result", "tool_use_id": "a", "result": "ok", "is_error": False},
+                {
+                    "type": "tool_use",
+                    "tool_use_id": "b",
+                    "name": "write_file",
+                    "input": {"path": "out/report.md", "content": "[projected]"},
+                },
+                {"type": "tool_result", "tool_use_id": "b", "result": "ok", "is_error": False},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "c",
+                    "function": {"name": "read_file", "arguments": '{"path": "src/main.py"}'},
+                },
+                {"id": "d", "function": {"name": "edit_file", "arguments": '{"path": "x.py"}'}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c", "content": "file text"},
+        # "d" never got a result row: not counted.
+    ]
+
+    activity = file_activity_from_entries(entries)
+
+    assert activity.modified == ("out/report.md",)
+    # "a" has an empty input (arguments never recorded): nothing to list.
+    assert activity.read == ("src/main.py",)
