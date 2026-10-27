@@ -3038,9 +3038,16 @@ async def start_gateway_server(
     # Turns a restart or crash cut short: found and resumed once channels are
     # up (started below). Listening from now on, so a user message that
     # arrives first cancels the resume of its session.
+    from agentos.gateway.restart import peek_request
     from agentos.gateway.turn_recovery import TurnRecovery, set_turn_recovery
 
+    # Read before the restart announce consumes it: the session that asked
+    # for this restart does not get its turn resumed.
+    previous_restart = peek_request(config) if run else None
     svc.turn_recovery = TurnRecovery(
+        restart_requested_by=(
+            previous_restart.origin.session_key if previous_restart is not None else None
+        ),
         storage=get_session_storage(svc.session_manager) or svc.session_manager,
         session_manager=svc.session_manager,
         task_runtime=task_runtime,

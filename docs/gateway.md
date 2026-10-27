@@ -381,7 +381,11 @@ three attempts (counted across restarts, with backoff); after that, or for a
 turn older than 24 hours, the session gets a note asking the user to send a
 message to continue. A new message on the session cancels a resume that has
 not started yet. Cron, heartbeat, subagent and ACP turns are never resumed,
-and neither is anything while the gateway is in safe mode.
+and neither is anything while the gateway is in safe mode. A turn that asked
+for the restart itself (the `gateway` tool's `restart`, or a shell command
+that restarts, stops or updates the gateway), or any turn of the session the
+restart request came from, is not resumed either, so it cannot restart the
+gateway again: its session gets a note instead.
 
 `[task_runtime] resume_interrupted_turns = false` turns the automatic resume
 off: interrupted turns are only reported (the note in the session, `/ready`

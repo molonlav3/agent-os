@@ -746,3 +746,113 @@ async def test_ready_and_doctor_report_recovery_counts(env: _Env) -> None:
         step.command == "agentos config set task_runtime.resume_interrupted_turns true"
         for step in finding.fix_steps
     )
+
+
+# ---------------------------------------------------------------------------
+# A turn that asked for the restart is not resumed
+# ---------------------------------------------------------------------------
+
+
+async def _session_with_calls(env: _Env, calls: list[dict[str, Any]], *, answered: bool):
+    record = await _interrupted_session(env, tail="none")
+    assert env.manager is not None
+    messages: list[dict[str, Any]] = [{"role": "assistant", "content": calls}]
+    if answered:
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": call["id"], "content": "ok"}
+                    for call in calls
+                ],
+            }
+        )
+    await env.manager.write_turn_progress(
+        KEY,
+        message_id="progress-restart",
+        tool_calls=None,
+        provider_messages=_record(
+            messages, round_index=1, phase="round_complete" if answered else "tools_running"
+        ),
+    )
+    return record
+
+
+@pytest.mark.parametrize(
+    ("call", "answered"),
+    [
+        ({"name": "gateway", "input": {"action": "restart", "mode": "safe"}}, False),
+        ({"name": "gateway", "input": {"action": "restart"}}, True),
+        ({"name": "exec_command", "input": {"command": "agentos gateway restart"}}, True),
+        ({"name": "exec_command", "input": {"command": "uv tool upgrade use-agent-os"}}, False),
+    ],
+)
+async def test_turn_that_asked_for_the_restart_is_reported_not_resumed(
+    env: _Env, call: dict[str, Any], answered: bool
+) -> None:
+    record = await _session_with_calls(
+        env, [{"type": "tool_use", "id": "r1", **call}], answered=answered
+    )
+    recovery = env.recovery()
+    await recovery.scan()
+    await recovery.wait_idle(timeout=5)
+
+    assert env.runner is not None and env.runner.turns == []
+    state = await _state(env, record.task_id)
+    assert (state["state"], state["reason"]) == ("reported", "restart_requested")
+    assert env.manager is not None
+    rows = await env.manager.get_transcript(KEY)
+    assert "restarted as this conversation asked" in str(rows[-1].content)
+
+
+async def test_session_named_by_the_restart_request_is_not_resumed(env: _Env) -> None:
+    record = await _interrupted_session(env, tail="round_complete")
+    recovery = env.recovery(restart_requested_by=KEY)
+    await recovery.scan()
+    await recovery.wait_idle(timeout=5)
+    assert env.runner is not None and env.runner.turns == []
+    assert (await _state(env, record.task_id))["reason"] == "restart_requested"
+
+
+async def test_other_shell_commands_still_resume(env: _Env) -> None:
+    calls = [
+        {"type": "tool_use", "id": "s1", "name": "exec_command", "input": {"command": "ls -la"}},
+        {"type": "tool_use", "id": "s2", "name": "grep_search", "input": {"q": "gateway restart"}},
+    ]
+    record = await _session_with_calls(env, calls, answered=True)
+    recovery = env.recovery()
+    await recovery.scan()
+    await recovery.wait_idle(timeout=5)
+    assert env.runner is not None and len(env.runner.turns) == 1
+    assert (await _state(env, record.task_id))["state"] == "resumed"
+
+
+def test_peek_request_leaves_the_restart_request_for_the_announce(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from agentos.gateway.restart import (
+        RestartOrigin,
+        RestartRequest,
+        peek_request,
+        read_and_clear_request,
+        restart_request_path,
+    )
+
+    config = SimpleNamespace(state_dir=str(tmp_path))
+    path = restart_request_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    request = RestartRequest(
+        restart_id="r-1",
+        mode="safe",
+        reason="test",
+        requested_at=time.time(),
+        origin=RestartOrigin.web(KEY, None),
+    )
+    import json
+
+    path.write_text(json.dumps(request.to_json()), encoding="utf-8")
+    peeked = peek_request(config)
+    assert peeked is not None and peeked.origin.session_key == KEY
+    assert path.exists()
+    assert read_and_clear_request(config) is not None
+    assert peek_request(config) is None

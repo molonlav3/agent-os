@@ -379,7 +379,9 @@ the last tool round finished or the message was never answered, with read and
 status tools only when its last tool calls have no recorded result (shell,
 writes, trading and sends come back with the user's next message). At most
 three attempts, 24 h maximum age; then the session gets a note to send a
-message. A new message cancels a resume not yet started. `[task_runtime]
+message. A new message cancels a resume not yet started. A turn that asked
+for the restart itself (gateway tool, `agentos gateway restart`, an update) is
+never resumed, only noted. `[task_runtime]
 resume_interrupted_turns = false` only reports them. Counts are in `/ready`
 `turn_recovery`; `agentos doctor` shows `gateway.turn_recovery.not_resumed`.
 

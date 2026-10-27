@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
@@ -48,6 +49,7 @@ from agentos.gateway.task_runtime import (
     TaskRuntimeNotAdmittingError,
 )
 from agentos.gateway.turn_recovery_route import envelope_from_task
+from agentos.session.keys import canonicalize_session_key
 from agentos.session.models import AgentTaskStatus
 
 log = structlog.get_logger(__name__)
@@ -233,6 +235,12 @@ def tombstone_text(*, attempts: int, reason: str) -> str:
             "A reply was interrupted by a gateway restart more than 24 hours ago and "
             "was not resumed. Send a message to continue."
         )
+    if reason == "restart_requested":
+        return (
+            "The gateway restarted as this conversation asked. The turn that asked "
+            "was not resumed automatically, so it cannot restart the gateway again; "
+            "send a message to continue."
+        )
     if reason == "reported":
         return (
             "A reply was interrupted by a gateway restart. Automatic resume is off; "
@@ -243,6 +251,59 @@ def tombstone_text(*, attempts: int, reason: str) -> str:
         f"automatically ({attempts} attempts). Send a message to continue; tool "
         "results marked unknown should be checked before anything is repeated."
     )
+
+
+#: A shell command that restarts, stops or updates the gateway itself.
+_SELF_RESTART_COMMAND = re.compile(
+    r"\b(?:agentos|gateway)\b[^\n;|&]*\b(?:restart|stop|update|upgrade)\b"
+    r"|\buv\s+tool\s+(?:upgrade|install)\b[^\n;|&]*\buse-agent-os\b",
+    re.IGNORECASE,
+)
+
+
+def _strings(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _strings(item)
+
+
+def turn_requested_restart(tail: TurnTail) -> bool:
+    """Whether the interrupted turn itself called for the restart that stopped it.
+
+    True for a ``gateway`` tool call with ``action: restart`` or any other
+    tool call (a shell command) that restarts, stops or updates the gateway.
+    Resuming such a turn could restart the gateway again.
+    """
+    record = getattr(tail.progress_entry, "provider_messages", None)
+    if isinstance(record, str):
+        import json
+
+        try:
+            record = json.loads(record)
+        except ValueError:
+            return False
+    messages = record.get("messages") if isinstance(record, dict) else None
+    for message in messages if isinstance(messages, list) else []:
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = str(block.get("name") or "")
+            arguments = block.get("input")
+            if name == "gateway" and isinstance(arguments, dict):
+                if str(arguments.get("action") or "").strip().lower() == "restart":
+                    return True
+                continue
+            if name in RESTART_SAFE_TOOL_ALLOW:
+                continue
+            if any(_SELF_RESTART_COMMAND.search(text) for text in _strings(arguments)):
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +387,7 @@ class TurnRecovery:
         auto_resume: bool = True,
         channel_manager_ref: Callable[[], Any] | None = None,
         safe_mode_active: Callable[[], bool] | None = None,
+        restart_requested_by: str | None = None,
         clock_ms: Callable[[], int] = _now_ms,
         backoff_s: Iterable[float] = BACKOFF_S,
         max_attempts: int = MAX_ATTEMPTS,
@@ -338,6 +400,10 @@ class TurnRecovery:
         self._auto_resume = auto_resume
         self._channel_manager_ref = channel_manager_ref or (lambda: None)
         self._safe_mode_active = safe_mode_active or (lambda: False)
+        # Session that asked for the restart this boot follows (if any).
+        self._restart_requested_by = (
+            canonicalize_session_key(restart_requested_by) if restart_requested_by else None
+        )
         self._clock_ms = clock_ms
         self._backoff_s = tuple(backoff_s) or (0.0,)
         self._max_attempts = max(1, int(max_attempts))
@@ -489,6 +555,11 @@ class TurnRecovery:
         recovery.reason = reason
         if action == "close":
             await self._finish(recovery, "closed", reason)
+            return
+        if session_key == self._restart_requested_by or turn_requested_restart(tail):
+            # The turn asked for the restart that stopped it: resuming it could
+            # restart again. Report only.
+            await self._finish(recovery, "reported", "restart_requested", hint=True)
             return
         recovery.restricted = recovery.restricted or action == "resume_restricted"
         recovery.unanswered_input = tail.status == "unanswered_input" and any(
@@ -759,7 +830,12 @@ class TurnRecovery:
             recovery.reason = reason
         await self._persist(recovery)
         if hint:
-            label = state if state in ("expired", "reported") else "attempts"
+            if recovery.reason == "restart_requested":
+                label = "restart_requested"
+            elif state in ("expired", "reported"):
+                label = state
+            else:
+                label = "attempts"
             await self._leave_hint(
                 recovery, tombstone_text(attempts=recovery.attempts, reason=label)
             )
@@ -934,4 +1010,5 @@ __all__ = [
     "restart_safe_tool_names",
     "set_turn_recovery",
     "tombstone_text",
+    "turn_requested_restart",
 ]

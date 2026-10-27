@@ -20,7 +20,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   chat as usual, at most three attempts per interrupted run (counted across
   restarts), then a note in the session; 24 h maximum age; a new message
   cancels a resume not yet started; cron, heartbeat, subagent and ACP turns
-  are excluded, and safe mode only reports. `[task_runtime]
+  are excluded, and safe mode only reports. A turn that asked for the
+  restart itself (the `gateway` tool, a shell `agentos gateway restart` or
+  update, or the session the restart request came from) is only noted, so
+  it cannot restart the gateway again. `[task_runtime]
   resume_interrupted_turns = false` only reports. `/ready` carries
   `turn_recovery` counts and `agentos doctor` reports turns that were not
   resumed.
