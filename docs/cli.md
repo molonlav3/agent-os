@@ -1751,6 +1751,14 @@ agentos config set tools.parallel_calls false
 agentos config set agentos_router.effort_by_tier false
 ```
 
+The loop guard (on by default) tells the model when it keeps repeating a tool
+call that returns the same result, then refuses the repeat, and ends the turn
+with `loop_detected` if it tries again. To only log those decisions instead:
+
+```sh
+agentos config set tools.loop_guard observe
+```
+
 A reply that loops on the same line, paragraph or phrase is cut after its first
 copy and continued once (`[llm.repetition_guard]`, on by default; see
 [providers-and-models.md](providers-and-models.md#repetitive-output-guard)).

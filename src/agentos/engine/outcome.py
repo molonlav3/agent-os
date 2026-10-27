@@ -36,6 +36,7 @@ _PARTIAL_CODES = frozenset(
         "repetition_detected",
         "turn_tool_error_budget_exceeded",
         "tool_failure_loop_exhausted",
+        "loop_detected",
     }
 )
 _INTERRUPTED_CODES = frozenset(

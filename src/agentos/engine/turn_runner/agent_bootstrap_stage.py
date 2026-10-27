@@ -79,6 +79,8 @@ class _AgentConfigAuxiliaries:
     tool_result_store_retention_seconds: int
     # ``[tools] parallel_calls``
     parallel_tool_calls: bool = True
+    # ``[tools] loop_guard``
+    loop_guard: str = "enforce"
     # ``[llm.repetition_guard]``; ``None`` keeps the AgentConfig default.
     repetition_guard: RepetitionGuardSettings | None = None
 
@@ -421,6 +423,7 @@ class AgentBootstrapStage:
             model_capabilities=catalog.capabilities,
             thinking=aux.thinking,
             parallel_tool_calls=aux.parallel_tool_calls,
+            loop_guard=aux.loop_guard,
             repetition_guard=aux.repetition_guard or RepetitionGuardSettings(),
             tool_result_projection_max_inline_chars=(
                 aux.tool_result_projection_max_inline_chars
