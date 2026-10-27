@@ -15,6 +15,99 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Calls whose results change, and status polls, are not refused (polls get a
   much larger allowance). The guard and the repeated-failure streak both reset
   on every new message. `[tools] loop_guard = "observe"` restores log-only.
+### Added
+- Engine: when a reply ends by writing a tool call out as text (a JSON call in
+  a code fence, ReAct `Action:` / `Action Input:` lines, an "I'll call
+  `read_file`" line followed by the arguments, or tool markup that was not
+  turned into a call) and nothing ran, the engine retries that model call
+  once with a short nudge to call the tool natively. The written-out call is
+  held back while it streams, so the user never sees it as the answer; the
+  nudge goes on the retried request only and is not stored in history. The
+  detector only fires on a call-shaped payload that ends the reply and names
+  a tool offered on that request, and not on text that explains or shows a
+  call. It uses the existing provider retry budget (`max_provider_retries: 0`
+  turns it off) and `max_turn_llm_calls`; a second miss ends the turn as
+  before. Retries show as `text_tool_call` in the decision log's
+  `turn_policy_decision` entries and in the turn timing `retries` breakdown,
+  with a `provider_text_tool_call_retry` warning.
+### Fixed
+- Provider: tool calls a model writes as text are hidden from the user only
+  when they actually run. One format table now drives both the stream guard
+  and promotion, and covers `<invoke>` (bare or wrapped),
+  `<tool_call>{json}</tool_call>`, `<function=name><parameter=k>v</parameter></function>`,
+  `to=functions.<name>` channel markup and the trailing `tool_name{...}`
+  fallback. Before, `<tool_call>` and `<function=...>` calls were hidden but
+  never run, and channel markup was shown raw.
+- Provider: a tool call quoted inside a fenced code block or inline code is
+  never run or hidden. Before, an `<invoke name="exec">` example in a
+  ```` ```xml ```` fence was executed. Promotion now also needs the reply to be
+  one block of calls (prose before and after is fine), only names tools
+  offered that turn, and caps names at 120 characters and payloads at
+  256 KiB; anything rejected stays visible as written.
+- Engine: prose after a promoted text-form call stays visible; the stream
+  guard no longer drops everything after the first call marker, and markup
+  that did not run (unknown tool, truncated payload, a native call in the
+  same reply) is released instead of silently removed.
+- Web console, desktop app and channel deliveries no longer hide tool-call
+  markup in assistant text (`<invoke>`, `<tool_call>`, `<minimax:tool_call>`,
+  `<parameter>`): the engine already cuts the calls it ran, so markup that
+  reaches the display never ran and is shown. The chat Markdown renderer
+  shows such tags literally instead of letting the HTML sanitizer drop them.
+  The non-call scaffold filters (`<details><summary>View areas around line`,
+  `<effect_calls>`, `<angle brackets>`) are unchanged.
+### Added
+- Tools: a tool call whose name misses only by decoration resolves to the one
+  tool it means: a `functions.`/`tools.` prefix and a `:<n>` counter are
+  dropped, case is ignored and `/` reads as `_`. The match must be unique among
+  the tools the session can see; MCP tool names are only ever matched exactly.
+  The engine resolves the name as the call arrives, so concurrency, timeouts,
+  approvals, stream events and the saved `tool_use` block use the real name.
+- Tools: arguments are validated against the tool's schema before hooks,
+  policy and approvals. Lossless mistakes (`"5"` for an integer, `"true"` for
+  a boolean, a JSON-encoded string for an array or object) are coerced;
+  anything else is rejected with `ToolArgumentsRejected`, naming each failing
+  argument path and the expected type, instead of a generic type error from
+  the handler. Coerced values are what the transcript keeps and what the
+  next request replays. A rejection is marked retryable (a corrected call
+  should run), and identical rejected calls still count toward the
+  repeated-failure guard.
+  `POST /api/v1/tools/invoke` answers such a call with `400 INVALID_REQUEST`.
+### Fixed
+- Engine: a turn's tool rounds are now durable while it runs. The turn keeps
+  one in-progress transcript row, rewritten when a round's calls are issued
+  and again when their results are in, and the final row replaces it in the
+  same transaction, so a finished turn still leaves exactly one row and its
+  usage is rolled up once. A crash or kill mid-turn no longer loses calls
+  that already ran (a trade, a sent message, a file write): they stay in
+  history, and `chat.history` shows them once the turn is no longer live.
+- Engine: a tool call without a recorded result is no longer deleted from
+  history together with the assistant text around it. It is kept and given an
+  error result saying its outcome is unknown and to check the current state
+  before repeating it; a real result that sits elsewhere in the same step is
+  moved next to its call.
+### Changed
+- Engine: the context compaction summary now has fixed sections (Goal,
+  Constraints and preferences, Done, In progress, Blocked, Key decisions,
+  Next steps, Critical context), and a later compaction revises the previous
+  summary instead of writing a new one; a long history split into chunks now
+  yields one revised summary rather than one per chunk. The files read and
+  modified by the compacted tool calls are appended by the engine, merged
+  across compactions and capped, so the model can neither drop nor invent
+  them. Applies to the in-turn, the proactive (between-turns) and the manual
+  (`/compact`, `sessions.compact`) compaction. A manual compaction revises
+  the newest stored summary and replaces it in replay, instead of adding a
+  second summary that knows nothing of the first.
+### Fixed
+- Provider: each assistant message now records the provider, model and API
+  family that produced it (stored in the transcript record; older rows read
+  as unknown). After a model switch (router tier, failover, `/model`), a
+  request to a different model no longer replays the previous model's signed
+  thinking, `redacted_thinking`, OpenRouter `reasoning_details` or Gemini
+  `thought_signature`, and tool-call ids are rewritten to the target API's
+  format (Anthropic charset, OpenAI 40 characters, Mistral nine
+  alphanumerics) with their tool results kept paired. Plain text and
+  `reasoning_content` stay. Replays to the same model, and history without
+  provenance, are sent unchanged.
 
 ## [2026.10.27] - 2026-10-27
 

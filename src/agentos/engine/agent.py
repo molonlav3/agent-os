@@ -47,6 +47,12 @@ from agentos.engine.session_sanitize import (
     sanitize_session_messages,
     session_payload_chars,
 )
+from agentos.engine.text_tool_call_detect import (
+    TextToolCallStreamGate,
+    offered_tool_names,
+    text_tool_call_nudge,
+    text_tool_call_to_retry,
+)
 from agentos.engine.thinking import drop_reasoning
 from agentos.engine.tokenjuice_adapter import reduce_tool_result_with_tokenjuice
 from agentos.engine.tool_batch import ToolBatchExecutor, registry_spec_lookup
@@ -85,10 +91,23 @@ from agentos.engine.transcript import (
 from agentos.engine.transcript import (
     TOOL_ARGUMENT_PROJECTION_PREFIX as _TOOL_ARGUMENT_PROJECTION_PREFIX,
 )
+from agentos.engine.turn_progress import (
+    PHASE_ROUND_COMPLETE,
+    PHASE_TOOLS_RUNNING,
+    TurnProgress,
+    TurnProgressPhase,
+    TurnProgressSink,
+)
 from agentos.engine.turn_timing import NULL_TURN_TIMING, TurnTiming
+from agentos.engine.verification_ledger import (
+    MUTATING_TOOL_NAMES as _MUTATING_TOOL_NAMES,
+)
 from agentos.engine.verification_ledger import (
     VerificationLedger,
     build_verification_nudge,
+)
+from agentos.engine.verification_ledger import (
+    mutated_paths as _mutated_paths,
 )
 from agentos.execution_status import (
     mark_execution_status_truncated,
@@ -129,6 +148,7 @@ from agentos.provider.failures import (
     honoured_retry_after,
     is_transport_timeout,
 )
+from agentos.provider.replay import provenance_for_provider
 from agentos.provider.request_proof import effective_proof_budget
 from agentos.provider.types import ContentBlockImage, StopReason, normalize_stop_reason
 from agentos.result_budget import (
@@ -453,6 +473,9 @@ class _ProviderAttemptKind(StrEnum):
     REFUSAL = "refusal"
     # The provider paused a long-running turn and expects it to be resumed.
     PAUSE_TURN = "pause_turn"
+    # The reply wrote a tool call out as text and nothing ran. Detected by the
+    # engine, not by the classifier: such a reply classifies as OK.
+    TEXT_TOOL_CALL = "text_tool_call"
 
 
 class _IterationStreamTimeoutError(TimeoutError):
@@ -502,6 +525,7 @@ class _ProviderRetryPolicy:
                 _ProviderAttemptKind.MALFORMED_EMPTY: 1,
                 _ProviderAttemptKind.STREAM_INCOMPLETE: 1,
                 _ProviderAttemptKind.LENGTH_CAPPED: length_capped_continuations,
+                _ProviderAttemptKind.TEXT_TOOL_CALL: 1,
             },
             provider_failure_budgets={ProviderFailureKind.EMPTY_RESPONSE: 1},
         )
@@ -535,7 +559,6 @@ class _ProviderRetryPolicy:
         return provider_retry_attempt < self.max_provider_retries
 
 
-_MUTATING_TOOL_NAMES = frozenset({"write_file", "edit_file", "apply_patch"})
 _COMMAND_TOOL_NAMES = frozenset({"exec_command", "execute_code", "background_process"})
 # Sessions whose surface is a person in a chat rather than a checkout. There is
 # usually no test command to run there, so the verification nudge is withheld.
@@ -548,27 +571,6 @@ _MESSAGING_SESSION_MARKERS = (
     "whatsapp",
     "signal",
 )
-
-
-def _mutated_paths(arguments: dict[str, Any]) -> list[str]:
-    """Pull the touched paths out of a mutating tool's arguments."""
-
-    paths: list[str] = []
-    for key in ("path", "file_path", "target"):
-        value = arguments.get(key)
-        if isinstance(value, str) and value.strip():
-            paths.append(value.strip())
-    patch = arguments.get("patch")
-    if isinstance(patch, str):
-        # apply_patch names its files inside the patch body.
-        for line in patch.splitlines():
-            stripped = line.strip()
-            for marker in ("*** Update File:", "*** Add File:", "*** Delete File:"):
-                if stripped.startswith(marker):
-                    candidate = stripped[len(marker) :].strip()
-                    if candidate:
-                        paths.append(candidate)
-    return paths
 
 
 def _is_messaging_surface(session_key: str | None) -> bool:
@@ -680,6 +682,7 @@ def _strip_historical_image_blocks(messages: list[Message]) -> list[Message]:
                 content=kept,
                 reasoning_content=msg.reasoning_content,
                 reasoning_details=msg.reasoning_details,
+                provenance=msg.provenance,
             )
         )
     return sanitized
@@ -774,6 +777,9 @@ class Agent:
         self._turn_record: TranscriptRecord | None = None
         self._turn_compaction_declined_tokens: int | None = None
         self._message_sizes = MessageSizeCache(Agent._live_request_jsonable)
+        # Durable mid-turn progress (``agentos.engine.turn_progress``); set by
+        # the runtime for the turn it runs, ``None`` when nothing persists.
+        self._turn_progress_sink: TurnProgressSink | None = None
 
     def _context_overflow_error(self) -> ErrorEvent:
         reason = self._last_compaction_refusal_reason
@@ -1736,6 +1742,9 @@ class Agent:
                     length_capped_continuations=self.config.length_capped_continuations,
                 )
                 _attempt_retries_used = _retry_policy.used_attempts()
+                # Request-scoped messages for the one retry after a reply that
+                # wrote a tool call as text; never added to turn_messages.
+                _text_tool_call_nudge: list[Message] = []
                 _invalid_response_fallback_done = False
                 _retry_after_fallback_done = False
                 _pause_turn_resumes = 0
@@ -1787,6 +1796,8 @@ class Agent:
                             else None
                         ),
                     )
+                    attempt_nudge, _text_tool_call_nudge = _text_tool_call_nudge, []
+                    request_messages.extend(attempt_nudge)
                     self._write_context_stage(
                         "stream:context",
                         request_messages,
@@ -1881,6 +1892,7 @@ class Agent:
                                 else None
                             ),
                         )
+                        request_messages.extend(attempt_nudge)
                         # Calibrate against the request actually sent.
                         estimated_context_tokens = self._estimate_live_request_tokens(
                             request_messages,
@@ -1916,6 +1928,17 @@ class Agent:
 
                     _got_done_event = False
                     attempt_user_visible_emitted = False
+                    # Holds back text that may be a tool call written as text,
+                    # while a retry for that is still available.
+                    text_call_gate = (
+                        TextToolCallStreamGate(offered_tool_names(provider_tools_for_call))
+                        if tools_supported_for_call
+                        and provider_tools_for_call
+                        and _retry_policy.can_retry_attempt(
+                            _ProviderAttemptKind.TEXT_TOOL_CALL, _attempt_retries_used
+                        )
+                        else None
+                    )
                     try:
                         raw_stream = self.provider.chat(
                             request_messages,
@@ -1933,7 +1956,10 @@ class Agent:
                                 assistant_text_parts.append(raw_ev.text)
                                 if raw_ev.text:
                                     attempt_user_visible_emitted = True
-                                yield TextDeltaEvent(text=raw_ev.text)
+                                if text_call_gate is None:
+                                    yield TextDeltaEvent(text=raw_ev.text)
+                                elif shown_text := text_call_gate.push(raw_ev.text):
+                                    yield TextDeltaEvent(text=shown_text)
 
                             elif isinstance(raw_ev, ProviderThinkingDelta):
                                 # Reasoning is display-only: never mixed into the
@@ -1953,16 +1979,21 @@ class Agent:
                                     ):
                                         ignored_post_delivery_tool_use = True
                                     continue
+                                if text_call_gate is not None and (
+                                    held_text := text_call_gate.release()
+                                ):
+                                    yield TextDeltaEvent(text=held_text)
+                                start_tool_name = self._canonical_tool_name(raw_ev.tool_name)
                                 pending_tools[raw_ev.tool_use_id] = _StreamAccumulator(
                                     tool_use_id=raw_ev.tool_use_id,
-                                    tool_name=raw_ev.tool_name,
+                                    tool_name=start_tool_name,
                                     synthetic_from_text=raw_ev.synthetic_from_text,
                                 )
                                 tool_argument_heartbeat_chars[raw_ev.tool_use_id] = 0
                                 attempt_user_visible_emitted = True
                                 yield ToolUseStartEvent(
                                     tool_use_id=raw_ev.tool_use_id,
-                                    tool_name=raw_ev.tool_name,
+                                    tool_name=start_tool_name,
                                     synthetic_from_text=raw_ev.synthetic_from_text,
                                 )
 
@@ -2012,11 +2043,17 @@ class Agent:
                                     if acc is not None
                                     else raw_ev.synthetic_from_text
                                 )
+                                end_tool_name = self._canonical_tool_name(
+                                    raw_ev.tool_name,
+                                    tool_use_id=raw_ev.tool_use_id,
+                                )
                                 tool_calls.append(
                                     ToolCall(
                                         tool_use_id=raw_ev.tool_use_id,
-                                        tool_name=raw_ev.tool_name,
-                                        arguments=arguments,
+                                        tool_name=end_tool_name,
+                                        arguments=self._coerce_tool_arguments(
+                                            end_tool_name, arguments
+                                        ),
                                         synthetic_from_text=synthetic_from_text,
                                         thought_signature=raw_ev.thought_signature,
                                     )
@@ -2109,6 +2146,8 @@ class Agent:
                                     message=raw_ev.message,
                                 )
                     except _IterationStreamTimeoutError:
+                        if text_call_gate is not None and (held_text := text_call_gate.release()):
+                            yield TextDeltaEvent(text=held_text)
                         if artifact_delivery_final_response_pending:
                             yield _finish_artifact_delivery_degraded(
                                 reason=(
@@ -2129,6 +2168,23 @@ class Agent:
                         )
                         yield terminal_error
                         break
+
+                    text_tool_call = (
+                        text_tool_call_to_retry(
+                            text="".join(assistant_text_parts),
+                            gate=text_call_gate,
+                            produced_tool_calls=bool(tool_calls or pending_tools),
+                            stream_complete=_got_done_event and not _got_error,
+                            stop_reason=getattr(provider_done_for_log, "stop_reason", None),
+                        )
+                        if text_call_gate is not None
+                        and _turn_budget_error() is None
+                        and _turn_llm_call_budget_error(turn_llm_calls + 1) is None
+                        else None
+                    )
+                    if text_call_gate is not None and text_tool_call is None:
+                        if held_text := text_call_gate.release():
+                            yield TextDeltaEvent(text=held_text)
 
                     call_duration_ms = int((time.monotonic() - call_started_at) * 1000)
                     response_payload = {
@@ -2184,6 +2240,53 @@ class Agent:
                             yield terminal_error
                         break
                     response_text = "".join(assistant_text_parts)
+                    if text_tool_call is not None and text_call_gate is not None:
+                        # The reply wrote a tool call as text and nothing ran.
+                        # Drop it (the gate kept it off screen) and ask once
+                        # more, with a nudge on that request only.
+                        _attempt_retries_used[_ProviderAttemptKind.TEXT_TOOL_CALL] += 1
+                        text_call_gate.discard()
+                        _text_tool_call_nudge = [
+                            Message(
+                                role="assistant",
+                                content=[ContentBlockText(text=response_text)],
+                            ),
+                            Message(role="user", content=text_tool_call_nudge(text_tool_call)),
+                        ]
+                        self.turn_timing.record_retry(_ProviderAttemptKind.TEXT_TOOL_CALL.value)
+                        logger.warning(
+                            "provider.text_tool_call_retry",
+                            session_key=self._session_key,
+                            model=last_actual_model or self.config.model_id or "",
+                            provider=type(self.provider).__name__,
+                            iteration=iterations,
+                            call_attempt=_call_attempt,
+                            tool_name=text_tool_call.tool_name,
+                            shape=text_tool_call.shape,
+                            discarded_chars=len(response_text) - text_tool_call.start,
+                        )
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="retry_text_tool_call",
+                            reason="text_tool_call",
+                            code="text_tool_call",
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                            tool_name=text_tool_call.tool_name,
+                            shape=text_tool_call.shape,
+                            budget=_retry_policy.attempt_budgets[
+                                _ProviderAttemptKind.TEXT_TOOL_CALL
+                            ],
+                        )
+                        yield WarningEvent(
+                            code="provider_text_tool_call_retry",
+                            message=(
+                                "The model wrote a tool call as text instead of calling "
+                                "the tool; retrying once."
+                            ),
+                        )
+                        _call_attempt += 1
+                        continue
                     if ignored_post_delivery_tool_use and not response_text.strip():
                         if artifact_delivery_final_response_pending:
                             response_text = self._artifact_delivery_final_response_text(
@@ -3026,6 +3129,9 @@ class Agent:
                             reasoning_details=getattr(
                                 provider_done_for_log, "reasoning_details", None
                             ),
+                            # Read after the stream: a failover wrapper now
+                            # reports the provider that actually answered.
+                            provenance=provenance_for_provider(self.provider),
                         )
                     )
 
@@ -3085,6 +3191,13 @@ class Agent:
                         preflight_tool_results.update(blocked_batch_results(loop_block, tool_calls))
                     else:
                         loop_block = None
+
+                # The calls are on record before they run: a crash from here
+                # on leaves them in history with an unknown outcome instead of
+                # losing them.
+                await self._report_turn_progress(
+                    turn_messages, round_index=iterations, phase=PHASE_TOOLS_RUNNING
+                )
 
                 # ------ STREAMING → TOOL_CALLING ------
                 yield self._transition(AgentState.TOOL_CALLING)
@@ -3243,6 +3356,14 @@ class Agent:
                     break
                 if turn_yielded:
                     break
+
+                if self._turn_progress_sink is not None:
+                    # The round is complete: seal it now (the next request
+                    # would seal it unchanged) and put it on record.
+                    sealed_len = self._seal_transcript(turn_messages, sealed_len)
+                    await self._report_turn_progress(
+                        turn_messages, round_index=iterations, phase=PHASE_ROUND_COMPLETE
+                    )
 
                 # ------ TOOL_CALLING → THINKING ------
                 yield self._transition(AgentState.THINKING)
@@ -3580,6 +3701,7 @@ class Agent:
                     content=blocks,
                     reasoning_content=message.reasoning_content,
                     reasoning_details=message.reasoning_details,
+                    provenance=message.provenance,
                 )
                 self._message_sizes.retain_only(messages)
 
@@ -3672,17 +3794,46 @@ class Agent:
         self._transcript_input_entry_id = entry_id
         self._transcript_input_entry_content = content if entry_id is not None else None
 
-    def _record_turn_transcript(self, messages: list[Message]) -> None:
+    def _turn_transcript_record(self, messages: list[Message]) -> TranscriptRecord:
         if self._turn_reset:
             appended = list(messages)
         else:
             appended = list(messages[self._turn_base_len :])
-        self._turn_record = TranscriptRecord(
+        return TranscriptRecord(
             messages=persistable_messages(appended),
             mode="reset" if self._turn_reset else "append",
             input_entry_id=self._transcript_input_entry_id,
             compaction_id=self._turn_compaction_id,
         )
+
+    def _record_turn_transcript(self, messages: list[Message]) -> None:
+        self._turn_record = self._turn_transcript_record(messages)
+
+    def set_turn_progress_sink(self, sink: TurnProgressSink | None) -> None:
+        """Receive the turn's record after each tool round (``None`` stops it)."""
+        self._turn_progress_sink = sink
+
+    async def _report_turn_progress(
+        self,
+        messages: list[Message],
+        *,
+        round_index: int,
+        phase: TurnProgressPhase,
+    ) -> None:
+        sink = self._turn_progress_sink
+        if sink is None:
+            return
+        try:
+            record = encode_transcript_record(self._turn_transcript_record(messages))
+            await sink(TurnProgress(record=record, round=round_index, phase=phase))
+        except Exception:  # noqa: BLE001 - progress is best-effort
+            logger.warning(
+                "agent.turn_progress_failed",
+                session_key=self._session_key,
+                round=round_index,
+                phase=phase,
+                exc_info=True,
+            )
 
     def transcript_record(self) -> dict[str, Any] | None:
         """The structured record of the last successful turn, for persistence.
@@ -4192,6 +4343,60 @@ class Agent:
                 reason="provider_projection_reused",
             )
         return tc
+
+    def _canonical_tool_name(self, name: str, *, tool_use_id: str | None = None) -> str:
+        """The offered tool name a model's near-miss name unambiguously means.
+
+        Applied where the stream hands over a tool call, so scheduling,
+        timeouts, approvals, events and the persisted ``tool_use`` block all
+        carry the registered name. Pass ``tool_use_id`` to log the rewrite.
+        """
+        offered = [definition.name for definition in self.tool_definitions]
+        if not offered or name in offered:
+            return name
+        from agentos.tools.tool_name_resolution import resolve_tool_name_among
+
+        resolution = resolve_tool_name_among(name, offered)
+        if resolution is None:
+            return name
+        if tool_use_id is not None:
+            logger.info(
+                "agent.tool_name_resolved",
+                session_key=self._session_key,
+                tool_use_id=tool_use_id,
+                requested=resolution.requested,
+                tool=resolution.resolved,
+                rules=list(resolution.rules),
+            )
+        return resolution.resolved
+
+    def _coerce_tool_arguments(self, tool_name: str, arguments: Any) -> Any:
+        """Apply the lossless argument repairs dispatch would apply, up front.
+
+        Uses the schema of the tool definition sent with the request, so the
+        persisted ``tool_use`` input, replayed history and dispatch all carry
+        the value that actually runs. Rejection stays in dispatch: arguments
+        that do not fully validate are returned unchanged.
+        """
+        definition = self._tool_definition_by_name.get(tool_name)
+        if definition is None:
+            definition = next(
+                (item for item in self.tool_definitions if item.name == tool_name), None
+            )
+        schema = getattr(definition, "input_schema", None)
+        if schema is None or not isinstance(arguments, dict):
+            return arguments
+        from agentos.tools.argument_admission import coerce_tool_arguments
+
+        try:
+            coerced = coerce_tool_arguments(
+                getattr(schema, "properties", None) or {},
+                getattr(schema, "required", None) or [],
+                arguments,
+            )
+        except Exception:  # noqa: BLE001 - dispatch still validates the call
+            return arguments
+        return arguments if coerced is None else coerced
 
     async def _execute_tool(self, tc: ToolCall) -> ToolResult:
         """Dispatch a tool call to the registered handler."""

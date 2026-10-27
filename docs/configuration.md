@@ -1048,6 +1048,21 @@ estimate_calibration = true      # scale the size estimate by what providers rep
   0.7-1.25), so compaction does not fire early. Usage the provider marks as
   estimated and requests carrying images or documents are not counted. `estimate_calibration = false`
   uses the raw estimate.
+- **Summary format.** The summary has fixed sections: Goal, Constraints and
+  preferences, Done, In progress, Blocked, Key decisions, Next steps, and
+  Critical context (exact paths, commands, numbers and IDs). A later
+  compaction hands the previous summary to the summarizer as the base to
+  revise, so finished work stays under Done instead of being summarized away.
+  Below the model's text AgentOS appends the files the compacted tool calls
+  read (`read_file`, `read_spreadsheet`, `pdf`) and modified (`write_file`,
+  `edit_file`, `apply_patch`), merged with the previous summary's lists and
+  capped to the newest 20 of each. Shell commands are not parsed for paths.
+  The in-turn, the proactive and the manual (`/compact`, `sessions.compact`)
+  compaction all write this format. A manual compaction revises the newest
+  stored summary, and from then on only the revision is replayed, not the two
+  side by side; if its summarizer call fails, the earlier summary is kept and
+  replays on its own. Summaries stored before this behaviour existed replay
+  as they always did.
 - When the summarizer fails or times out, a deterministic digest bounded to an
   eighth of the context window is used instead, so a compaction still shrinks
   the history.
