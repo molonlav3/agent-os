@@ -455,3 +455,28 @@ def test_load_replays_a_steered_row_once_from_the_record() -> None:
         ("user", "steer"),
         ("assistant", "done"),
     ]
+
+
+async def test_shared_group_finishes_and_the_exclusive_call_after_it_is_cut() -> None:
+    specs = {"write": _spec("write"), "read": _spec("read", concurrency="parallel")}
+    pending: list[bool] = []
+    ran: list[str] = []
+
+    async def execute(call: ToolCall) -> ToolResult:
+        ran.append(call.tool_use_id)
+        if call.tool_use_id == "t1":
+            pending.append(True)
+        await asyncio.sleep(0)
+        return _ok(call)
+
+    executor = _executor(execute, specs, lambda: bool(pending))
+    calls = [_call(0, "write"), _call(1, "read"), _call(2, "read"), _call(3, "write")]
+    await _run(executor, calls)
+
+    assert ran == ["t0", "t1", "t2"]
+    assert [is_skipped_for_steering(r) for r in executor.executed_results] == [
+        False,
+        False,
+        False,
+        True,
+    ]

@@ -645,6 +645,11 @@ class ToolBatchExecutor:
             call: ToolCall, policy: ToolConcurrencyPolicy, order: int | None
         ) -> _Admission:
             exclusive = policy.mode == "exclusive"
+            # A first run queues at its call index whatever its mode, so a
+            # shared call is admitted before a later exclusive one (the gate
+            # is ordered by this rank). Only an exclusive call is held to a
+            # turn; a shared one re-queues at the back after stepping out.
+            queue_order = order
             if not exclusive:
                 order = None
             spec = self.spec_for(call.tool_name)
@@ -654,7 +659,7 @@ class ToolBatchExecutor:
                 # An exclusive first run is admitted in its turn, unless its
                 # tool asks for approval first and waits for the turn itself.
                 slot=gate.reserve(
-                    exclusive=exclusive, order=order, needs_turn=exclusive and not early
+                    exclusive=exclusive, order=queue_order, needs_turn=exclusive and not early
                 ),
                 exclusive=exclusive,
                 order=order,

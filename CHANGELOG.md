@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Engine: a tool batch runs in the model's order again. Shared (`parallel` /
+  `keyed`) calls queued behind every exclusive call, so in `[write, read,
+  read, write]` the second write ran before the two reads.
+
 ### Added
 - Gateway: mid-turn steering. A `chat.send` / `sessions.send` that asks for
   `queueMode: "steer"` while the session's turn runs no longer cancels that
