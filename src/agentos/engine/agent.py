@@ -39,6 +39,7 @@ from agentos.engine.session_sanitize import (
     sanitize_session_messages,
     session_payload_chars,
 )
+from agentos.engine.steering import steering_for, steering_pending, take_steering
 from agentos.engine.thinking import drop_reasoning
 from agentos.engine.tokenjuice_adapter import reduce_tool_result_with_tokenjuice
 from agentos.engine.tool_batch import ToolBatchExecutor, registry_spec_lookup
@@ -765,6 +766,8 @@ class Agent:
         self._turn_compaction_id: str | None = None
         self._turn_record: TranscriptRecord | None = None
         self._turn_compaction_declined_tokens: int | None = None
+        # User rows steered into the current turn (agentos.engine.steering).
+        self._turn_steered_entry_ids: list[str] = []
         self._message_sizes = MessageSizeCache(Agent._live_request_jsonable)
 
     def _context_overflow_error(self) -> ErrorEvent:
@@ -1365,6 +1368,9 @@ class Agent:
         self._turn_compaction_id = None
         self._turn_record = None
         self._turn_compaction_declined_tokens = None
+        self._turn_steered_entry_ids = []
+        # Messages the user sends while this turn runs (gateway turns only).
+        steering = steering_for(self._session_key)
         # Index of this turn's first input message: compaction keeps it and
         # everything after it (the current turn) and summarizes the rest.
         turn_input_index = len(turn_messages)
@@ -3054,6 +3060,18 @@ class Agent:
                             guidance=nudge,
                         )
                         yield WarningEvent(code="unverified_code_changes", message=nudge)
+                    # A message the user sent meanwhile outranks ending the turn.
+                    if not (
+                        max_iterations_finalization_attempted
+                        or artifact_delivery_final_response_pending
+                    ):
+                        steered = await take_steering(
+                            steering, turn_messages, self._turn_steered_entry_ids
+                        )
+                        if steered is not None:
+                            yield steered
+                            yield self._transition(AgentState.THINKING)
+                            continue
                     break
 
                 tool_deadline = _loop.time() + self.config.iteration_timeout
@@ -3088,6 +3106,9 @@ class Agent:
                     call_log=self._write_turn_call_log,
                     iteration=iterations,
                     clock=_loop.time,
+                    steering_pending=(
+                        None if steering is None else lambda: steering_pending(steering)
+                    ),
                 )
                 async for event in self.turn_timing.tool_batch(
                     tool_batch.run(tool_calls), calls=len(tool_calls)
@@ -3210,7 +3231,10 @@ class Agent:
                 if terminal_artifacts:
                     _finish_artifact_delivery_without_provider()
                     break
-                if turn_yielded:
+                steered = await take_steering(steering, turn_messages, self._turn_steered_entry_ids)
+                if steered is not None:
+                    yield steered
+                elif turn_yielded:
                     break
 
                 # ------ TOOL_CALLING → THINKING ------
@@ -3651,6 +3675,7 @@ class Agent:
             mode="reset" if self._turn_reset else "append",
             input_entry_id=self._transcript_input_entry_id,
             compaction_id=self._turn_compaction_id,
+            steered_entry_ids=tuple(self._turn_steered_entry_ids),
         )
 
     def transcript_record(self) -> dict[str, Any] | None:

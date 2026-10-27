@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- Gateway: mid-turn steering. A `chat.send` / `sessions.send` in `steer` mode
+  (the session default) while the session's turn runs no longer cancels that
+  turn: the turn takes the message at its next checkpoint. Calls of an
+  ordered tool sequence that have not started get a "skipped" result, the
+  message is added after the tool results before the next model call, and a
+  turn about to end continues with it. Its user row is written where the turn
+  takes it, not at send time; a message no checkpoint takes runs as the next
+  turn. Turns that never check (coding-harness turns) keep `steer` =
+  interrupt. Capability `mid-turn-steering`.
+- Gateway: server-side pending inputs. `chat.send` / `sessions.send` answer
+  with the turn's `task_id` and the effective `queue_mode` (`chat.send` now
+  accepts `queueMode`); `chat.history` lists `pending_inputs` (queued messages,
+  oldest first); `chat.abort {taskId}` / `sessions.abort {taskId}` withdraws a
+  queued message (`withdrawn: true`, removing a follow-up's already written
+  user row) or stops just that running turn.
+
 ## [2026.10.27] - 2026-10-27
 
 ### Added
