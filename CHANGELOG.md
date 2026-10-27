@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [2026.10.27] - 2026-10-27
+
 ### Added
 - Gateway: `POST /api/v1/rpc` calls one RPC method over plain HTTP behind the
   normal bearer auth: `{id?, method, params?}` in, `{id, ok, payload | error}`
