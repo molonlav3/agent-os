@@ -657,3 +657,228 @@ async def test_without_calibration_the_raw_estimate_still_compacts(
 
     assert len(provider.summarizer_requests) == 1
     assert str(provider.turn_requests[-1][0].content).startswith("[Context summary]")
+
+
+# ---------------------------------------------------------------------------
+# Structured summary on the proactive path
+# ---------------------------------------------------------------------------
+
+
+class _RecordingProvider(_Provider):
+    """Also keeps the summarizer's chat config."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.summarizer_configs: list[Any] = []
+
+    def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
+        if str(getattr(config, "system", "") or "").startswith("You are a conversation compactor"):
+            self.summarizer_configs.append(config)
+        return super().chat(messages, tools, config)
+
+
+async def test_proactive_job_uses_the_structured_summary_prompt(
+    tmp_path: Path, storages: list[SessionStorage]
+) -> None:
+    from agentos.engine.compaction_service import SUMMARY_SECTIONS
+
+    manager = await _manager(tmp_path, storages)
+    provider = _RecordingProvider()
+    runner = _runner(provider, manager, tmp_path)
+    await _seed(manager, KEY, rounds=2)
+
+    await _turn(runner, manager, KEY, "deploy status?", tmp_path)
+    await _scheduler(runner).wait_idle(KEY)
+
+    assert len(provider.summarizer_configs) == 1
+    system = str(provider.summarizer_configs[0].system)
+    for name, _ in SUMMARY_SECTIONS:
+        assert f"- {name}:" in system
+    request = str(provider.summarizer_requests[0][0].content)
+    assert request.startswith("Write the summary for the conversation below.")
+    assert "old question 0" in request
+
+
+async def test_proactive_service_appends_and_merges_the_file_lists() -> None:
+    """The proactive job builds the summary with the same service and builder
+    as the in-turn path: the previous summary is the base, the file lists are
+    the engine's and merge with the previous ones."""
+    from agentos.engine.compaction_files import (
+        FileActivity,
+        attach_file_activity,
+        split_file_activity,
+    )
+    from agentos.engine.compaction_service import CONTEXT_SUMMARY_HEADER, SUMMARY_ACK
+    from agentos.engine.proactive_compaction import PROACTIVE_PHASE, _compaction_service
+    from agentos.provider import ContentBlockToolResult, ContentBlockToolUse
+
+    provider = _Provider()
+    _AUX_PROVIDER["provider"] = provider
+    agent = SimpleNamespace(
+        provider=provider,
+        config=SimpleNamespace(
+            context_overflow_threshold=0.85,
+            compaction_summary_model_hint=("", ""),
+            compaction_summary_timeout_seconds=5.0,
+        ),
+    )
+    service = _compaction_service(agent, KEY)
+    previous = attach_file_activity(
+        "## Goal\n- earlier work", FileActivity(read=("docs/plan.md",), modified=("src/a.py",))
+    )
+    messages = [
+        Message(role="user", content=f"{CONTEXT_SUMMARY_HEADER}\n{previous}"),
+        Message(role="assistant", content=SUMMARY_ACK),
+        Message(role="user", content="continue " + "x" * 3000),
+        Message(
+            role="assistant",
+            content=[
+                ContentBlockToolUse(id="w1", name="write_file", input={"path": "src/b.py"}),
+            ],
+        ),
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="w1", content="ok " + "y" * 3000)],
+        ),
+        Message(role="assistant", content="wrote it"),
+        Message(role="user", content="next"),
+    ]
+
+    def _size(items: Any) -> int:
+        return sum(len(item.model_dump_json()) for item in items) // 4
+
+    result = await service.compact(
+        messages,
+        turn_input_index=len(messages) - 1,
+        estimated_tokens=_size(messages),
+        window_tokens=4_000,
+        message_tokens=_size,
+        proactive=True,
+    )
+
+    assert service._phase == PROACTIVE_PHASE
+    assert result.compacted
+    request = str(provider.summarizer_requests[0][0].content)
+    assert "[Earlier summary]\n## Goal\n- earlier work\n[End of earlier summary]" in request
+    assert "docs/plan.md" not in request
+    text, files = split_file_activity(result.summary)
+    assert text == SUMMARY
+    assert files == FileActivity(read=("docs/plan.md",), modified=("src/a.py", "src/b.py"))
+
+
+class _NumberedSummaries(_Provider):
+    """Numbers each summary so a test can tell which compaction wrote it."""
+
+    def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
+        if str(getattr(config, "system", "") or "").startswith("You are a conversation compactor"):
+            self.summarizer_requests.append(list(messages))
+            return self._numbered(len(self.summarizer_requests))
+        return super().chat(messages, tools, config)
+
+    async def _numbered(self, number: int) -> AsyncIterator[Any]:
+        yield ProviderText(text=f"## Goal\n- summary number {number}")
+        yield ProviderDone(stop_reason="end_turn", input_tokens=10, output_tokens=1)
+
+
+async def test_manual_compact_after_a_compaction_revises_and_replaces_its_summary(
+    tmp_path: Path, storages: list[SessionStorage]
+) -> None:
+    """``sessions.compact`` after an automatic compaction and one more turn:
+    the new summary is a revision of the earlier one, and only the revision
+    is replayed (not the two side by side)."""
+    from agentos.session.compaction import CompactionConfig
+
+    manager = await _manager(tmp_path, storages)
+    provider = _NumberedSummaries()
+    runner = _runner(provider, manager, tmp_path)
+    await _seed(manager, KEY, rounds=2)
+    await _turn(runner, manager, KEY, "deploy status?", tmp_path)
+    await _scheduler(runner).wait_idle(KEY)
+    await _turn(runner, manager, KEY, "and the logs? " + "L" * 3000, tmp_path)
+    await _scheduler(runner).wait_idle(KEY)
+    (first,) = await manager.get_summaries(KEY)
+    assert first.summary_text == "## Goal\n- summary number 1"
+    calls_before = len(provider.summarizer_requests)
+
+    result = await manager.compact_with_result(
+        KEY, 600, CompactionConfig(provider=provider, model="m", safety_margin=1.0)
+    )
+
+    assert result.removed_count > 0
+    # The manual summarizer revised the earlier summary.
+    request = str(provider.summarizer_requests[calls_before][0].content)
+    assert "[Earlier summary]\n## Goal\n- summary number 1\n" in request
+    summaries = await manager.get_summaries(KEY)
+    assert len(summaries) == 2
+    newest = summaries[-1]
+    assert newest.summary_payload is not None
+    assert newest.summary_payload["revises_compaction_id"] == first.compaction_id
+
+    await _turn(runner, manager, KEY, "third", tmp_path)
+
+    sent = str(provider.turn_requests[-1][-1].content)
+    assert "[Compacted Session Summaries]" in sent
+    assert newest.summary_text in sent
+    assert "summary number 1" not in sent
+    assert "[Summary 2]" not in sent
+
+
+class _CarryingSummaries(_NumberedSummaries):
+    """A summarizer that keeps every fact it is shown: each earlier
+    ``- summary number N`` line in its input, then its own line."""
+
+    def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
+        if str(getattr(config, "system", "") or "").startswith("You are a conversation compactor"):
+            self.summarizer_requests.append(list(messages))
+            shown = [
+                line.strip()
+                for line in str(messages[0].content).splitlines()
+                if line.strip().startswith("- summary number")
+            ]
+            return self._carry([*dict.fromkeys(shown)], len(self.summarizer_requests))
+        return super().chat(messages, tools, config)
+
+    async def _carry(self, shown: list[str], number: int) -> AsyncIterator[Any]:
+        lines = "\n".join([*shown, f"- summary number {number}"])
+        yield ProviderText(text=f"## Goal\n{lines}")
+        yield ProviderDone(stop_reason="end_turn", input_tokens=10, output_tokens=1)
+
+
+async def test_a_manual_summary_survives_the_next_automatic_compaction(
+    tmp_path: Path, storages: list[SessionStorage]
+) -> None:
+    """``sessions.compact``, more turns, then automatic compactions: what the
+    manual summary said still reaches the next request. The turns after the
+    manual compaction carry it in their persisted request context, and the
+    automatic compaction that folds them hands it to the summarizer, so a
+    summarizer that keeps what it is shown keeps it."""
+    from agentos.session.compaction import CompactionConfig
+
+    manager = await _manager(tmp_path, storages)
+    provider = _CarryingSummaries()
+    runner = _runner(provider, manager, tmp_path)
+    await _seed(manager, KEY, rounds=2)
+    await _turn(runner, manager, KEY, "deploy status?", tmp_path)
+    await _scheduler(runner).wait_idle(KEY)
+    await _turn(runner, manager, KEY, "and the logs? " + "L" * 3000, tmp_path)
+    await _scheduler(runner).wait_idle(KEY)
+    manual = await manager.compact_with_result(
+        KEY, 600, CompactionConfig(provider=provider, model="m", safety_margin=1.0)
+    )
+    assert manual.removed_count > 0
+    facts = [line for line in manual.summary.splitlines() if line.startswith("- summary number")]
+    assert facts
+    calls_after_manual = len(provider.summarizer_requests)
+
+    await _turn(runner, manager, KEY, "first follow-up " + "M" * 12_000, tmp_path)
+    await _scheduler(runner).wait_idle(KEY)
+    await _turn(runner, manager, KEY, "second follow-up " + "N" * 12_000, tmp_path)
+    await _scheduler(runner).wait_idle(KEY)
+    # An automatic compaction ran after the manual one.
+    assert len(provider.summarizer_requests) > calls_after_manual
+
+    await _turn(runner, manager, KEY, "where are we?", tmp_path)
+
+    payload = "\n".join(str(message.content) for message in provider.turn_requests[-1])
+    for fact in facts:
+        assert fact in payload
