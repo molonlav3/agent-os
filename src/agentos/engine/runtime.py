@@ -60,6 +60,10 @@ from agentos.engine.outcome import outcome_from_error, turn_outcome_details
 from agentos.engine.pipeline import TurnContext
 from agentos.engine.pricing import PriceEntry, lookup_price
 from agentos.engine.proactive_compaction import ProactiveCompactionScheduler
+from agentos.engine.repetition_guard import (
+    RepetitionGuardSettings,
+    repetition_guard_settings_from,
+)
 from agentos.engine.router_decision import build_router_decision_event
 from agentos.engine.transcript import transcript_record_of
 from agentos.engine.turn_policy import resolve_turn_policy
@@ -126,6 +130,7 @@ from agentos.engine.types import (
     DoneEvent,
     ErrorEvent,
     RouterControlReplayEvent,
+    SteeringEvent,
     ThinkingLevel,
     ToolResultEvent,
     WarningEvent,
@@ -3222,6 +3227,9 @@ class TurnRunner:
                     router_control_replay_event = event
                     yield event
                     break
+                if isinstance(event, SteeringEvent) and event.no_memory_capture:
+                    # A message steered in asked to stay out of memory.
+                    no_memory_capture = True
                 yield event
             timing.stage_end("stream_consumer")
             if router_control_replay_event is not None:
@@ -4221,6 +4229,18 @@ class TurnRunner:
 
         tools_cfg = getattr(self._config, "tools", None) if self._config else None
         return bool(getattr(tools_cfg, "parallel_calls", True))
+
+    def _resolve_loop_guard(self) -> str:
+        """``[tools] loop_guard``: act on repeated no-progress tool calls."""
+
+        tools_cfg = getattr(self._config, "tools", None) if self._config else None
+        return str(getattr(tools_cfg, "loop_guard", "enforce") or "enforce")
+
+    def _resolve_repetition_guard(self) -> RepetitionGuardSettings:
+        """``[llm.repetition_guard]``: thresholds for the degenerate-output guard."""
+
+        llm_cfg = getattr(self._config, "llm", None) if self._config else None
+        return repetition_guard_settings_from(getattr(llm_cfg, "repetition_guard", None))
 
     @staticmethod
     def _parse_thinking_level(value: Any, *, source: str) -> bool | ThinkingLevel | None:

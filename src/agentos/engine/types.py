@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
+from agentos.engine.repetition_guard import RepetitionGuardSettings
 from agentos.execution_status import ExecutionStatus
 from agentos.tool_boundary import ToolCall as ToolCall
 from agentos.tool_boundary import ToolResult as ToolResult
@@ -219,6 +220,40 @@ class WarningEvent:
 
 
 @dataclass
+class RepetitionStopEvent:
+    """The agent cut a provider response that had started repeating itself.
+
+    Engine-internal: the stream consumer uses it to drop ``removed_text`` from
+    the end of the reply it is accumulating (that text was already streamed as
+    deltas) and the tool calls the cut response had started, then suppresses
+    it. User-facing notice travels as a ``repetition_detected`` warning.
+    """
+
+    kind: Literal["repetition_stop"] = field(default="repetition_stop", init=False)
+    channel: str = "text"
+    signal: str = ""
+    period: int = 0
+    removed_text: str = ""
+
+
+@dataclass
+class SteeringEvent:
+    """A message the user sent while the turn ran, now injected into it.
+
+    The message was written to the transcript (``message_id``) at the point
+    the model meets it: after the tool results it arrived during, before the
+    next model call. ``task_id`` is the queued task the message was sent as.
+    """
+
+    kind: Literal["steering"] = field(default="steering", init=False)
+    text: str = ""
+    message_id: str | None = None
+    task_id: str | None = None
+    #: The message must not reach memory capture, so the turn skips it.
+    no_memory_capture: bool = False
+
+
+@dataclass
 class CompactionEvent:
     """Emitted when Agent completes inline compaction. Captured by TurnRunner for DB persistence."""
 
@@ -257,8 +292,10 @@ AgentEvent = (
     | ErrorEvent
     | DoneEvent
     | CompactionEvent
+    | RepetitionStopEvent
     | WarningEvent
     | RouterDecisionEvent
+    | SteeringEvent
 )
 
 
@@ -335,6 +372,9 @@ class AgentConfig:
     # instead of failing over, and does not trip the provider's circuit
     # breaker. 0 disables honouring the hint.
     rate_limit_retry_after_cap_seconds: float = 30.0
+    # Stop a response that degenerates into repeated output
+    # (``[llm.repetition_guard]``); one continuation, then a terminal error.
+    repetition_guard: RepetitionGuardSettings = field(default_factory=RepetitionGuardSettings)
     # Prompt caching breakpoints (list of {"text": ..., "cache": "true"})
     cache_breakpoints: list[dict[str, str]] | None = None
     cache_mode: Literal["off", "auto", "on"] = "off"
@@ -365,6 +405,9 @@ class AgentConfig:
     tool_use_argument_provider_request_max_chars: int = 0
     tool_use_argument_projection_enabled: bool = False
     tool_failure_loop_block_threshold: int = 3
+    # ``[tools] loop_guard``: "enforce" warns the model about repeated
+    # no-progress tool calls and then refuses them; "observe" only logs.
+    loop_guard: str = "enforce"
     tool_result_store_dir: str | None = None
     tool_result_store_session_id: str | None = None
     tool_result_store_session_key: str | None = None

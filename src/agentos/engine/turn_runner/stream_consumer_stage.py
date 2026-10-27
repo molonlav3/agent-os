@@ -44,6 +44,8 @@ if TYPE_CHECKING:
         CompactionEvent,
         DoneEvent,
         ErrorEvent,
+        RepetitionStopEvent,
+        SteeringEvent,
         TextDeltaEvent,
         ToolResultEvent,
         ToolUseStartEvent,
@@ -281,7 +283,9 @@ class _ToolUseStartHandler:
             strip_synthetic_tool_call_text,
         )
 
-        pending_text = state.protocol_text_guard.flush_before_tool_use()
+        pending_text = state.protocol_text_guard.flush_before_tool_use(
+            synthetic_from_text=event.synthetic_from_text
+        )
         if pending_text:
             state.final_text_parts.append(pending_text)
             state.current_text_parts.append(pending_text)
@@ -359,6 +363,28 @@ class _ToolResultHandler:
         return event
 
 
+class _SteeringHandler:
+    """Close the current text segment and mark where a steered message came in.
+
+    The marker (``agentos.engine.steering.steer_segment``) lets a reader of
+    the turn's row show the work before the message, the message, then the
+    work after it, instead of one block with the message above it.
+    """
+
+    def handle(self, event: SteeringEvent, state: _StreamState) -> SteeringEvent:
+        from agentos.engine.steering import steer_segment
+
+        pending_text = state.protocol_text_guard.flush()
+        if pending_text:
+            state.final_text_parts.append(pending_text)
+            state.current_text_parts.append(pending_text)
+        if state.current_text_parts:
+            state.turn_segments.append({"type": "text", "text": "".join(state.current_text_parts)})
+            state.current_text_parts[:] = []
+        state.turn_segments.append(steer_segment(event))
+        return event
+
+
 class _ArtifactHandler:
     """Append an artifact payload to the per-turn artifact list."""
 
@@ -397,7 +423,11 @@ class _ErrorHandler:
                 message=_LLM_TIMEOUT_ENVELOPE["user_message"],
                 code=_LLM_TIMEOUT_ENVELOPE["error_class"],
             )
-        if event.code in {"incomplete_tool_stream", "provider_output_truncated"}:
+        if event.code in {
+            "incomplete_tool_stream",
+            "provider_output_truncated",
+            "repetition_detected",
+        }:
             state.turn_segments[:] = _drop_unpaired_tool_use_segments(state.turn_segments)
         # Text still held back pending disambiguation (it merely resembled the
         # start of a tool-protocol marker) is genuine assistant output once
@@ -410,6 +440,48 @@ class _ErrorHandler:
             state.current_text_parts.append(pending_text)
         state.error_message = event.message or "Unknown error"
         state.pending_error_event = event
+        return _SUPPRESS
+
+
+class _RepetitionStopHandler:
+    """Take a cut, repeating response back out of the reply being accumulated.
+
+    The repeated text already went out as deltas; dropping it here keeps it
+    out of the persisted reply. Tool calls the cut response started never run,
+    so their unpaired ``tool_use`` segments go too. Returns ``_SUPPRESS``: the
+    event is engine-internal.
+    """
+
+    def handle(
+        self,
+        event: RepetitionStopEvent,
+        state: _StreamState,
+    ) -> object:
+        from agentos.engine.runtime import _drop_unpaired_tool_use_segments
+
+        pending_text = state.protocol_text_guard.flush()
+        if pending_text:
+            state.final_text_parts.append(pending_text)
+            state.current_text_parts.append(pending_text)
+        state.turn_segments[:] = _drop_unpaired_tool_use_segments(state.turn_segments)
+        removed = event.removed_text
+        if not removed:
+            return _SUPPRESS
+        current_text = "".join(state.current_text_parts)
+        final_text = "".join(state.final_text_parts)
+        if current_text.endswith(removed) and final_text.endswith(removed):
+            kept_current = current_text[: -len(removed)]
+            kept_final = final_text[: -len(removed)]
+            state.current_text_parts[:] = [kept_current] if kept_current else []
+            state.final_text_parts[:] = [kept_final] if kept_final else []
+        else:
+            # The reply diverged from the raw stream (a protocol-marker strip,
+            # a tool segment flush); leave it whole rather than cut blindly.
+            log.debug(
+                "stream_consumer.repetition_trim_skipped",
+                removed_chars=len(removed),
+                current_chars=len(current_text),
+            )
         return _SUPPRESS
 
 
@@ -462,14 +534,12 @@ class _DoneHandler:
             state.final_text_parts.append(pending_text)
             state.current_text_parts.append(pending_text)
 
-        from agentos.engine.tool_text_compat import strip_protocol_text_leak
-
-        normalized_text = strip_protocol_text_leak(
-            _normalize_heartbeat_text(
-                event.text,
-                run_kind=inp.run_kind,
-                heartbeat_ack_max_chars=inp.heartbeat_ack_max_chars,
-            )
+        # Text-form tool calls were already cut from event.text where they
+        # ran; markup left in it did not run and stays visible.
+        normalized_text = _normalize_heartbeat_text(
+            event.text,
+            run_kind=inp.run_kind,
+            heartbeat_ack_max_chars=inp.heartbeat_ack_max_chars,
         )
         routed_tier = metadata.get("routed_tier")
         routing_source = metadata.get("routing_source", "none")
@@ -857,7 +927,9 @@ class StreamConsumerStage:
         self._tool_use_start_handler = _ToolUseStartHandler()
         self._tool_result_handler = _ToolResultHandler()
         self._artifact_handler = _ArtifactHandler()
+        self._steering_handler = _SteeringHandler()
         self._error_handler = _ErrorHandler()
+        self._repetition_stop_handler = _RepetitionStopHandler()
         self._warning_handler = _WarningHandler(warning_transformer)
         self._done_handler = _DoneHandler()
         self._compaction_handler = _CompactionHandler(
@@ -876,6 +948,8 @@ class StreamConsumerStage:
             CompactionEvent,
             DoneEvent,
             ErrorEvent,
+            RepetitionStopEvent,
+            SteeringEvent,
             TextDeltaEvent,
             ToolResultEvent,
             ToolUseStartEvent,
@@ -903,11 +977,15 @@ class StreamConsumerStage:
                 transformed = self._error_handler.handle(event, state)
             elif isinstance(event, WarningEvent):
                 transformed = self._warning_handler.handle(event)
+            elif isinstance(event, RepetitionStopEvent):
+                transformed = self._repetition_stop_handler.handle(event, state)
             elif isinstance(event, DoneEvent):
                 transformed, extra_yields = self._done_handler.handle(event, inp, state)
             elif isinstance(event, CompactionEvent):
                 await self._compaction_handler.handle(event, inp)
                 transformed = _SUPPRESS
+            elif isinstance(event, SteeringEvent):
+                transformed = self._steering_handler.handle(event, state)
             else:
                 transformed = event
 

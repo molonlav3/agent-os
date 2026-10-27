@@ -75,6 +75,9 @@ class StopReason(StrEnum):
     STOP_SEQUENCE = "stop_sequence"
     REFUSAL = "refusal"
     PAUSE_TURN = "pause_turn"
+    # Set by the engine, never by a provider: the response degenerated into
+    # repeated output and the engine stopped reading the stream.
+    REPETITION = "repetition_detected"
     UNKNOWN = "unknown"
 
 
@@ -97,7 +100,8 @@ _STOP_REASON_ALIASES: dict[str, StopReason] = {
     # OpenAI Responses API (``status`` / ``incomplete_details.reason``)
     "completed": StopReason.END_TURN,
     "max_output_tokens": StopReason.MAX_TOKENS,
-    # Our own canonical value, so normalizing is idempotent
+    # Our own canonical values, so normalizing is idempotent
+    "repetition_detected": StopReason.REPETITION,
     "unknown": StopReason.UNKNOWN,
 }
 
@@ -443,6 +447,24 @@ MessageContent = (
 )
 
 
+class MessageProvenance(BaseModel):
+    """Which provider and model produced an assistant message.
+
+    ``provider`` is the provider kind the request went through (``anthropic``,
+    ``openrouter``, an OpenAI-compatible gateway, ...), ``model`` the model id
+    that was requested, and ``api`` the API family whose signed reasoning and
+    tool-call ids the message carries (``anthropic``, ``openai``, ``google``,
+    ``deepseek``, ...). The family comes from the model id, because one
+    OpenAI-compatible gateway can serve several families behind one base URL;
+    it is empty when neither the model nor the provider names a known family.
+    See :mod:`agentos.provider.replay`.
+    """
+
+    provider: str | None = None
+    model: str | None = None
+    api: str | None = None
+
+
 class Message(BaseModel):
     """A single conversation message."""
 
@@ -452,3 +474,7 @@ class Message(BaseModel):
     # OpenRouter ``reasoning_details`` from the response that produced this
     # assistant message, kept verbatim for replay (see DoneEvent).
     reasoning_details: list[dict[str, Any]] | None = None
+    # Origin of an assistant message; ``None`` for user messages and for
+    # messages persisted before provenance was recorded (treated as "same
+    # model" on replay, so old sessions replay exactly as before).
+    provenance: MessageProvenance | None = None

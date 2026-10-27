@@ -273,7 +273,7 @@ is a category (`INVALID_REQUEST`, `FORBIDDEN`, `NOT_FOUND`, …) and
 | `200` `{"dryRun": true, "allowed": …, "policy": {…}}` | `dry_run`: the resolved policy (profile, caller, sandboxed, read-only, may-require-approval); nothing ran. |
 | `403` `FORBIDDEN` / `POLICY_DENIED` | The configured tool policy (`[tools]` profile/allow/deny, the agent's own entry) refuses it; `details.error_class` names the refusal. |
 | `403` `FORBIDDEN` / `APPROVAL_REQUIRED` | The tool needs a human approval. HTTP calls run unattended, so the tool refuses as on any unattended run; `details.approval_id` is included when it queued one. |
-| `400` `INVALID_REQUEST` | Bad body, or an argument that writes a file (`output_path`, `save_path`, `output_file`, `destination`, …), refused for every tool. |
+| `400` `INVALID_REQUEST` | Bad body, an argument that writes a file (`output_path`, `save_path`, `output_file`, `destination`, …), refused for every tool, or arguments that do not match the tool's schema (`details.error_class = "ToolArgumentsRejected"`, the message names each failing argument). |
 | `404` `NOT_FOUND` | Unknown tool **or** one the endpoint does not run — the two look the same. |
 | `409` `INVALID_REQUEST` / `REQUEST_CONFLICT` | The `idempotency_key` was used for a different request in the last ten minutes (a repeat of the same request replays its first answer with `idempotentReplay: true`). |
 | `504` `UNAVAILABLE` / `TOOL_TIMEOUT` | The tool did not finish within the tool timeout. |
@@ -436,6 +436,41 @@ before relying on it.
   through_stream_seq, text, text_truncated?, plan?, events?}` for the running
   turn. It is capped at 256 KiB, filled in that order of priority; text is cut
   from the front. `through_stream_seq` is the stream position it covers.
+- **`mid-turn-steering`** — a `chat.send` / `sessions.send` with an explicit
+  `queueMode: "steer"` while the session's turn runs joins that turn instead
+  of cancelling it (without `queueMode` the session's default still replaces
+  the running turn, as before). The turn takes one
+  waiting message per checkpoint: before starting the next call of an ordered
+  tool sequence (calls not started get a "skipped" tool result), after a tool
+  batch (the message follows the tool results), and when the model would end
+  the turn (it continues instead). The user row is written when the turn
+  takes the message; until then it is not in the transcript. A message no
+  checkpoint takes runs as the next turn. When the running turn does not check
+  (a coding-harness turn, a turn still starting) `steer` still replaces it.
+  A `noMemoryCapture` message steers too; the turn it joins then skips
+  memory capture. The send answer carries `task_id` and the effective
+  `queue_mode` (`steer`, `interrupt`, `followup`, `collect`); an explicit
+  `steer` that fell back to interrupt also carries `steer_fallback`:
+  `attachments` (a message with attachments always starts its own turn) or
+  `no_steerable_turn` (nothing running takes steering messages). `chat.history` (unless paging with
+  `before`) returns `pending_inputs`: the session's queued messages, oldest
+  first, as `{task_id, queue_mode, text, text_truncated?, queued_at,
+  attachments, steer, message_id?}`; `message_id` is set when the user row is
+  already in the transcript (a follow-up), so a client does not show it
+  twice. `chat.abort {sessionKey, taskId}` (and `sessions.abort {key,
+  taskId}`) withdraws a queued message — `{withdrawn: true, aborted: [],
+  removed_message_id?}`, the task ends `cancelled` / `withdrawn` — stops just
+  that run when it is the running one, and answers `delivered: true` when a
+  running turn already took it. When a turn takes the message it emits
+  `session.event.steering {text, message_id, task_id}` and adds a
+  `{"type": "steer", "message_id"}` segment to its row's `tool_calls`.
+  `chat.history` cuts such an assistant message at each `steer` segment and
+  moves the steered user message between the parts (work before, message,
+  work after); the last part keeps the row's ids, usage and artifacts, earlier
+  parts get `<message_id>#partN` ids and `split_from`. While the turn runs,
+  its part up to the newest steer is listed and `in_flight_run.text` holds
+  only the text after it. A `delta_cursor` read whose turn would move a
+  steered message the client already has answers `kind: "reset"`.
 - **`idempotency-keys`** — `chat.send`, `sessions.send`, `sessions.create`,
   `cron.add`, `exec.approval.resolve` and `plugin.approval.resolve` accept an
   optional `idempotency_key`. The same key within five minutes returns the first

@@ -31,6 +31,98 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   resumed.
 
 ### Fixed
+- Engine: a tool batch runs in the model's order again. Shared (`parallel` /
+  `keyed`) calls queued behind every exclusive call, so in `[write, read,
+  read, write]` the second write ran before the two reads.
+
+### Added
+- Gateway: mid-turn steering. A `chat.send` / `sessions.send` that asks for
+  `queueMode: "steer"` while the session's turn runs no longer cancels that
+  turn: the turn takes the message at its next checkpoint. Sends without an
+  explicit `queueMode` behave as before. Calls of an
+  ordered tool sequence that have not started get a "skipped" result, the
+  message is added after the tool results before the next model call, and a
+  turn about to end continues with it. Its user row is written where the turn
+  takes it, not at send time; a message no checkpoint takes runs as the next
+  turn. Turns that never check (coding-harness turns) keep `steer` =
+  interrupt, and the answer says why in `steer_fallback`. A `noMemoryCapture`
+  message steers too and keeps the turn it joins out of memory capture.
+  Capability `mid-turn-steering`.
+- Gateway: server-side pending inputs. `chat.send` / `sessions.send` answer
+  with the turn's `task_id` and the effective `queue_mode` (`chat.send` now
+  accepts `queueMode`); `chat.history` lists `pending_inputs` (queued messages,
+  oldest first); `chat.abort {taskId}` / `sessions.abort {taskId}` withdraws a
+  queued message (`withdrawn: true`, removing a follow-up's already written
+  user row) or stops just that running turn.
+### Added
+- Engine: a repetition guard stops a streamed response that degenerates into
+  the same line, paragraph or short phrase over and over, instead of letting it
+  run to `max_tokens`. It watches the visible text and the reasoning
+  separately, starts checking at 16k characters and reads only the last 64k on
+  a growing schedule, so its cost stays bounded. On a trip the provider stream
+  is closed, the text is kept up to the first repeated copy, tool calls the cut
+  response started are dropped, and the response is continued once (like an
+  output-limit cut); a second loop ends the turn with `repetition_detected`.
+  The cut call's usage is counted as an estimate (request-size estimate in,
+  streamed text and reasoning out), so turn totals and token budgets include
+  it. Tune or disable it under `[llm.repetition_guard]`.
+### Fixed
+- Engine: the progress watchdog now acts instead of only logging. When a tool
+  call keeps returning the same result, or two calls alternate with nothing
+  new, the model gets a `[Loop check]` note on that result; the next repeat is
+  answered with "not run" results instead of being executed, and a second one
+  in the same turn ends it with `loop_detected` and a message for the user.
+  Calls whose results change, and status polls, are not refused (polls get a
+  much larger allowance). The guard and the repeated-failure streak both reset
+  on every new message. `[tools] loop_guard = "observe"` restores log-only.
+### Added
+- Engine: when a reply ends by writing a tool call out as text (a JSON call in
+  a code fence, ReAct `Action:` / `Action Input:` lines, an "I'll call
+  `read_file`" line followed by the arguments, or tool markup that was not
+  turned into a call) and nothing ran, the engine retries that model call
+  once with a short nudge to call the tool natively. The written-out call is
+  held back while it streams, so the user never sees it as the answer; the
+  nudge goes on the retried request only and is not stored in history. The
+  detector only fires on a call-shaped payload that ends the reply and names
+  a tool offered on that request, and not on text that explains or shows a
+  call. It uses the existing provider retry budget (`max_provider_retries: 0`
+  turns it off) and `max_turn_llm_calls`; a second miss ends the turn as
+  before. Retries show as `text_tool_call` in the decision log's
+  `turn_policy_decision` entries and in the turn timing `retries` breakdown,
+  with a `provider_text_tool_call_retry` warning.
+### Fixed
+- Engine, gateway: a message steered into a running turn now shows where it
+  came in. `chat.history` (web console, desktop app) shows the work done
+  before the message, then the message, then the work after it, instead of
+  the message above one assistant reply that also held the earlier work with
+  the texts run together; the live view splits the same way when
+  `session.event.steering` arrives, and a reload mid-turn lists the settled
+  part above the message while `in_flight_run.text` restarts at it. A message
+  taken when the model answered is put on record before the next model call,
+  so a crash during that call no longer loses the answer or reads the two
+  user rows as a fresh, unanswered input. `classify_transcript_tail` no longer
+  counts rows steered into the turn as trailing input, and now does count a
+  follow-up queued mid-turn that sorts before the rewritten in-progress row.
+- Provider: each assistant message now records the provider, model and API
+  family that produced it (stored in the transcript record; older rows read
+  as unknown). After a model switch (router tier, failover, `/model`), a
+  request to a different model no longer replays the previous model's signed
+  thinking, `redacted_thinking`, OpenRouter `reasoning_details` or Gemini
+  `thought_signature`, and tool-call ids are rewritten to the target API's
+  format (Anthropic charset, OpenAI 40 characters, Mistral nine
+  alphanumerics) with their tool results kept paired. Plain text and
+  `reasoning_content` stay. Replays to the same model, and history without
+  provenance, are sent unchanged.
+### Changed
+- Engine: the context compaction summary now has fixed sections (Goal,
+  Constraints and preferences, Done, In progress, Blocked, Key decisions,
+  Next steps, Critical context), and a later compaction revises the previous
+  summary instead of writing a new one; a long history split into chunks now
+  yields one revised summary rather than one per chunk. The files read and
+  modified by the compacted tool calls are appended by the engine, merged
+  across compactions and capped, so the model can neither drop nor invent
+  them. Applies to the in-turn, the proactive (between-turns) and the manual
+  (`/compact`, `sessions.compact`) compaction.
 - Engine: a turn's tool rounds are now durable while it runs. The turn keeps
   one in-progress transcript row, rewritten when a round's calls are issued
   and again when their results are in, and the final row replaces it in the
@@ -43,6 +135,83 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   error result saying its outcome is unknown and to check the current state
   before repeating it; a real result that sits elsewhere in the same step is
   moved next to its call.
+- Provider: tool calls a model writes as text are hidden from the user only
+  when they actually run. One format table now drives both the stream guard
+  and promotion, and covers `<invoke>` (bare or wrapped),
+  `<tool_call>{json}</tool_call>`, `<function=name><parameter=k>v</parameter></function>`,
+  `to=functions.<name>` channel markup and the trailing `tool_name{...}`
+  fallback. Before, `<tool_call>` and `<function=...>` calls were hidden but
+  never run, and channel markup was shown raw.
+- Provider: a tool call quoted inside a fenced code block or inline code is
+  never run or hidden. Before, an `<invoke name="exec">` example in a
+  ```` ```xml ```` fence was executed. Promotion now also needs the reply to be
+  one block of calls (prose before and after is fine), only names tools
+  offered that turn, and caps names at 120 characters and payloads at
+  256 KiB; anything rejected stays visible as written.
+- Engine: prose after a promoted text-form call stays visible; the stream
+  guard no longer drops everything after the first call marker, and markup
+  that did not run (unknown tool, truncated payload, a native call in the
+  same reply) is released instead of silently removed.
+- Web console, desktop app and channel deliveries no longer hide tool-call
+  markup in assistant text (`<invoke>`, `<tool_call>`, `<minimax:tool_call>`,
+  `<parameter>`): the engine already cuts the calls it ran, so markup that
+  reaches the display never ran and is shown. The chat Markdown renderer
+  shows such tags literally instead of letting the HTML sanitizer drop them.
+  The non-call scaffold filters (`<details><summary>View areas around line`,
+  `<effect_calls>`, `<angle brackets>`) are unchanged.
+### Added
+- Tools: a tool call whose name misses only by decoration resolves to the one
+  tool it means: a `functions.`/`tools.` prefix and a `:<n>` counter are
+  dropped, case is ignored and `/` reads as `_`. The match must be unique among
+  the tools the session can see; MCP tool names are only ever matched exactly.
+  The engine resolves the name as the call arrives, so concurrency, timeouts,
+  approvals, stream events and the saved `tool_use` block use the real name.
+- Tools: arguments are validated against the tool's schema before hooks,
+  policy and approvals. Lossless mistakes (`"5"` for an integer, `"true"` for
+  a boolean, a JSON-encoded string for an array or object) are coerced;
+  anything else is rejected with `ToolArgumentsRejected`, naming each failing
+  argument path and the expected type, instead of a generic type error from
+  the handler. Coerced values are what the transcript keeps and what the
+  next request replays. A rejection is marked retryable (a corrected call
+  should run), and identical rejected calls still count toward the
+  repeated-failure guard.
+  `POST /api/v1/tools/invoke` answers such a call with `400 INVALID_REQUEST`.
+### Fixed
+- Engine: a turn's tool rounds are now durable while it runs. The turn keeps
+  one in-progress transcript row, rewritten when a round's calls are issued
+  and again when their results are in, and the final row replaces it in the
+  same transaction, so a finished turn still leaves exactly one row and its
+  usage is rolled up once. A crash or kill mid-turn no longer loses calls
+  that already ran (a trade, a sent message, a file write): they stay in
+  history, and `chat.history` shows them once the turn is no longer live.
+- Engine: a tool call without a recorded result is no longer deleted from
+  history together with the assistant text around it. It is kept and given an
+  error result saying its outcome is unknown and to check the current state
+  before repeating it; a real result that sits elsewhere in the same step is
+  moved next to its call.
+### Changed
+- Engine: the context compaction summary now has fixed sections (Goal,
+  Constraints and preferences, Done, In progress, Blocked, Key decisions,
+  Next steps, Critical context), and a later compaction revises the previous
+  summary instead of writing a new one; a long history split into chunks now
+  yields one revised summary rather than one per chunk. The files read and
+  modified by the compacted tool calls are appended by the engine, merged
+  across compactions and capped, so the model can neither drop nor invent
+  them. Applies to the in-turn, the proactive (between-turns) and the manual
+  (`/compact`, `sessions.compact`) compaction. A manual compaction revises
+  the newest stored summary and replaces it in replay, instead of adding a
+  second summary that knows nothing of the first.
+### Fixed
+- Provider: each assistant message now records the provider, model and API
+  family that produced it (stored in the transcript record; older rows read
+  as unknown). After a model switch (router tier, failover, `/model`), a
+  request to a different model no longer replays the previous model's signed
+  thinking, `redacted_thinking`, OpenRouter `reasoning_details` or Gemini
+  `thought_signature`, and tool-call ids are rewritten to the target API's
+  format (Anthropic charset, OpenAI 40 characters, Mistral nine
+  alphanumerics) with their tool results kept paired. Plain text and
+  `reasoning_content` stay. Replays to the same model, and history without
+  provenance, are sent unchanged.
 
 ## [2026.10.27] - 2026-10-27
 

@@ -34,6 +34,7 @@ Record shape (``transcript_entries.provider_messages`` JSON)::
       "mode": "append" | "reset",
       "input_entry_id": "<message_id of the persisted user row it replays>" | null,
       "compaction_id": "<id>" | null,
+      "steered_entry_ids": ["<message_id of a user row steered into the turn>"],
       "messages": [
         {"role": "user", "content": "text ..."},
         {"role": "assistant",
@@ -44,17 +45,27 @@ Record shape (``transcript_entries.provider_messages`` JSON)::
            {"type": "tool_use", "id": "...", "name": "...", "input": {...}}
          ],
          "reasoning_content": "...",
-         "reasoning_details": [{...}]},
+         "reasoning_details": [{...}],
+         "provenance": {"provider": "...", "model": "...", "api": "..."}},
         {"role": "user",
          "content": [{"type": "tool_result", "tool_use_id": "...", "content": "..."}]}
       ]
     }
 
+``steered_entry_ids`` (present only when non-empty) names the user rows sent
+while the turn ran and injected into it (``agentos.engine.steering``); the
+record already holds those messages where the model met them, so a load skips
+the rows.
+
 ``append`` records extend the history; a ``reset`` record (written by a turn
 that compacted) replaces everything before it. Assistant messages also keep
-``reasoning_content`` and OpenRouter ``reasoning_details`` verbatim. Whether a
+``reasoning_content`` and OpenRouter ``reasoning_details`` verbatim, plus the
+``provenance`` (provider, model, API family) of the response that produced
+them; rows written before provenance existed read as unknown. Whether a
 later request replays reasoning is the provider's decision (and, for models
-that take none, an opt-in drop on load) -- never a storage one.
+that take none, an opt-in drop on load) -- never a storage one. A request to a
+different model drops the foreign signed reasoning in the request view only
+(:mod:`agentos.provider.replay`).
 """
 
 from __future__ import annotations
@@ -82,6 +93,7 @@ from agentos.provider.types import (
     ContentBlockToolResult,
     ContentBlockToolUse,
     Message,
+    MessageProvenance,
 )
 
 log = structlog.get_logger(__name__)
@@ -130,6 +142,8 @@ class TranscriptRecord:
     mode: RecordMode = "append"
     input_entry_id: str | None = None
     compaction_id: str | None = None
+    #: User rows steered into the turn; the record replays them in place.
+    steered_entry_ids: tuple[str, ...] = ()
 
 
 def _block_classes() -> dict[str, type[BaseModel]]:
@@ -193,6 +207,7 @@ def _with_content(message: Message, content: Any) -> Message:
         content=content,
         reasoning_content=message.reasoning_content,
         reasoning_details=message.reasoning_details,
+        provenance=message.provenance,
     )
 
 
@@ -212,7 +227,21 @@ def encode_message(message: Message) -> dict[str, Any]:
         payload["reasoning_details"] = json.loads(
             json.dumps(message.reasoning_details, ensure_ascii=False, default=str)
         )
+    if message.provenance is not None:
+        payload["provenance"] = message.provenance.model_dump(mode="json", exclude_none=True)
     return payload
+
+
+def _decode_provenance(payload: Any) -> MessageProvenance | None:
+    """Read a stored provenance; anything unusable reads as unknown."""
+    if not isinstance(payload, dict):
+        return None
+    fields = {
+        key: value.strip()
+        for key in ("provider", "model", "api")
+        if isinstance(value := payload.get(key), str) and value.strip()
+    }
+    return MessageProvenance(**fields) if fields else None
 
 
 def decode_message(payload: Any) -> Message | None:
@@ -243,18 +272,22 @@ def decode_message(payload: Any) -> Message | None:
             if isinstance(details, list)
             else None
         ),
+        provenance=_decode_provenance(payload.get("provenance")),
     )
 
 
 def encode_transcript_record(record: TranscriptRecord) -> dict[str, Any]:
-    return {
+    encoded: dict[str, Any] = {
         "kind": PROVIDER_MESSAGES_KIND,
         "v": PROVIDER_MESSAGES_VERSION,
         "mode": record.mode,
         "input_entry_id": record.input_entry_id,
         "compaction_id": record.compaction_id,
-        "messages": [encode_message(message) for message in record.messages],
     }
+    if record.steered_entry_ids:
+        encoded["steered_entry_ids"] = list(record.steered_entry_ids)
+    encoded["messages"] = [encode_message(message) for message in record.messages]
+    return encoded
 
 
 def decode_transcript_record(payload: Any) -> TranscriptRecord | None:
@@ -284,11 +317,17 @@ def decode_transcript_record(payload: Any) -> TranscriptRecord | None:
     mode = payload.get("mode")
     input_entry_id = payload.get("input_entry_id")
     compaction_id = payload.get("compaction_id")
+    steered = payload.get("steered_entry_ids")
     return TranscriptRecord(
         messages=messages,
         mode="reset" if mode == "reset" else "append",
         input_entry_id=input_entry_id if isinstance(input_entry_id, str) else None,
         compaction_id=compaction_id if isinstance(compaction_id, str) else None,
+        steered_entry_ids=(
+            tuple(item for item in steered if isinstance(item, str) and item)
+            if isinstance(steered, list)
+            else ()
+        ),
     )
 
 
@@ -366,7 +405,8 @@ def build_history_from_transcript(
     User rows persisted *between* a record's input row and the record's own
     row are follow-ups queued while that turn ran (``sessions.send`` persists
     them at once). They are replayed after the record, where the model met
-    them, not before it.
+    them, not before it. Rows the record names in ``steered_entry_ids`` were
+    injected into that turn and are replayed by the record itself.
 
     *current_input_id* names the persisted user row of the turn being loaded:
     it is left out of the history (the agent appends it itself) and returned
@@ -388,6 +428,10 @@ def build_history_from_transcript(
         for index, record in records.items()
         if index >= start and record.input_entry_id
     }
+    # Rows steered into a turn are inside its record already.
+    for index, record in records.items():
+        if index >= start:
+            covered_input_ids.update(record.steered_entry_ids)
     position_by_id = {
         getattr(entry, "message_id", None): index for index, entry in enumerate(entries)
     }
