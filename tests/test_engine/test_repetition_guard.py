@@ -111,16 +111,22 @@ def _numbered_list(items: int) -> str:
     )
 
 
+_LONG_LEGITIMATE_OUTPUTS = [
+    ("markdown_table", _markdown_table(1_500)),
+    ("boilerplate_tests", _boilerplate_tests(700)),
+    ("boilerplate_classes", _boilerplate_classes(500)),
+    ("numbered_list_300", _numbered_list(300)),
+    ("numbered_list_3000", _numbered_list(3_000)),
+    ("prose", _prose(150_000)),
+]
+
+
+# Short ids: pytest puts the test id in PYTEST_CURRENT_TEST, and Windows caps an
+# environment variable at 32,767 characters.
 @pytest.mark.parametrize(
     ("name", "text"),
-    [
-        ("markdown_table", _markdown_table(1_500)),
-        ("boilerplate_tests", _boilerplate_tests(700)),
-        ("boilerplate_classes", _boilerplate_classes(500)),
-        ("numbered_list_300", _numbered_list(300)),
-        ("numbered_list_3000", _numbered_list(3_000)),
-        ("prose", _prose(150_000)),
-    ],
+    _LONG_LEGITIMATE_OUTPUTS,
+    ids=[name for name, _ in _LONG_LEGITIMATE_OUTPUTS],
 )
 def test_long_legitimate_output_does_not_trip(name: str, text: str) -> None:
     assert len(text) > 20_000, name
