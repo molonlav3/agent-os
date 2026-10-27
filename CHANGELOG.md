@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Provider: tool calls a model writes as text are hidden from the user only
+  when they actually run. One format table now drives both the stream guard
+  and promotion, and covers `<invoke>` (bare or wrapped),
+  `<tool_call>{json}</tool_call>`, `<function=name><parameter=k>v</parameter></function>`,
+  `to=functions.<name>` channel markup and the trailing `tool_name{...}`
+  fallback. Before, `<tool_call>` and `<function=...>` calls were hidden but
+  never run, and channel markup was shown raw.
+- Provider: a tool call quoted inside a fenced code block or inline code is
+  never run or hidden. Before, an `<invoke name="exec">` example in a
+  ```` ```xml ```` fence was executed. Promotion now also needs the reply to be
+  one block of calls (prose before and after is fine), only names tools
+  offered that turn, and caps names at 120 characters and payloads at
+  256 KiB; anything rejected stays visible as written.
+- Engine: prose after a promoted text-form call stays visible; the stream
+  guard no longer drops everything after the first call marker, and markup
+  that did not run (unknown tool, truncated payload, a native call in the
+  same reply) is released instead of silently removed.
+
 ## [2026.10.27] - 2026-10-27
 
 ### Added
