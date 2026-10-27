@@ -86,8 +86,14 @@ from agentos.engine.turn_progress import (
 )
 from agentos.engine.turn_timing import NULL_TURN_TIMING, TurnTiming
 from agentos.engine.verification_ledger import (
+    MUTATING_TOOL_NAMES as _MUTATING_TOOL_NAMES,
+)
+from agentos.engine.verification_ledger import (
     VerificationLedger,
     build_verification_nudge,
+)
+from agentos.engine.verification_ledger import (
+    mutated_paths as _mutated_paths,
 )
 from agentos.execution_status import (
     mark_execution_status_truncated,
@@ -128,6 +134,7 @@ from agentos.provider.failures import (
     honoured_retry_after,
     is_transport_timeout,
 )
+from agentos.provider.replay import provenance_for_provider
 from agentos.provider.request_proof import effective_proof_budget
 from agentos.provider.types import ContentBlockImage, StopReason, normalize_stop_reason
 from agentos.result_budget import (
@@ -534,7 +541,6 @@ class _ProviderRetryPolicy:
         return provider_retry_attempt < self.max_provider_retries
 
 
-_MUTATING_TOOL_NAMES = frozenset({"write_file", "edit_file", "apply_patch"})
 _COMMAND_TOOL_NAMES = frozenset({"exec_command", "execute_code", "background_process"})
 # Sessions whose surface is a person in a chat rather than a checkout. There is
 # usually no test command to run there, so the verification nudge is withheld.
@@ -547,27 +553,6 @@ _MESSAGING_SESSION_MARKERS = (
     "whatsapp",
     "signal",
 )
-
-
-def _mutated_paths(arguments: dict[str, Any]) -> list[str]:
-    """Pull the touched paths out of a mutating tool's arguments."""
-
-    paths: list[str] = []
-    for key in ("path", "file_path", "target"):
-        value = arguments.get(key)
-        if isinstance(value, str) and value.strip():
-            paths.append(value.strip())
-    patch = arguments.get("patch")
-    if isinstance(patch, str):
-        # apply_patch names its files inside the patch body.
-        for line in patch.splitlines():
-            stripped = line.strip()
-            for marker in ("*** Update File:", "*** Add File:", "*** Delete File:"):
-                if stripped.startswith(marker):
-                    candidate = stripped[len(marker) :].strip()
-                    if candidate:
-                        paths.append(candidate)
-    return paths
 
 
 def _is_messaging_surface(session_key: str | None) -> bool:
@@ -679,6 +664,7 @@ def _strip_historical_image_blocks(messages: list[Message]) -> list[Message]:
                 content=kept,
                 reasoning_content=msg.reasoning_content,
                 reasoning_details=msg.reasoning_details,
+                provenance=msg.provenance,
             )
         )
     return sanitized
@@ -3022,6 +3008,9 @@ class Agent:
                             reasoning_details=getattr(
                                 provider_done_for_log, "reasoning_details", None
                             ),
+                            # Read after the stream: a failover wrapper now
+                            # reports the provider that actually answered.
+                            provenance=provenance_for_provider(self.provider),
                         )
                     )
 
@@ -3574,6 +3563,7 @@ class Agent:
                     content=blocks,
                     reasoning_content=message.reasoning_content,
                     reasoning_details=message.reasoning_details,
+                    provenance=message.provenance,
                 )
                 self._message_sizes.retain_only(messages)
 
