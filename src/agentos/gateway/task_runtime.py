@@ -31,6 +31,7 @@ from typing import Any, cast
 import structlog
 
 from agentos.engine.outcome import completed_outcome, outcome_from_error
+from agentos.engine.turn_progress import TurnStopSignal, bind_turn_stop_signal
 from agentos.gateway.routing import RouteEnvelope, SourceKind
 from agentos.gateway.session_lifecycle import TaskLifecycleEvent, TaskLifecycleListener
 from agentos.gateway.terminal_events import TerminalPublications, runtime_terminal_frame
@@ -228,6 +229,8 @@ class _RuntimeTask:
     #: Set once the task reached ``running``: only a run that started has a
     #: stream, so only it owes a terminal stream frame.
     started: bool = False
+    #: Tells the turn a gateway shutdown is what cancels it.
+    stop_signal: TurnStopSignal = field(default_factory=TurnStopSignal)
 
 
 TaskHandler = Callable[[TaskRun], Awaitable[Any]]
@@ -648,6 +651,7 @@ class TaskRuntime:
             for task in tasks:
                 task.cancel_requested = True
                 task.cancel_source = _clean_cancel_detail(source, "unknown")
+                task.stop_signal.shutdown = False
                 task.cancel_reason = _clean_cancel_detail(reason, "cancelled")
                 if task.asyncio_task is not None and not task.asyncio_task.done():
                     task.asyncio_task.cancel()
@@ -775,6 +779,11 @@ class TaskRuntime:
         ]
         if not tasks:
             return
+        # Before anything can cancel them: a graceful drain that times out
+        # cancels the remaining turns itself (``wait_for`` on the gather).
+        # Turns that finish during the drain are not affected; a user cancel
+        # meanwhile still counts as a cancel.
+        self._stamp_shutdown_interrupt()
 
         if graceful:
             # Phase 1: wait for all tasks to finish naturally.
@@ -794,7 +803,6 @@ class TaskRuntime:
             tasks = [t for t in tasks if not t.done()]
 
         if cancel:
-            self._stamp_shutdown_interrupt()
             for task in tasks:
                 task.cancel()
         if tasks:
@@ -997,6 +1005,7 @@ class TaskRuntime:
             self._pinned_locks.pop(key, None)
 
     async def _execute(self, task: _RuntimeTask) -> None:
+        bind_turn_stop_signal(task.stop_signal)
         session_key = task.envelope.session_key
         write_lock = self._pin_lock(self._session_locks, session_key)
         execution_lock = self._pin_lock(self._session_execution_locks, session_key)
@@ -1604,6 +1613,7 @@ class TaskRuntime:
                 continue
             task.cancel_source = SHUTDOWN_CANCEL_SOURCE
             task.cancel_reason = SHUTDOWN_INTERRUPTED_REASON
+            task.stop_signal.shutdown = True
 
     async def _mark_unfinished_abandoned(self) -> None:
         async with self._state_lock:
