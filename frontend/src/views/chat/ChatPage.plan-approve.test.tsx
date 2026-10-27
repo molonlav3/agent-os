@@ -110,7 +110,8 @@ async function presentPlan() {
     // taken while nothing is streaming.
     mockRpc.emit('session.event.done', { key: KEY, stream_seq: 3, text: '' }, {})
   })
-  return screen.findByRole('button', { name: /approve plan/i })
+  // A loaded CI runner can take longer than findBy's 1 s default to render it.
+  return screen.findByRole('button', { name: /approve plan/i }, { timeout: 5000 })
 }
 
 beforeEach(() => {

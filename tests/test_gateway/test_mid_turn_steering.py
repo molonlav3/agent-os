@@ -113,6 +113,23 @@ async def test_steer_send_joins_the_running_turn_and_lands_where_it_is_taken(
     assert runner.steered_ids == [user_ids[1]]
 
 
+async def _terminal_record(rig: Any, task_id: str, timeout: float = 15.0) -> Any:
+    """The task's record once it is terminal in the store.
+
+    ``TaskRuntime.wait`` returns as soon as the task leaves memory, which can be
+    a moment before its terminal status is written; a slow runner sees
+    ``running`` in that gap.
+    """
+    await rig.runtime.wait(task_id, timeout=timeout)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        record = await rig.runtime.status(task_id)
+        if record.status != AgentTaskStatus.RUNNING or loop.time() > deadline:
+            return record
+        await asyncio.sleep(0.02)
+
+
 async def test_steer_message_no_checkpoint_took_runs_as_the_next_turn(tmp_path: Path) -> None:
     runner = SteerableRunner(take=False)
     async with turn_rig(tmp_path, runner) as rig:
@@ -124,7 +141,7 @@ async def test_steer_message_no_checkpoint_took_runs_as_the_next_turn(tmp_path: 
         runner.release.set()
         await rig.runtime.wait(first["task_id"], timeout=3)
         await wait_for(lambda: len(runner.calls) == 2)
-        record = await rig.runtime.wait(second["task_id"], timeout=3)
+        record = await _terminal_record(rig, second["task_id"])
         rows = await _user_rows(rig)
 
     message, kwargs = runner.calls[1]
