@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- Gateway: turns a restart or crash cut short are resumed. A graceful
+  shutdown or restart marks the turns it cancels interrupted
+  (`shutdown_interrupted`); the startup sweep still marks a crashed
+  process's turns `process_restart`. After boot the gateway classifies each
+  such session from its transcript: nothing to do when the reply is already
+  there; a normal resume when the message was never answered or the last tool
+  round finished; a resume with read and status tools only when tool calls
+  have no recorded result (no shell, writes, trading, sends or approvals; the
+  user's next message gets every tool back). The resume is an internal
+  continuation turn whose reply reaches the session's web console or channel
+  chat as usual, at most three attempts per interrupted run (counted across
+  restarts), then a note in the session; 24 h maximum age; a new message
+  cancels a resume not yet started; cron, heartbeat, subagent and ACP turns
+  are excluded, and safe mode only reports. `[task_runtime]
+  resume_interrupted_turns = false` only reports. `/ready` carries
+  `turn_recovery` counts and `agentos doctor` reports turns that were not
+  resumed.
+
 ### Fixed
 - Engine: a turn's tool rounds are now durable while it runs. The turn keeps
   one in-progress transcript row, rewritten when a round's calls are issued
