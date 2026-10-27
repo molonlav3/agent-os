@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- Tools: a tool call whose name misses only by decoration resolves to the one
+  tool it means: a `functions.`/`tools.` prefix and a `:<n>` counter are
+  dropped, case is ignored and `/` reads as `_`. The match must be unique among
+  the tools the session can see; MCP tool names are only ever matched exactly.
+  The engine resolves the name as the call arrives, so concurrency, timeouts,
+  approvals, stream events and the saved `tool_use` block use the real name.
+- Tools: arguments are validated against the tool's schema before hooks,
+  policy and approvals. Lossless mistakes (`"5"` for an integer, `"true"` for
+  a boolean, a JSON-encoded string for an array or object) are coerced;
+  anything else is rejected with `ToolArgumentsRejected`, naming each failing
+  argument path and the expected type, instead of a generic type error from
+  the handler. Coerced values are what the transcript keeps and what the
+  next request replays. A rejection is marked retryable (a corrected call
+  should run), and identical rejected calls still count toward the
+  repeated-failure guard.
+  `POST /api/v1/tools/invoke` answers such a call with `400 INVALID_REQUEST`.
 ### Fixed
 - Engine: a turn's tool rounds are now durable while it runs. The turn keeps
   one in-progress transcript row, rewritten when a round's calls are issued

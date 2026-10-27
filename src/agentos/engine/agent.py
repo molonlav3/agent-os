@@ -1935,16 +1935,17 @@ class Agent:
                                     ):
                                         ignored_post_delivery_tool_use = True
                                     continue
+                                start_tool_name = self._canonical_tool_name(raw_ev.tool_name)
                                 pending_tools[raw_ev.tool_use_id] = _StreamAccumulator(
                                     tool_use_id=raw_ev.tool_use_id,
-                                    tool_name=raw_ev.tool_name,
+                                    tool_name=start_tool_name,
                                     synthetic_from_text=raw_ev.synthetic_from_text,
                                 )
                                 tool_argument_heartbeat_chars[raw_ev.tool_use_id] = 0
                                 attempt_user_visible_emitted = True
                                 yield ToolUseStartEvent(
                                     tool_use_id=raw_ev.tool_use_id,
-                                    tool_name=raw_ev.tool_name,
+                                    tool_name=start_tool_name,
                                     synthetic_from_text=raw_ev.synthetic_from_text,
                                 )
 
@@ -1994,11 +1995,17 @@ class Agent:
                                     if acc is not None
                                     else raw_ev.synthetic_from_text
                                 )
+                                end_tool_name = self._canonical_tool_name(
+                                    raw_ev.tool_name,
+                                    tool_use_id=raw_ev.tool_use_id,
+                                )
                                 tool_calls.append(
                                     ToolCall(
                                         tool_use_id=raw_ev.tool_use_id,
-                                        tool_name=raw_ev.tool_name,
-                                        arguments=arguments,
+                                        tool_name=end_tool_name,
+                                        arguments=self._coerce_tool_arguments(
+                                            end_tool_name, arguments
+                                        ),
                                         synthetic_from_text=synthetic_from_text,
                                         thought_signature=raw_ev.thought_signature,
                                     )
@@ -4205,6 +4212,60 @@ class Agent:
                 reason="provider_projection_reused",
             )
         return tc
+
+    def _canonical_tool_name(self, name: str, *, tool_use_id: str | None = None) -> str:
+        """The offered tool name a model's near-miss name unambiguously means.
+
+        Applied where the stream hands over a tool call, so scheduling,
+        timeouts, approvals, events and the persisted ``tool_use`` block all
+        carry the registered name. Pass ``tool_use_id`` to log the rewrite.
+        """
+        offered = [definition.name for definition in self.tool_definitions]
+        if not offered or name in offered:
+            return name
+        from agentos.tools.tool_name_resolution import resolve_tool_name_among
+
+        resolution = resolve_tool_name_among(name, offered)
+        if resolution is None:
+            return name
+        if tool_use_id is not None:
+            logger.info(
+                "agent.tool_name_resolved",
+                session_key=self._session_key,
+                tool_use_id=tool_use_id,
+                requested=resolution.requested,
+                tool=resolution.resolved,
+                rules=list(resolution.rules),
+            )
+        return resolution.resolved
+
+    def _coerce_tool_arguments(self, tool_name: str, arguments: Any) -> Any:
+        """Apply the lossless argument repairs dispatch would apply, up front.
+
+        Uses the schema of the tool definition sent with the request, so the
+        persisted ``tool_use`` input, replayed history and dispatch all carry
+        the value that actually runs. Rejection stays in dispatch: arguments
+        that do not fully validate are returned unchanged.
+        """
+        definition = self._tool_definition_by_name.get(tool_name)
+        if definition is None:
+            definition = next(
+                (item for item in self.tool_definitions if item.name == tool_name), None
+            )
+        schema = getattr(definition, "input_schema", None)
+        if schema is None or not isinstance(arguments, dict):
+            return arguments
+        from agentos.tools.argument_admission import coerce_tool_arguments
+
+        try:
+            coerced = coerce_tool_arguments(
+                getattr(schema, "properties", None) or {},
+                getattr(schema, "required", None) or [],
+                arguments,
+            )
+        except Exception:  # noqa: BLE001 - dispatch still validates the call
+            return arguments
+        return arguments if coerced is None else coerced
 
     async def _execute_tool(self, tc: ToolCall) -> ToolResult:
         """Dispatch a tool call to the registered handler."""
