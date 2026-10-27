@@ -1202,13 +1202,16 @@ async def _sessions_send_impl(params: dict | None, ctx: RpcContext) -> dict:
         or getattr(session, "queue_mode", None)
         or "followup"
     )
-    # Mid-turn steering: a plain ``steer`` message for a session whose turn is
-    # running goes to that turn (agentos.engine.steering) instead of
-    # interrupting it, and its user row is written where the turn takes it.
+    # Mid-turn steering: a plain message the client explicitly sends with
+    # ``queueMode: "steer"`` while the session's turn runs goes to that turn
+    # (agentos.engine.steering) instead of interrupting it, and its user row
+    # is written where the turn takes it. The session's default queue mode
+    # (also ``steer``) keeps its old meaning, interrupt, so a client that does
+    # not ask for steering sees no change.
     steer_running_turn = _steers_running_turn(
         task_runtime,
         key,
-        requested_mode=requested_mode,
+        requested_mode=params.get("queueMode") or params.get("queue_mode"),
         has_attachments=bool(raw_attachments),
         no_memory_capture=bool(capture_controls["no_memory_capture"]),
     )

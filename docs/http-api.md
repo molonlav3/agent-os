@@ -436,9 +436,10 @@ before relying on it.
   through_stream_seq, text, text_truncated?, plan?, events?}` for the running
   turn. It is capped at 256 KiB, filled in that order of priority; text is cut
   from the front. `through_stream_seq` is the stream position it covers.
-- **`mid-turn-steering`** — a `chat.send` / `sessions.send` with
-  `queueMode: "steer"` (the default session queue mode) while the session's
-  turn runs joins that turn instead of cancelling it. The turn takes one
+- **`mid-turn-steering`** — a `chat.send` / `sessions.send` with an explicit
+  `queueMode: "steer"` while the session's turn runs joins that turn instead
+  of cancelling it (without `queueMode` the session's default still replaces
+  the running turn, as before). The turn takes one
   waiting message per checkpoint: before starting the next call of an ordered
   tool sequence (calls not started get a "skipped" tool result), after a tool
   batch (the message follows the tool results), and when the model would end

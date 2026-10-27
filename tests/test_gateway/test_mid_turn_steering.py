@@ -221,3 +221,21 @@ async def test_steer_into_a_turn_that_checks_no_queue_still_interrupts(tmp_path:
     assert second["queue_mode"] == "interrupt"
     assert stopped.status == AgentTaskStatus.CANCELLED
     assert rows == ["first", "replace it"]
+
+
+async def test_send_without_an_explicit_steer_keeps_the_old_default(tmp_path: Path) -> None:
+    """The session default (``steer``) still interrupts; only an explicit ask steers."""
+    runner = SteerableRunner()
+    async with turn_rig(tmp_path, runner) as rig:
+        first = await _send(rig, "first")
+        await asyncio.wait_for(runner.started.wait(), timeout=3)
+        second = await _send(rig, "plain message")
+        await wait_for(lambda: len(runner.calls) == 2)
+        runner.release.set()
+        await rig.runtime.wait(second["task_id"], timeout=3)
+        stopped = await rig.runtime.status(first["task_id"])
+
+    assert second["queue_mode"] == "interrupt"
+    assert stopped.status == AgentTaskStatus.CANCELLED
+    assert runner.steered == []
+    assert runner.calls[1][0] == "plain message"

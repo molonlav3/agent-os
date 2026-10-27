@@ -7,9 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
-- Gateway: mid-turn steering. A `chat.send` / `sessions.send` in `steer` mode
-  (the session default) while the session's turn runs no longer cancels that
-  turn: the turn takes the message at its next checkpoint. Calls of an
+- Gateway: mid-turn steering. A `chat.send` / `sessions.send` that asks for
+  `queueMode: "steer"` while the session's turn runs no longer cancels that
+  turn: the turn takes the message at its next checkpoint. Sends without an
+  explicit `queueMode` behave as before. Calls of an
   ordered tool sequence that have not started get a "skipped" result, the
   message is added after the tool results before the next model call, and a
   turn about to end continues with it. Its user row is written where the turn
