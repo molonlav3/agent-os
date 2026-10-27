@@ -15,7 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   modified by the compacted tool calls are appended by the engine, merged
   across compactions and capped, so the model can neither drop nor invent
   them. Applies to the in-turn, the proactive (between-turns) and the manual
-  (`/compact`, `sessions.compact`) compaction.
+  (`/compact`, `sessions.compact`) compaction. A manual compaction revises
+  the newest stored summary and replaces it in replay, instead of adding a
+  second summary that knows nothing of the first.
 
 ## [2026.10.27] - 2026-10-27
 
