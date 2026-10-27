@@ -137,6 +137,18 @@ def _stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _summary_to_revise(summaries: list[SessionSummary]) -> SessionSummary | None:
+    """The newest durable summary, which a manual compaction revises.
+
+    Only a summary with a compaction id can be superseded in replay (the new
+    summary names it), so one without is left to replay on its own.
+    """
+    for summary in reversed(summaries):
+        if summary.summary_text.strip():
+            return summary if summary.compaction_id else None
+    return None
+
+
 def _compaction_entry_payloads(entries: list[TranscriptEntry]) -> list[dict[str, Any]]:
     return [
         {
@@ -1084,12 +1096,17 @@ class SessionManager:
         token_count: int | None = None,
         provenance: dict[str, Any] | None = None,
         provider_messages: dict[str, Any] | None = None,
+        replaces_message_id: str | None = None,
     ) -> TranscriptEntry:
         """Append a message to the session transcript and touch updated_at.
 
         *provider_messages* is the structured record of the provider-facing
         messages an assistant turn appended (``agentos.engine.transcript``);
         it is stored on assistant rows only.
+
+        *replaces_message_id* names a row this one supersedes (the turn's
+        in-progress row, see :meth:`write_turn_progress`); it is removed in
+        the same transaction as the insert.
         """
         session_key = canonicalize_session_key(session_key)
         node = await self._storage.get_session(session_key)
@@ -1122,7 +1139,14 @@ class SessionManager:
         # Pass the epoch we read from the node so storage can perform an
         # atomic INSERT WHERE epoch=? guard against concurrent resets.
         expected_epoch = node.epoch if node.epoch is not None else 0
-        await self._storage.append_transcript_entry(entry, expected_epoch=expected_epoch)
+        if replaces_message_id:
+            await self._storage.append_transcript_entry(
+                entry,
+                expected_epoch=expected_epoch,
+                replaces_message_id=replaces_message_id,
+            )
+        else:
+            await self._storage.append_transcript_entry(entry, expected_epoch=expected_epoch)
 
         node.updated_at = _now_ms()
         if token_count and turn_usage is None:
@@ -1133,6 +1157,44 @@ class SessionManager:
         if self._memory_sync_notify is not None:
             byte_count = len(content.encode("utf-8")) if content else 0
             self._memory_sync_notify(byte_count)
+        return entry
+
+    async def write_turn_progress(
+        self,
+        session_key: str,
+        *,
+        message_id: str,
+        tool_calls: list[dict[str, Any]] | None,
+        provider_messages: dict[str, Any],
+    ) -> TranscriptEntry:
+        """Persist (or replace) the in-progress row of a running turn.
+
+        A turn writes one such row after its tool calls are issued and again
+        after their results are in; each write replaces the previous one
+        (same *message_id*) atomically, and the turn's final row replaces it
+        in turn (``append_message(replaces_message_id=...)``). The row carries
+        no text and no usage: readers looking for "the last reply" skip it,
+        and usage is rolled up once, by the final row.
+        """
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        entry = TranscriptEntry(
+            session_id=node.session_id,
+            session_key=session_key,
+            message_id=message_id,
+            role="assistant",
+            content="",
+            tool_calls=tool_calls,
+            provider_messages=provider_messages,
+        )
+        expected_epoch = node.epoch if node.epoch is not None else 0
+        await self._storage.append_transcript_entry(
+            entry,
+            expected_epoch=expected_epoch,
+            replaces_message_id=message_id,
+        )
         return entry
 
     async def remove_message(self, session_key: str, message_id: str) -> bool:
@@ -1436,6 +1498,7 @@ class SessionManager:
             entries = await self._storage.get_transcript(node.session_id)
             preimage = _transcript_preimage(entries)
             raw = _compaction_entry_payloads(entries)
+            previous = _summary_to_revise(await self._storage.get_all_summaries(node.session_id))
 
         result = await compact_context(
             CompactionRequest(
@@ -1444,6 +1507,13 @@ class SessionManager:
                 context_window_tokens=context_window_tokens,
                 config=config or CompactionConfig(),
                 custom_instructions=custom_instructions,
+                previous_summary=previous.summary_text if previous else None,
+                previous_compaction_id=previous.compaction_id if previous else None,
+                previous_summary_payload=(
+                    dict(previous.summary_payload)
+                    if previous is not None and isinstance(previous.summary_payload, dict)
+                    else None
+                ),
             )
         )
 
