@@ -57,6 +57,9 @@ class SteeringMessage:
     text: str
     message_id: str | None = None
     task_id: str | None = None
+    #: The sender asked that the message not reach memory capture; the turn
+    #: that takes it then skips capture.
+    no_memory_capture: bool = False
 
 
 class SteeringSource(Protocol):
@@ -145,7 +148,12 @@ async def take_steering(
     turn_messages.append(Message(role="user", content=taken.text))
     if taken.message_id:
         steered_entry_ids.append(taken.message_id)
-    return SteeringEvent(text=taken.text, message_id=taken.message_id, task_id=taken.task_id)
+    return SteeringEvent(
+        text=taken.text,
+        message_id=taken.message_id,
+        task_id=taken.task_id,
+        no_memory_capture=taken.no_memory_capture,
+    )
 
 
 class BatchSteeringCheckpoint:
