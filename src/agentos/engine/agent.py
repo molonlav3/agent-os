@@ -35,6 +35,7 @@ from agentos.engine.progress_watchdog import (
     guidance_for,
     tool_call_signature,
 )
+from agentos.engine.repetition_guard import RepetitionTrip, StreamRepetitionGuard, kept_text
 from agentos.engine.session_sanitize import (
     sanitize_session_messages,
     session_payload_chars,
@@ -144,6 +145,7 @@ from .types import (
     CompactionOutcome,
     DoneEvent,
     ErrorEvent,
+    RepetitionStopEvent,
     RunHeartbeatEvent,
     StateChangeEvent,
     TextDeltaEvent,
@@ -180,6 +182,13 @@ _PROVIDER_PAUSE_TURN_RESUME_PROMPT = (
 # response as the end of the turn.
 _MAX_PAUSE_TURN_RESUMES = 3
 _PROVIDER_REFUSAL_REPLY = "The model declined to respond to this request."
+_REPETITION_CONTINUE_PROMPT = (
+    "The previous response started repeating the same output over and over, so it was "
+    "stopped and the repeated part was removed. Continue the task from where the kept text "
+    "ends. Do not repeat anything already written; if nothing new remains, finish with a "
+    "short conclusion. If a tool call was dropped, issue it again in full."
+)
+_REPETITION_STOPPED_REPLY = "The model kept repeating the same output, so the response was stopped."
 # CompactionService outcomes that leave the transcript untouched because
 # compacting would not help this turn; not retried at the same size.
 _COMPACTION_DECLINE_REASONS = frozenset(
@@ -445,6 +454,8 @@ class _ProviderAttemptKind(StrEnum):
     REFUSAL = "refusal"
     # The provider paused a long-running turn and expects it to be resumed.
     PAUSE_TURN = "pause_turn"
+    # The engine cut a response that degenerated into repeated output.
+    REPETITION = "repetition_detected"
 
 
 class _IterationStreamTimeoutError(TimeoutError):
@@ -494,6 +505,7 @@ class _ProviderRetryPolicy:
                 _ProviderAttemptKind.MALFORMED_EMPTY: 1,
                 _ProviderAttemptKind.STREAM_INCOMPLETE: 1,
                 _ProviderAttemptKind.LENGTH_CAPPED: length_capped_continuations,
+                _ProviderAttemptKind.REPETITION: 1,
             },
             provider_failure_budgets={ProviderFailureKind.EMPTY_RESPONSE: 1},
         )
@@ -1902,24 +1914,35 @@ class Agent:
 
                     _got_done_event = False
                     attempt_user_visible_emitted = False
+                    repetition_guard = (
+                        StreamRepetitionGuard(self.config.repetition_guard)
+                        if self.config.repetition_guard.enabled
+                        else None
+                    )
+                    repetition_trip: RepetitionTrip | None = None
                     try:
                         raw_stream = self.provider.chat(
                             request_messages,
                             tools=provider_tools_for_call,
                             config=call_chat_cfg,
                         )
-                        async for raw_ev in self.turn_timing.provider_stream(
-                            self._stream_provider_events_with_deadline(
-                                raw_stream,
-                                loop=_loop,
-                                total_deadline=_total_deadline,
-                            )
-                        ):
+                        deadline_stream = self._stream_provider_events_with_deadline(
+                            raw_stream,
+                            loop=_loop,
+                            total_deadline=_total_deadline,
+                        )
+                        timed_stream = self.turn_timing.provider_stream(deadline_stream)
+                        async for raw_ev in timed_stream:
                             if isinstance(raw_ev, ProviderTextDelta):
                                 assistant_text_parts.append(raw_ev.text)
                                 if raw_ev.text:
                                     attempt_user_visible_emitted = True
                                 yield TextDeltaEvent(text=raw_ev.text)
+                                if repetition_guard is not None and repetition_guard.feed_text(
+                                    raw_ev.text
+                                ):
+                                    repetition_trip = repetition_guard.trip
+                                    break
 
                             elif isinstance(raw_ev, ProviderThinkingDelta):
                                 # Reasoning is display-only: never mixed into the
@@ -1930,6 +1953,11 @@ class Agent:
                                 ):
                                     _thinking_shown_attempt = _call_attempt
                                     yield ThinkingEvent(text=raw_ev.text)
+                                if repetition_guard is not None and repetition_guard.feed_reasoning(
+                                    raw_ev.text
+                                ):
+                                    repetition_trip = repetition_guard.trip
+                                    break
 
                             elif isinstance(raw_ev, ProviderToolUseStart):
                                 if not tools_supported_for_call:
@@ -2115,6 +2143,11 @@ class Agent:
                         )
                         yield terminal_error
                         break
+                    if repetition_trip is not None:
+                        # Stop paying for tokens: close every layer of the
+                        # stream now instead of leaving it to the GC.
+                        for stream_layer in (timed_stream, deadline_stream, raw_stream):
+                            await self._close_provider_stream(stream_layer)
 
                     call_duration_ms = int((time.monotonic() - call_started_at) * 1000)
                     response_payload = {
@@ -2133,6 +2166,15 @@ class Agent:
                         ],
                         "got_done_event": _got_done_event,
                     }
+                    if repetition_trip is not None:
+                        response_payload["repetition"] = {
+                            "stop_reason": StopReason.REPETITION.value,
+                            "channel": repetition_trip.channel,
+                            "signal": repetition_trip.signal,
+                            "period": repetition_trip.period,
+                            "repeats": repetition_trip.repeats,
+                            "checked_chars": repetition_trip.checked_chars,
+                        }
                     if provider_done_for_log is not None:
                         response_payload["usage"] = {
                             "stop_reason": provider_done_for_log.stop_reason,
@@ -2168,6 +2210,94 @@ class Agent:
                         else:
                             yield self._transition(AgentState.ERROR)
                             yield terminal_error
+                        break
+                    if repetition_trip is not None:
+                        # Keep the text up to the first repeated copy and drop
+                        # every tool call the cut response started: it has no
+                        # done event, so its calls are never safe to run.
+                        raw_response_text = "".join(assistant_text_parts)
+                        kept_response_text = (
+                            kept_text(raw_response_text, repetition_trip)
+                            if repetition_trip.channel == "text"
+                            else raw_response_text
+                        )
+                        dropped_tool_calls = len(tool_calls) + len(pending_tools)
+                        assistant_text_parts = [kept_response_text] if kept_response_text else []
+                        tool_calls = []
+                        pending_tools = {}
+                        repetition_continue = _retry_policy.can_retry_attempt(
+                            _ProviderAttemptKind.REPETITION,
+                            _attempt_retries_used,
+                        )
+                        logger.warning(
+                            "provider.repetition_detected",
+                            session_key=self._session_key,
+                            model=last_actual_model or self.config.model_id or "",
+                            provider=type(self.provider).__name__,
+                            iteration=iterations,
+                            call_attempt=_call_attempt,
+                            channel=repetition_trip.channel,
+                            signal=repetition_trip.signal,
+                            period=repetition_trip.period,
+                            repeats=repetition_trip.repeats,
+                            checked_chars=repetition_trip.checked_chars,
+                            kept_chars=len(kept_response_text),
+                            removed_chars=len(raw_response_text) - len(kept_response_text),
+                            dropped_tool_calls=dropped_tool_calls,
+                            action="continue" if repetition_continue else "stop",
+                        )
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action=(
+                                "continue_after_repetition"
+                                if repetition_continue
+                                else "stop_repetitive_response"
+                            ),
+                            reason="repetition_detected",
+                            code="repetition_detected",
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                            channel=repetition_trip.channel,
+                            signal=repetition_trip.signal,
+                            dropped_tool_calls=dropped_tool_calls,
+                        )
+                        yield RepetitionStopEvent(
+                            channel=repetition_trip.channel,
+                            signal=repetition_trip.signal,
+                            period=repetition_trip.period,
+                            removed_text=raw_response_text[len(kept_response_text) :],
+                        )
+                        if repetition_continue:
+                            _attempt_retries_used[_ProviderAttemptKind.REPETITION] += 1
+                            visible_text = _append_length_capped_continuation(
+                                turn_messages,
+                                response_text=kept_response_text,
+                                tool_calls=[],
+                                prompt=_REPETITION_CONTINUE_PROMPT,
+                            )
+                            if visible_text:
+                                final_text_parts.append(visible_text)
+                            yield WarningEvent(
+                                code="repetition_detected",
+                                message=(
+                                    "The response started repeating itself, so it was "
+                                    "stopped; continuing once."
+                                ),
+                            )
+                            _thinking_shown_attempt = None
+                            _call_attempt += 1
+                            continue
+                        yield self._transition(AgentState.ERROR)
+                        yield WarningEvent(
+                            code="repetition_detected",
+                            message="The response kept repeating itself, so it was stopped.",
+                        )
+                        turn_stop_reason = StopReason.REPETITION.value
+                        terminal_error = ErrorEvent(
+                            message=_REPETITION_STOPPED_REPLY,
+                            code="repetition_detected",
+                        )
+                        yield terminal_error
                         break
                     response_text = "".join(assistant_text_parts)
                     if ignored_post_delivery_tool_use and not response_text.strip():

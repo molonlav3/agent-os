@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- Engine: a repetition guard stops a streamed response that degenerates into
+  the same line, paragraph or short phrase over and over, instead of letting it
+  run to `max_tokens`. It watches the visible text and the reasoning
+  separately, starts checking at 16k characters and reads only the last 64k on
+  a growing schedule, so its cost stays bounded. On a trip the provider stream
+  is closed, the text is kept up to the first repeated copy, tool calls the cut
+  response started are dropped, and the response is continued once (like an
+  output-limit cut); a second loop ends the turn with `repetition_detected`.
+  Tune or disable it under `[llm.repetition_guard]`.
+
 ## [2026.10.27] - 2026-10-27
 
 ### Added
