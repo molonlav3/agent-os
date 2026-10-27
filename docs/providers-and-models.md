@@ -339,8 +339,12 @@ min_coverage = 0.5
 agentos config set llm.repetition_guard.enabled false
 ```
 
-Usage for a cut response is not reported by the provider (the stream ends
-before its usage event), so its tokens are missing from the turn totals.
+A cut response never reaches the provider's usage event, so AgentOS counts an
+estimate for it instead: input from the request-size estimate, output from the
+length of the text and reasoning it streamed (about four characters per
+token). The estimate feeds the turn totals, the session usage and the
+`max_turn_input_tokens` / `max_turn_output_tokens` budgets; with no
+provider-billed figure the turn's cost is the pricing-table estimate.
 
 ## Provider Troubleshooting
 

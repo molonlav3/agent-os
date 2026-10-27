@@ -346,3 +346,81 @@ async def test_turn_runner_reads_guard_settings_from_config() -> None:
     assert not any(
         event.kind == "warning" and event.code == "repetition_detected" for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_cut_response_counts_estimated_usage() -> None:
+    from agentos.engine.usage import UsageTracker
+
+    provider = _Provider([_looping_text(), _finish()])
+    usage = UsageTracker()
+    agent = Agent(
+        provider=provider,
+        config=_config(),
+        usage_tracker=usage,
+        session_key="agent:test:repetition-usage",
+    )
+
+    events = [event async for event in agent.run_turn("check the logs")]
+
+    streamed = "".join(
+        event.text
+        for event in events[: next(i for i, e in enumerate(events) if e.kind == "repetition_stop")]
+        if event.kind == "text_delta"
+    )
+    estimated_output = len(streamed) // 4
+    done = next(event for event in events if event.kind == "done")
+    # The finishing call reported 12 in / 5 out; the cut call is an estimate.
+    assert done.output_tokens == estimated_output + 5
+    assert done.input_tokens > 12
+    tracked = usage.get("agent:test:repetition-usage")
+    assert tracked is not None
+    assert tracked.output_tokens == estimated_output + 5
+    assert tracked.input_tokens == done.input_tokens
+
+
+@pytest.mark.asyncio
+async def test_cut_response_usage_counts_toward_turn_budgets() -> None:
+    provider = _Provider([_looping_text(), _finish()])
+    agent = Agent(provider=provider, config=_config(max_turn_output_tokens=1_000))
+
+    events = [event async for event in agent.run_turn("check the logs")]
+
+    # The cut call's estimated output (~4k tokens) is over budget, so the turn
+    # stops instead of paying for a continuation.
+    assert len(provider.calls) == 1
+    errors = [event.code for event in events if event.kind == "error"]
+    assert errors == ["turn_output_token_budget_exceeded"]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_loop_usage_counts_reasoning_tokens() -> None:
+    events: list[Any] = [
+        ProviderThinking(text="Wait, maybe the cache is stale. ") for _ in range(3_000)
+    ]
+    events.append(ProviderDone(stop_reason="stop", input_tokens=10, output_tokens=30_000))
+    provider = _Provider([events, _finish("The cache was stale.")])
+    agent = Agent(provider=provider, config=_config())
+
+    out = [event async for event in agent.run_turn("why is it slow?")]
+
+    done = next(event for event in out if event.kind == "done")
+    assert done.reasoning_tokens > 3_000
+    assert done.output_tokens == done.reasoning_tokens + 5
+
+
+@pytest.mark.asyncio
+async def test_subagent_result_drops_the_cut_loop() -> None:
+    from agentos.engine.subagent import SubagentManager, SubagentSpec
+
+    provider = _Provider([_looping_text(), _finish()])
+    manager = SubagentManager()
+
+    handle = await manager.spawn(
+        SubagentSpec(task="check the logs"),
+        agent_factory=lambda spec, depth: Agent(provider=provider, config=_config()),
+    )
+    result = await handle.task
+
+    assert result.count("check the configuration file again") == 1
+    assert result.endswith("All checks passed.")

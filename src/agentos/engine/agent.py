@@ -1920,6 +1920,7 @@ class Agent:
                         else None
                     )
                     repetition_trip: RepetitionTrip | None = None
+                    attempt_reasoning_parts: list[str] = []
                     try:
                         raw_stream = self.provider.chat(
                             request_messages,
@@ -1953,6 +1954,7 @@ class Agent:
                                 ):
                                     _thinking_shown_attempt = _call_attempt
                                     yield ThinkingEvent(text=raw_ev.text)
+                                attempt_reasoning_parts.append(raw_ev.text)
                                 if repetition_guard is not None and repetition_guard.feed_reasoning(
                                     raw_ev.text
                                 ):
@@ -2148,6 +2150,36 @@ class Agent:
                         # stream now instead of leaving it to the GC.
                         for stream_layer in (timed_stream, deadline_stream, raw_stream):
                             await self._close_provider_stream(stream_layer)
+                        # The provider never sent its usage event, but the call
+                        # was billed: count an estimate so turn totals, cost and
+                        # token budgets do not undercount it.
+                        cut_reasoning_tokens = get_approx_tokens("".join(attempt_reasoning_parts))
+                        provider_done_for_log = ProviderDoneEvent(
+                            stop_reason=StopReason.REPETITION,
+                            input_tokens=max(0, int(estimated_context_tokens)),
+                            output_tokens=(
+                                get_approx_tokens("".join(assistant_text_parts))
+                                + cut_reasoning_tokens
+                            ),
+                            reasoning_tokens=cut_reasoning_tokens,
+                            model=last_actual_model or self.config.model_id or "",
+                            usage_estimated=True,
+                        )
+                        iter_input_tokens = provider_done_for_log.input_tokens
+                        iter_output_tokens = provider_done_for_log.output_tokens
+                        iter_reasoning_tokens = cut_reasoning_tokens
+                        total_input_tokens += iter_input_tokens
+                        total_output_tokens += iter_output_tokens
+                        total_reasoning_tokens += cut_reasoning_tokens
+                        if self._usage_tracker and self._session_key:
+                            metadata = provider_metadata(self.provider)
+                            self._usage_tracker.add(
+                                self._session_key,
+                                input_tokens=iter_input_tokens,
+                                output_tokens=iter_output_tokens,
+                                model_id=provider_done_for_log.model,
+                                provider_id=(metadata.provider_kind or metadata.provider_name),
+                            )
 
                     call_duration_ms = int((time.monotonic() - call_started_at) * 1000)
                     response_payload = {

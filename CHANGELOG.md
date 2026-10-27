@@ -15,7 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   is closed, the text is kept up to the first repeated copy, tool calls the cut
   response started are dropped, and the response is continued once (like an
   output-limit cut); a second loop ends the turn with `repetition_detected`.
-  Tune or disable it under `[llm.repetition_guard]`.
+  The cut call's usage is counted as an estimate (request-size estimate in,
+  streamed text and reasoning out), so turn totals and token budgets include
+  it. Tune or disable it under `[llm.repetition_guard]`.
 
 ## [2026.10.27] - 2026-10-27
 
