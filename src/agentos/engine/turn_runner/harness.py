@@ -440,6 +440,8 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
         return _AgentConfigAuxiliaries(
             thinking=thinking,
             parallel_tool_calls=runner._resolve_parallel_tool_calls(),
+            loop_guard=runner._resolve_loop_guard(),
+            repetition_guard=runner._resolve_repetition_guard(),
             tool_result_store_dir=str(media_root_from_config(runner._config) / "tool-results"),
             tool_result_store_session_id=session_id_for_log or session_key,
             tool_result_projection_max_inline_chars=getattr(
@@ -903,6 +905,7 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
         provider_messages: dict[str, Any] | None = None,
+        replaces_message_id: str | None = None,
     ) -> bool:
         session_manager = self._runner._session_manager
         if session_manager is None:
@@ -924,6 +927,10 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
             session_manager.append_message, "provider_messages"
         ):
             append_kwargs["provider_messages"] = provider_messages
+        if replaces_message_id is not None and accepts_keyword_arg(
+            session_manager.append_message, "replaces_message_id"
+        ):
+            append_kwargs["replaces_message_id"] = replaces_message_id
         await self._runner._append_session_message(session_key, **append_kwargs)
         return True
 

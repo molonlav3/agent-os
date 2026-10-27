@@ -33,8 +33,10 @@ _PARTIAL_CODES = frozenset(
         "max_iterations",
         "output_truncated",
         "provider_output_truncated",
+        "repetition_detected",
         "turn_tool_error_budget_exceeded",
         "tool_failure_loop_exhausted",
+        "loop_detected",
     }
 )
 _INTERRUPTED_CODES = frozenset(

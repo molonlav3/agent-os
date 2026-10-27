@@ -26,12 +26,13 @@ from .error_body import read_bounded_body, summarize_error_body
 from .openrouter_attribution import openrouter_app_headers
 from .protocol import ProviderConnectionConfig, ProviderMetadata
 from .reasoning import ThinkTagStreamSplitter
+from .replay import prepare_replay, provenance_for_provider
 from .request_proof import (
     ProviderRequestBudgetExceededError,
     prove_provider_payload_from_env,
 )
 from .retry_after import retry_after_from_response
-from .text_tool_protocol import parse_text_tool_calls
+from .text_tool_protocol import promote_text_tool_calls
 from .transport import (
     PooledHttpClient,
     StreamIdleTimeoutError,
@@ -62,14 +63,6 @@ from .types import (
 
 _OPENAI_API_BASE = "https://api.openai.com"
 log = structlog.get_logger(__name__)
-_PLAIN_JSON_TOOL_CALL_RE = re.compile(
-    r"^\s*([A-Za-z_][A-Za-z0-9_.:-]*)\s*(\{.*\})\s*$",
-    re.DOTALL,
-)
-_PLAIN_JSON_TOOL_PREFIX_RE = re.compile(
-    r"([A-Za-z_][A-Za-z0-9_.:-]*)\s*(?=\{)",
-)
-
 _OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS = 4000
 
 
@@ -252,56 +245,6 @@ def _resolve_llm_proxy(proxy: str | None) -> str | None:
     if proxy is None:
         return os.environ.get("AGENTOS_LLM_PROXY", "").strip() or None
     return proxy.strip() or None
-
-
-def _parse_exact_plain_json_tool_call(text: str) -> tuple[str, dict[str, Any]] | None:
-    """Parse a bare ``tool_name{...}`` assistant text response."""
-    candidates = [text]
-    non_empty_lines = [line for line in text.splitlines() if line.strip()]
-    if non_empty_lines:
-        last_line = non_empty_lines[-1]
-        if last_line != text:
-            candidates.append(last_line)
-
-    match = None
-    for candidate in candidates:
-        match = _PLAIN_JSON_TOOL_CALL_RE.match(candidate)
-        if match:
-            break
-    if match is None:
-        return None
-
-    try:
-        arguments = json.loads(match.group(2))
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(arguments, dict):
-        return None
-    return match.group(1), arguments
-
-
-def _parse_trailing_plain_json_tool_call(text: str) -> tuple[str, dict[str, Any]] | None:
-    """Parse a trailing ``tool_name{...}``, allowing prose before it."""
-    decoder = json.JSONDecoder()
-    for match in reversed(list(_PLAIN_JSON_TOOL_PREFIX_RE.finditer(text))):
-        try:
-            arguments, end = decoder.raw_decode(text, match.end())
-        except json.JSONDecodeError:
-            continue
-        if text[end:].strip():
-            continue
-        if not isinstance(arguments, dict):
-            continue
-        return match.group(1), arguments
-    return None
-
-
-def _parse_plain_json_tool_call(text: str) -> tuple[str, dict[str, Any]] | None:
-    """Parse a text response ending in ``tool_name{...}``."""
-    exact_call = _parse_exact_plain_json_tool_call(text)
-    if exact_call is not None:
-        return exact_call
-    return _parse_trailing_plain_json_tool_call(text)
 
 
 def _extract_thought_signature(tc: Mapping[str, Any]) -> str | None:
@@ -642,59 +585,40 @@ def _synthesize_text_tool_events(
     full_text: str,
     tools: list[ToolDefinition] | None,
 ) -> list[ToolUseStartEvent | ToolUseEndEvent]:
+    """Tool-use events for a reply that wrote its tool calls as text.
+
+    The format table and the promotion rules live in ``text_tool_protocol``;
+    ``engine.tool_text_compat`` hides exactly what is promoted here, so
+    markup is either run or left visible, never silently dropped.
+    """
     if not tools or not full_text:
         return []
-
+    promotion = promote_text_tool_calls(
+        full_text,
+        {tool.name for tool in tools},
+        schemas={tool.name: tool.input_schema.properties for tool in tools},
+    )
+    if promotion is None:
+        return []
+    prefix = "text_protocol" if promotion.source == "markup" else "text_compat"
     events: list[ToolUseStartEvent | ToolUseEndEvent] = []
-    allowed_tool_names = {tool.name for tool in tools}
-    # Any wrapper engine.tool_text_compat hides from the user must also be
-    # executed here, so detection rides on the <invoke> block itself rather
-    # than on the wrapper around it.
-    for text_call in parse_text_tool_calls(full_text):
-        if text_call.name not in allowed_tool_names:
-            continue
-        tool_use_id = f"text_protocol_{uuid4().hex[:12]}"
+    for call in promotion.calls:
+        tool_use_id = f"{prefix}_{uuid4().hex[:12]}"
         events.append(
             ToolUseStartEvent(
                 tool_use_id=tool_use_id,
-                tool_name=text_call.name,
+                tool_name=call.name,
                 synthetic_from_text=True,
             )
         )
         events.append(
             ToolUseEndEvent(
                 tool_use_id=tool_use_id,
-                tool_name=text_call.name,
-                arguments=dict(text_call.arguments),
+                tool_name=call.name,
+                arguments=dict(call.arguments),
                 synthetic_from_text=True,
             )
         )
-    # Fall back on whether anything was actually synthesized, not on whether
-    # any XML parsed: an <invoke> naming a tool this turn never offered must
-    # not swallow a genuine trailing plain-JSON call in the same reply.
-    if events:
-        return events
-
-    plain_call = _parse_plain_json_tool_call(full_text)
-    if plain_call is not None:
-        tool_name, arguments = plain_call
-        if tool_name in allowed_tool_names:
-            tool_use_id = f"text_compat_{uuid4().hex[:12]}"
-            events.append(
-                ToolUseStartEvent(
-                    tool_use_id=tool_use_id,
-                    tool_name=tool_name,
-                    synthetic_from_text=True,
-                )
-            )
-            events.append(
-                ToolUseEndEvent(
-                    tool_use_id=tool_use_id,
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    synthetic_from_text=True,
-                )
-            )
     return events
 
 
@@ -903,11 +827,15 @@ def _replayable_reasoning_details(
 ) -> list[dict[str, Any]] | None:
     """``details`` when every block was produced by ``model``'s family, else None.
 
-    A message does not record which model produced it, and a router or
-    ``/model`` switch can put a different family on the next request. Claude
-    signatures, OpenAI / Gemini encrypted reasoning are only valid for the
-    family that issued them, so the blocks are replayed all-or-nothing: the
-    sequence may not be reordered or partially edited. Details whose
+    A router or ``/model`` switch can put a different family on the next
+    request. Messages that record their origin are already stripped of
+    another model's reasoning by :func:`agentos.provider.replay.prepare_replay`;
+    this check covers what that cannot see: messages persisted before
+    provenance was recorded, and a routing model id (``openrouter/auto``)
+    that answers with a different family from one request to the next.
+    Claude signatures, OpenAI / Gemini encrypted reasoning are only valid for
+    the family that issued them, so the blocks are replayed all-or-nothing:
+    the sequence may not be reordered or partially edited. Details whose
     ``format`` names no known family (plain-text reasoning from GLM, DeepSeek,
     ...) are only replayed to a model that is also outside the known families.
     """
@@ -1217,6 +1145,9 @@ class OpenAIProvider:
                 openai_messages.append({"role": "system", "content": content_blocks})
             else:
                 openai_messages.append({"role": "system", "content": cfg.system})
+        # Messages another model produced lose their signed reasoning and get
+        # tool ids this API accepts; same-model history is sent unchanged.
+        messages = prepare_replay(messages, provenance_for_provider(self))
         for m in messages:
             openai_messages.extend(
                 _build_openai_messages(

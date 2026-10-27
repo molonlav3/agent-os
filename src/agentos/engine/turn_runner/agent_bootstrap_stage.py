@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from agentos.engine.repetition_guard import RepetitionGuardSettings
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
@@ -77,6 +79,10 @@ class _AgentConfigAuxiliaries:
     tool_result_store_retention_seconds: int
     # ``[tools] parallel_calls``
     parallel_tool_calls: bool = True
+    # ``[tools] loop_guard``
+    loop_guard: str = "enforce"
+    # ``[llm.repetition_guard]``; ``None`` keeps the AgentConfig default.
+    repetition_guard: RepetitionGuardSettings | None = None
 
 @dataclass(frozen=True)
 class _MemorySnapshotResult:
@@ -417,6 +423,8 @@ class AgentBootstrapStage:
             model_capabilities=catalog.capabilities,
             thinking=aux.thinking,
             parallel_tool_calls=aux.parallel_tool_calls,
+            loop_guard=aux.loop_guard,
+            repetition_guard=aux.repetition_guard or RepetitionGuardSettings(),
             tool_result_projection_max_inline_chars=(
                 aux.tool_result_projection_max_inline_chars
             ),

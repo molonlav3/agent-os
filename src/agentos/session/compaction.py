@@ -12,8 +12,10 @@ import structlog
 
 from agentos.provider.protocol import provider_connection_config
 from agentos.session.compaction_state import (
+    REVISES_COMPACTION_ID_KEY,
     build_structured_summary_from_text,
     extract_compaction_obligations,
+    merge_structured_payloads,
 )
 
 log = structlog.get_logger(__name__)
@@ -46,6 +48,15 @@ class CompactionRequest:
     context_window_tokens: int
     config: CompactionConfig = field(default_factory=CompactionConfig)
     custom_instructions: str | None = None
+    # The summary this compaction revises (it may end with the engine's file
+    # block, which is merged). Takes precedence over a ``__prev_summary__:``
+    # line in ``custom_instructions``, which can carry one line only.
+    previous_summary: str | None = None
+    # The durable summary row *previous_summary* came from. When the model
+    # revises it, the new summary records ``revises_compaction_id`` in its
+    # payload, and replay shows the new summary in place of the old one.
+    previous_compaction_id: str | None = None
+    previous_summary_payload: dict[str, Any] | None = None
 
 
 @dataclass
@@ -448,14 +459,6 @@ def _normalize_custom_instructions(custom_instructions: str | None) -> str:
     return normalized
 
 
-_COMPACTION_SYSTEM_PROMPT = (
-    "You are a conversation compactor. Summarize the conversation concisely, "
-    "preserving key facts, decisions, open questions, and action items. "
-    "Write in the same language as the conversation. "
-    "Focus on recent context over older history."
-)
-
-
 def _summarizer_provider(model: str, api_key: str, base_url: str) -> Any | None:
     """An OpenAI-compatible ``LLMProvider`` for a configured compaction model."""
     if not api_key:
@@ -482,29 +485,33 @@ async def call_compaction_llm(
     custom_instructions: str | None = None,
     *,
     provider: Any | None = None,
+    earlier_summary: str | None = None,
 ) -> str | None:
     """Summarize a conversation chunk through the ``LLMProvider`` abstraction.
+
+    Uses the engine's structured summary format (the same sections, request
+    shape and output bound as in-turn and proactive compaction); with
+    *earlier_summary* the model revises that summary instead of starting
+    over. *identifier_instruction* is the session's identifier policy (empty
+    for none).
 
     *provider* is the resolved provider of the session (preferred: its own
     protocol, auth, attribution and retries). Without one, an OpenAI-compatible
     provider is built from *api_key*/*base_url*/*model*. Returns ``None`` on
     any failure so the caller falls back to a deterministic digest.
     """
-    from agentos.engine.compaction_service import summarize_with_provider
+    from agentos.engine.compaction_service import summarize_structured_with_provider
 
     llm = provider if provider is not None else _summarizer_provider(model, api_key, base_url)
     if llm is None:
         return None
-    system = _COMPACTION_SYSTEM_PROMPT
-    if identifier_instruction:
-        system = f"{system}\n\n{identifier_instruction}"
-    summary = await summarize_with_provider(
+    summary = await summarize_structured_with_provider(
         llm,
         chunk_text,
+        earlier_summary=earlier_summary,
         timeout=timeout,
-        max_tokens=1024,
         custom_instructions=_normalize_custom_instructions(custom_instructions) or None,
-        system=system,
+        identifier_instruction=identifier_instruction,
     )
     if summary is None:
         log.warning("compaction.llm_call_failed", model=model)
@@ -601,10 +608,15 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     * **Turn-boundary cut**: the split point avoids orphaning an assistant tool
       call from its paired tool result.  The legacy path uses a pure
       token-budget split that may land mid-turn.
-    * **Previous-summary prefix**: if ``request.custom_instructions`` carries a
-      ``__prev_summary__:<text>`` marker the summary is prepended to the new
-      chunk summary so incremental context accumulates.  Normal custom
+    * **Previous summary**: ``request.previous_summary`` (or a one-line
+      ``__prev_summary__:<text>`` marker in ``request.custom_instructions``) is
+      the base the model revises; without a model summary it is prepended to
+      the digest so incremental context accumulates.  Normal custom
       instructions are unaffected.
+    * **Summary format**: the engine's structured sections, chunks revising
+      one summary in order, and the engine's list of files read and modified
+      (merged with the previous summary's) appended after the text -- the
+      same builder as in-turn and proactive compaction.
 
     Everything else (chunk splitting, LLM calls, fallback, token accounting)
     is identical to the legacy path so the eval gate can compare the two
@@ -620,7 +632,9 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     # as the first line.  Strip it before forwarding to ``_normalize_custom_instructions``.
     raw_ci = request.custom_instructions or ""
     prev_summary: str = ""
+    prev_from_marker = False
     if raw_ci.startswith("__prev_summary__:"):
+        prev_from_marker = True
         first_newline = raw_ci.find("\n")
         if first_newline == -1:
             prev_summary = raw_ci[len("__prev_summary__:") :]
@@ -629,6 +643,9 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             prev_summary = raw_ci[len("__prev_summary__:") : first_newline]
             raw_ci = raw_ci[first_newline + 1 :]
     custom_instructions = _normalize_custom_instructions(raw_ci or None)
+    if request.previous_summary:
+        prev_summary = request.previous_summary
+        prev_from_marker = False
 
     if not entries:
         return CompactionResult(
@@ -684,11 +701,27 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         _build_strict_identifier_instruction() if cfg.identifier_policy == "strict" else ""
     )
 
-    summaries: list[str] = []
+    from agentos.engine.compaction_files import (
+        attach_file_activity,
+        file_activity_from_entries,
+        merge_file_activity,
+        split_file_activity,
+    )
+
+    # The engine's file block of a previous summary is merged, never sent to
+    # the model, which revises only the text.
+    prev_summary, prev_files = split_file_activity(prev_summary)
+
+    # The chunks revise one summary in order (the first revises the previous
+    # summary); after the first failure the rest use the digest, so the
+    # model's summary never skips a chunk in the middle.
+    rolled: str | None = None
+    digests: list[str] = []
     llm_chunks = 0
     fallback_chunks = 0
+    llm_available = bool((cfg.api_key or cfg.provider is not None) and cfg.model)
     for chunk in chunks:
-        if (cfg.api_key or cfg.provider is not None) and cfg.model:
+        if llm_available and cfg.model:
             llm_result = await call_compaction_llm(
                 chunk_text=_format_chunk_for_llm(chunk),
                 identifier_instruction=id_instruction,
@@ -698,19 +731,33 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                 timeout=cfg.timeout_seconds,
                 custom_instructions=custom_instructions or None,
                 provider=cfg.provider,
+                earlier_summary=rolled if rolled is not None else (prev_summary or None),
             )
             if llm_result:
-                summaries.append(llm_result)
+                rolled, _ = split_file_activity(llm_result)
                 llm_chunks += 1
                 continue
-        summaries.append(_summarize_chunk_fallback(chunk, cfg.identifier_policy))
+            llm_available = False
+        digests.append(_summarize_chunk_fallback(chunk, cfg.identifier_policy))
         fallback_chunks += 1
 
-    merged = _merge_summaries(summaries)
+    merged = _merge_summaries(([rolled] if rolled is not None else []) + digests)
 
-    # Prepend previous summary when present (incremental accumulation).
-    if prev_summary:
+    # The new summary contains the previous one when the model revised it, or
+    # when a ``__prev_summary__`` marker asks for it to be carried as is.
+    # Otherwise (no model summary for a durable previous summary) the previous
+    # summary is left alone and keeps replaying on its own.
+    revised_previous = bool(prev_summary) and rolled is not None
+    carried_previous = bool(prev_summary) and rolled is None and prev_from_marker
+    if carried_previous:
         merged = f"[Previous context]\n{prev_summary}\n\n[New context]\n{merged}"
+    merged = attach_file_activity(
+        merged,
+        merge_file_activity(
+            prev_files if revised_previous or carried_previous else None,
+            file_activity_from_entries(to_compact),
+        ),
+    )
 
     tokens_after = _estimate_tokens(merged) + sum(_entry_tokens(e) for e in kept)
     if llm_chunks and fallback_chunks:
@@ -757,7 +804,17 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         llm_model=cfg.model or "fallback",
         summary_source=summary_source,
         prev_summary_chars=len(prev_summary),
+        revised_previous=revised_previous,
     )
+
+    summary_payload = structured_summary.model_dump(mode="json")
+    if revised_previous and request.previous_compaction_id:
+        # The revised summary replaces its predecessor in replay; carry the
+        # predecessor's engine-extracted facts so nothing is lost with it.
+        summary_payload = merge_structured_payloads(
+            request.previous_summary_payload, summary_payload
+        )
+        summary_payload[REVISES_COMPACTION_ID_KEY] = request.previous_compaction_id
 
     return CompactionResult(
         summary=merged,
@@ -768,7 +825,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         tokens_before=total_tokens,
         tokens_after=tokens_after,
         remaining_budget_tokens=max(window - tokens_after, 0),
-        summary_payload=structured_summary.model_dump(mode="json"),
+        summary_payload=summary_payload,
         summary_format="structured_v1",
         coverage_status=coverage.status,
         missing_obligations=coverage.missing_obligations,

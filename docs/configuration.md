@@ -508,6 +508,52 @@ instruction. To send nothing, as before:
 parallel_calls = false
 ```
 
+### Loop guard
+
+A model can get stuck calling the same tool with the same arguments and getting
+the same answer back, or going back and forth between two calls. Each of those
+calls succeeds, so nothing else stops the turn until its iteration budget runs
+out. The loop guard watches every turn for that and acts in two steps:
+
+1. **Warn.** Once a call has returned the same result three times, or two calls
+   have alternated six times, a short `[Loop check]` note is appended to that
+   tool result so the model reads it next to the output.
+2. **Block.** A call that has already returned the same result four times (or
+   that would stretch an alternation with no new results to eight calls) is not
+   run: every call of that batch gets a result saying it was not run and why,
+   and the model is asked to reassess. If the model proposes a repeat again in
+   the same turn, the turn ends with the error code `loop_detected` and a
+   message for the user.
+
+Only repeats that produce nothing new count: a call whose result changed (a log
+that grew, a file that was edited) starts over, and a successful file edit or
+command resets the count of every other call. Status polls (`process` poll/log,
+`*_status` tools, child-session status) get a much larger allowance before they
+are refused. The guard starts from zero on each new message, so asking for the
+same action again is never blocked by an earlier turn; the "same call failed
+again" streak (`tool_failure_loop_block_threshold`) resets on a new message too.
+
+To keep the old behaviour — decisions are only written to the turn call log:
+
+```toml
+[tools]
+loop_guard = "observe"   # default "enforce"
+```
+
+### Repetitive output guard
+
+A response that degenerates into the same line, paragraph or phrase over and
+over is cut after the first repeated copy, its provider stream is closed, and
+it is continued once; a second loop ends the turn with `repetition_detected`.
+On by default with conservative thresholds; see
+[Providers and Models — Repetitive Output Guard](providers-and-models.md#repetitive-output-guard)
+for how it decides. To turn it off:
+
+```toml
+[llm.repetition_guard]
+enabled = false
+```
+
 ## Prompt Cache Configuration
 
 Controls prompt prefix caching for LLM providers that support it (Anthropic, OpenAI, DeepSeek, OpenRouter, etc.):
@@ -1016,6 +1062,21 @@ estimate_calibration = true      # scale the size estimate by what providers rep
   0.7-1.25), so compaction does not fire early. Usage the provider marks as
   estimated and requests carrying images or documents are not counted. `estimate_calibration = false`
   uses the raw estimate.
+- **Summary format.** The summary has fixed sections: Goal, Constraints and
+  preferences, Done, In progress, Blocked, Key decisions, Next steps, and
+  Critical context (exact paths, commands, numbers and IDs). A later
+  compaction hands the previous summary to the summarizer as the base to
+  revise, so finished work stays under Done instead of being summarized away.
+  Below the model's text AgentOS appends the files the compacted tool calls
+  read (`read_file`, `read_spreadsheet`, `pdf`) and modified (`write_file`,
+  `edit_file`, `apply_patch`), merged with the previous summary's lists and
+  capped to the newest 20 of each. Shell commands are not parsed for paths.
+  The in-turn, the proactive and the manual (`/compact`, `sessions.compact`)
+  compaction all write this format. A manual compaction revises the newest
+  stored summary, and from then on only the revision is replayed, not the two
+  side by side; if its summarizer call fails, the earlier summary is kept and
+  replays on its own. Summaries stored before this behaviour existed replay
+  as they always did.
 - When the summarizer fails or times out, a deterministic digest bounded to an
   eighth of the context window is used instead, so a compaction still shrinks
   the history.
