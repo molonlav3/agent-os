@@ -23,6 +23,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   should run), and identical rejected calls still count toward the
   repeated-failure guard.
   `POST /api/v1/tools/invoke` answers such a call with `400 INVALID_REQUEST`.
+### Fixed
+- Engine: a turn's tool rounds are now durable while it runs. The turn keeps
+  one in-progress transcript row, rewritten when a round's calls are issued
+  and again when their results are in, and the final row replaces it in the
+  same transaction, so a finished turn still leaves exactly one row and its
+  usage is rolled up once. A crash or kill mid-turn no longer loses calls
+  that already ran (a trade, a sent message, a file write): they stay in
+  history, and `chat.history` shows them once the turn is no longer live.
+- Engine: a tool call without a recorded result is no longer deleted from
+  history together with the assistant text around it. It is kept and given an
+  error result saying its outcome is unknown and to check the current state
+  before repeating it; a real result that sits elsewhere in the same step is
+  moved next to its call.
+### Changed
+- Engine: the context compaction summary now has fixed sections (Goal,
+  Constraints and preferences, Done, In progress, Blocked, Key decisions,
+  Next steps, Critical context), and a later compaction revises the previous
+  summary instead of writing a new one; a long history split into chunks now
+  yields one revised summary rather than one per chunk. The files read and
+  modified by the compacted tool calls are appended by the engine, merged
+  across compactions and capped, so the model can neither drop nor invent
+  them. Applies to the in-turn, the proactive (between-turns) and the manual
+  (`/compact`, `sessions.compact`) compaction. A manual compaction revises
+  the newest stored summary and replaces it in replay, instead of adding a
+  second summary that knows nothing of the first.
+### Fixed
+- Provider: each assistant message now records the provider, model and API
+  family that produced it (stored in the transcript record; older rows read
+  as unknown). After a model switch (router tier, failover, `/model`), a
+  request to a different model no longer replays the previous model's signed
+  thinking, `redacted_thinking`, OpenRouter `reasoning_details` or Gemini
+  `thought_signature`, and tool-call ids are rewritten to the target API's
+  format (Anthropic charset, OpenAI 40 characters, Mistral nine
+  alphanumerics) with their tool results kept paired. Plain text and
+  `reasoning_content` stay. Replays to the same model, and history without
+  provenance, are sent unchanged.
 
 ## [2026.10.27] - 2026-10-27
 
