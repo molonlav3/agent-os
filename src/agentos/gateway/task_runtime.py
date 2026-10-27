@@ -32,9 +32,11 @@ import structlog
 
 from agentos.engine.outcome import completed_outcome, outcome_from_error
 from agentos.engine.steering import SteeringMessage, bind_steering
+from agentos.engine.turn_progress import TurnStopSignal, bind_turn_stop_signal
 from agentos.gateway.routing import RouteEnvelope, SourceKind
 from agentos.gateway.session_lifecycle import TaskLifecycleEvent, TaskLifecycleListener
 from agentos.gateway.terminal_events import TerminalPublications, runtime_terminal_frame
+from agentos.gateway.turn_recovery_route import route_snapshot
 from agentos.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
 from agentos.session.models import AgentTaskRecord, AgentTaskStatus
 from agentos.session.terminal_reply import (
@@ -99,10 +101,19 @@ TERMINAL_STATUSES = frozenset(
 #: coding-harness child spawned by ``sessions_spawn(runtime="acp")``.
 _CHILD_RUN_KINDS = frozenset({"subagent", "acp"})
 
+#: ``cancel_source`` of a task the gateway's own shutdown cancels.
+SHUTDOWN_CANCEL_SOURCE = "gateway_shutdown"
+#: ``terminal_reason`` of a turn a graceful shutdown or restart cut short.
+SHUTDOWN_INTERRUPTED_REASON = "shutdown_interrupted"
+
 TaskStreamEventSink = Callable[[Any], Awaitable[None]]
 #: Writes a deferred user message to the transcript; returns the stored text
 #: and the row's message id (see ``TaskRuntime.enqueue(deferred_input=...)``).
 DeferredUserInput = Callable[[], Awaitable[tuple[str, str | None]]]
+#: Task-ledger ``details`` key holding a deferred message's text until its
+#: user row is written: a crash before then must not lose the message
+#: (restart recovery writes the row, ``agentos.gateway.turn_recovery``).
+DEFERRED_USER_TEXT_KEY = "deferred_user_text"
 
 #: Queue mode of a message meant for the running turn (mid-turn steering).
 STEER_QUEUE_MODE = "steer"
@@ -243,6 +254,8 @@ class _RuntimeTask:
     queued_at_ms: int = field(default_factory=lambda: _epoch_time_ms())
     #: Set when a running turn's agent picked up the steering source.
     steering_attached: bool = False
+    #: Tells the turn a gateway shutdown is what cancels it.
+    stop_signal: TurnStopSignal = field(default_factory=TurnStopSignal)
 
 
 class _TaskSteeringSource:
@@ -492,6 +505,9 @@ class TaskRuntime:
         # One terminal stream frame per run, whichever path ends it.
         self._terminal_publications = TerminalPublications()
         self._finalizers: set[asyncio.Task[None]] = set()
+        # Told about every task as it is admitted (restart recovery cancels a
+        # pending resume when the user writes first). Called synchronously.
+        self._enqueue_listeners: builtins.list[Callable[[AgentTaskRecord], None]] = []
 
     def stop_admission(self) -> None:
         """Refuse every further :meth:`enqueue` until :meth:`resume_admission`."""
@@ -504,6 +520,10 @@ class TaskRuntime:
     @property
     def admitting(self) -> bool:
         return self._admitting
+
+    def add_enqueue_listener(self, listener: Callable[[AgentTaskRecord], None]) -> None:
+        """Call *listener* with each task record right after it is admitted."""
+        self._enqueue_listeners.append(listener)
 
     @property
     def terminal_publications(self) -> TerminalPublications:
@@ -586,10 +606,13 @@ class TaskRuntime:
                 "metadata": envelope.metadata,
                 "persisted_user_message_id": persisted_user_message_id,
                 "fresh_user_session": fresh_user_session,
+                # Who to answer, so a turn a restart cut short can be resumed.
+                "route": route_snapshot(envelope),
             },
         )
         if deferred_input is not None and isinstance(record.details, dict):
             record.details["deferred_user_message"] = True
+            record.details[DEFERRED_USER_TEXT_KEY] = message
         if idempotency_key and isinstance(record.details, dict):
             # On the task record, not the envelope: the cached envelope is
             # reused by later runtime sends, which must not inherit the key.
@@ -598,6 +621,11 @@ class TaskRuntime:
             if idempotency_fingerprint:
                 record.details["idempotency_fingerprint"] = idempotency_fingerprint
         await self._storage.create_agent_task(record)
+        for listener in builtins.list(self._enqueue_listeners):
+            try:
+                listener(record)
+            except Exception:  # noqa: BLE001 - a listener never blocks admission
+                log.debug("task_runtime.enqueue_listener_failed", exc_info=True)
         runtime_task = _RuntimeTask(
             task_id=record.task_id,
             envelope=envelope,
@@ -702,6 +730,7 @@ class TaskRuntime:
             for task in tasks:
                 task.cancel_requested = True
                 task.cancel_source = _clean_cancel_detail(source, "unknown")
+                task.stop_signal.shutdown = False
                 task.cancel_reason = _clean_cancel_detail(reason, "cancelled")
                 if task.asyncio_task is not None and not task.asyncio_task.done():
                     task.asyncio_task.cancel()
@@ -762,6 +791,11 @@ class TaskRuntime:
         """True while ``task_id`` is queued or running in this process."""
         task = self._tasks.get(task_id)
         return task is not None and task.status not in TERMINAL_STATUSES
+
+    def is_task_started(self, task_id: str) -> bool:
+        """True once ``task_id`` reached ``running`` in this process (and is not done)."""
+        task = self._tasks.get(task_id)
+        return task is not None and task.started and task.status not in TERMINAL_STATUSES
 
     def active_task_ids(self, session_key: str) -> builtins.list[str]:
         """Ids of the queued and running tasks of ``session_key``, oldest first."""
@@ -917,6 +951,8 @@ class TaskRuntime:
             return None
         candidate.message = text
         candidate.persisted_user_message_id = message_id
+        # _mark_terminal merges the ledger details: the text goes, the row
+        # id and the turn it joined are kept (_terminal_details_update).
         await self._mark_terminal(
             candidate,
             AgentTaskStatus.SUCCEEDED,
@@ -946,6 +982,25 @@ class TaskRuntime:
         text, message_id = await deferred()
         task.message = text
         task.persisted_user_message_id = message_id
+        await self._record_deferred_written(task)
+
+    async def _record_deferred_written(self, task: _RuntimeTask) -> None:
+        """The deferred row is in the transcript: drop its text from the ledger."""
+        try:
+            existing = await self._storage.get_agent_task(task.task_id)
+            current = getattr(existing, "details", None)
+            if not isinstance(current, dict) or DEFERRED_USER_TEXT_KEY not in current:
+                return
+            details = dict(current)
+            details.pop(DEFERRED_USER_TEXT_KEY, None)
+            details["persisted_user_message_id"] = task.persisted_user_message_id
+            await self._storage.update_agent_task(task.task_id, details=details)
+        except Exception:  # noqa: BLE001 - recovery double-checks the transcript
+            log.warning(
+                "task_runtime.deferred_ledger_update_failed",
+                task_id=task.task_id,
+                exc_info=True,
+            )
 
     async def shutdown(
         self,
@@ -983,6 +1038,11 @@ class TaskRuntime:
         ]
         if not tasks:
             return
+        # Before anything can cancel them: a graceful drain that times out
+        # cancels the remaining turns itself (``wait_for`` on the gather).
+        # Turns that finish during the drain are not affected; a user cancel
+        # meanwhile still counts as a cancel.
+        self._stamp_shutdown_interrupt()
 
         if graceful:
             # Phase 1: wait for all tasks to finish naturally.
@@ -1204,6 +1264,7 @@ class TaskRuntime:
             self._pinned_locks.pop(key, None)
 
     async def _execute(self, task: _RuntimeTask) -> None:
+        bind_turn_stop_signal(task.stop_signal)
         session_key = task.envelope.session_key
         write_lock = self._pin_lock(self._session_locks, session_key)
         execution_lock = self._pin_lock(self._session_execution_locks, session_key)
@@ -1295,6 +1356,21 @@ class TaskRuntime:
         except asyncio.CancelledError:
             if task.steered_into is not None and task.terminal_emitted:
                 # A running turn took this message; its task already ended.
+                return
+            if task.cancel_source == SHUTDOWN_CANCEL_SOURCE and not task.overflow_dropped:
+                # The gateway stopped under the turn: interrupted, not
+                # cancelled by anyone, so restart recovery can pick it up.
+                _emit_metric(
+                    "turn_cancellations_total",
+                    value=1,
+                    reason="shutdown",
+                    session_key=task.envelope.session_key,
+                )
+                await self._mark_terminal(
+                    task,
+                    AgentTaskStatus.ABANDONED,
+                    terminal_reason=SHUTDOWN_INTERRUPTED_REASON,
+                )
                 return
             reason = "overflow_drop" if task.overflow_dropped else "interrupt"
             terminal_reason = "dropped_by_overflow" if task.overflow_dropped else "cancelled"
@@ -1807,6 +1883,15 @@ class TaskRuntime:
                 exc_info=True,
             )
 
+    def _stamp_shutdown_interrupt(self) -> None:
+        """Tag every unfinished task as stopped by the gateway shutting down."""
+        for task in self._tasks.values():
+            if task.status in TERMINAL_STATUSES or task.cancel_requested:
+                continue
+            task.cancel_source = SHUTDOWN_CANCEL_SOURCE
+            task.cancel_reason = SHUTDOWN_INTERRUPTED_REASON
+            task.stop_signal.shutdown = True
+
     async def _mark_unfinished_abandoned(self) -> None:
         async with self._state_lock:
             unfinished = [
@@ -1901,6 +1986,15 @@ class TaskRuntime:
         existing = await self._storage.get_agent_task(task.task_id)
         current_details = getattr(existing, "details", None)
         details = dict(current_details) if isinstance(current_details, dict) else {}
+        if DEFERRED_USER_TEXT_KEY in details:
+            if task.persisted_user_message_id:
+                details.pop(DEFERRED_USER_TEXT_KEY, None)
+                details["persisted_user_message_id"] = task.persisted_user_message_id
+            elif status != AgentTaskStatus.ABANDONED:
+                # Withdrawn or dropped before it was written: nothing to keep.
+                details.pop(DEFERRED_USER_TEXT_KEY, None)
+        if task.steered_into is not None and terminal_reason == STEERED_TERMINAL_REASON:
+            details["steered_into"] = task.steered_into
         cancellation: dict[str, str] | None = None
         if status == AgentTaskStatus.CANCELLED:
             cancellation = {

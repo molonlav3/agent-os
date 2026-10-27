@@ -6,12 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-### Fixed
-- Engine: a tool batch runs in the model's order again. Shared (`parallel` /
-  `keyed`) calls queued behind every exclusive call, so in `[write, read,
-  read, write]` the second write ran before the two reads.
-
 ### Added
+- Gateway: turns a restart or crash cut short are resumed. A graceful
+  shutdown or restart marks the turns it cancels interrupted
+  (`shutdown_interrupted`, also when a safe drain runs out of time), and such
+  a turn keeps its in-progress transcript row instead of an `[interrupted]`
+  reply, so its progress is still readable; the startup sweep still marks a crashed
+  process's turns `process_restart`. After boot the gateway classifies each
+  such session from its transcript: nothing to do when the reply is already
+  there; a normal resume when the message was never answered or the last tool
+  round finished; a resume with read and status tools only when tool calls
+  have no recorded result (no shell, writes, trading, sends or approvals; the
+  user's next message gets every tool back). The resume is an internal
+  continuation turn whose reply reaches the session's web console or channel
+  chat as usual, at most three attempts per interrupted run (counted across
+  restarts), then a note in the session; 24 h maximum age; a new message
+  cancels a resume not yet started; cron, heartbeat, subagent and ACP turns
+  are excluded, and safe mode only reports. A turn that asked for the
+  restart itself (the `gateway` tool, a shell `agentos gateway restart` or
+  update, or the session the restart request came from) is only noted, so
+  it cannot restart the gateway again. `[task_runtime]
+  resume_interrupted_turns = false` only reports. `/ready` carries
+  `turn_recovery` counts and `agentos doctor` reports turns that were not
+  resumed.
 - Gateway: mid-turn steering. A `chat.send` / `sessions.send` that asks for
   `queueMode: "steer"` while the session's turn runs no longer cancels that
   turn: the turn takes the message at its next checkpoint. Sends without an
@@ -30,7 +47,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   oldest first); `chat.abort {taskId}` / `sessions.abort {taskId}` withdraws a
   queued message (`withdrawn: true`, removing a follow-up's already written
   user row) or stops just that running turn.
-### Added
 - Engine: a repetition guard stops a streamed response that degenerates into
   the same line, paragraph or short phrase over and over, instead of letting it
   run to `max_tokens`. It watches the visible text and the reasoning
@@ -42,16 +58,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   The cut call's usage is counted as an estimate (request-size estimate in,
   streamed text and reasoning out), so turn totals and token budgets include
   it. Tune or disable it under `[llm.repetition_guard]`.
-### Fixed
-- Engine: the progress watchdog now acts instead of only logging. When a tool
-  call keeps returning the same result, or two calls alternate with nothing
-  new, the model gets a `[Loop check]` note on that result; the next repeat is
-  answered with "not run" results instead of being executed, and a second one
-  in the same turn ends it with `loop_detected` and a message for the user.
-  Calls whose results change, and status polls, are not refused (polls get a
-  much larger allowance). The guard and the repeated-failure streak both reset
-  on every new message. `[tools] loop_guard = "observe"` restores log-only.
-### Added
 - Engine: when a reply ends by writing a tool call out as text (a JSON call in
   a code fence, ReAct `Action:` / `Action Input:` lines, an "I'll call
   `read_file`" line followed by the arguments, or tool markup that was not
@@ -66,51 +72,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   before. Retries show as `text_tool_call` in the decision log's
   `turn_policy_decision` entries and in the turn timing `retries` breakdown,
   with a `provider_text_tool_call_retry` warning.
-### Fixed
-- Engine, gateway: a message steered into a running turn now shows where it
-  came in. `chat.history` (web console, desktop app) shows the work done
-  before the message, then the message, then the work after it, instead of
-  the message above one assistant reply that also held the earlier work with
-  the texts run together; the live view splits the same way when
-  `session.event.steering` arrives, and a reload mid-turn lists the settled
-  part above the message while `in_flight_run.text` restarts at it. A message
-  taken when the model answered is put on record before the next model call,
-  so a crash during that call no longer loses the answer or reads the two
-  user rows as a fresh, unanswered input. `classify_transcript_tail` no longer
-  counts rows steered into the turn as trailing input, and now does count a
-  follow-up queued mid-turn that sorts before the rewritten in-progress row.
-- Provider: each assistant message now records the provider, model and API
-  family that produced it (stored in the transcript record; older rows read
-  as unknown). After a model switch (router tier, failover, `/model`), a
-  request to a different model no longer replays the previous model's signed
-  thinking, `redacted_thinking`, OpenRouter `reasoning_details` or Gemini
-  `thought_signature`, and tool-call ids are rewritten to the target API's
-  format (Anthropic charset, OpenAI 40 characters, Mistral nine
-  alphanumerics) with their tool results kept paired. Plain text and
-  `reasoning_content` stay. Replays to the same model, and history without
-  provenance, are sent unchanged.
+- Tools: a tool call whose name misses only by decoration resolves to the one
+  tool it means: a `functions.`/`tools.` prefix and a `:<n>` counter are
+  dropped, case is ignored and `/` reads as `_`. The match must be unique among
+  the tools the session can see; MCP tool names are only ever matched exactly.
+  The engine resolves the name as the call arrives, so concurrency, timeouts,
+  approvals, stream events and the saved `tool_use` block use the real name.
+- Tools: arguments are validated against the tool's schema before hooks,
+  policy and approvals. Lossless mistakes (`"5"` for an integer, `"true"` for
+  a boolean, a JSON-encoded string for an array or object) are coerced;
+  anything else is rejected with `ToolArgumentsRejected`, naming each failing
+  argument path and the expected type, instead of a generic type error from
+  the handler. Coerced values are what the transcript keeps and what the
+  next request replays. A rejection is marked retryable (a corrected call
+  should run), and identical rejected calls still count toward the
+  repeated-failure guard.
+  `POST /api/v1/tools/invoke` answers such a call with `400 INVALID_REQUEST`.
+
 ### Changed
-- Engine: the context compaction summary now has fixed sections (Goal,
-  Constraints and preferences, Done, In progress, Blocked, Key decisions,
-  Next steps, Critical context), and a later compaction revises the previous
-  summary instead of writing a new one; a long history split into chunks now
-  yields one revised summary rather than one per chunk. The files read and
-  modified by the compacted tool calls are appended by the engine, merged
-  across compactions and capped, so the model can neither drop nor invent
-  them. Applies to the in-turn, the proactive (between-turns) and the manual
-  (`/compact`, `sessions.compact`) compaction.
-- Engine: a turn's tool rounds are now durable while it runs. The turn keeps
-  one in-progress transcript row, rewritten when a round's calls are issued
-  and again when their results are in, and the final row replaces it in the
-  same transaction, so a finished turn still leaves exactly one row and its
-  usage is rolled up once. A crash or kill mid-turn no longer loses calls
-  that already ran (a trade, a sent message, a file write): they stay in
-  history, and `chat.history` shows them once the turn is no longer live.
-- Engine: a tool call without a recorded result is no longer deleted from
-  history together with the assistant text around it. It is kept and given an
-  error result saying its outcome is unknown and to check the current state
-  before repeating it; a real result that sits elsewhere in the same step is
-  moved next to its call.
 - Provider: tool calls a model writes as text are hidden from the user only
   when they actually run. One format table now drives both the stream guard
   and promotion, and covers `<invoke>` (bare or wrapped),
@@ -135,24 +114,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   shows such tags literally instead of letting the HTML sanitizer drop them.
   The non-call scaffold filters (`<details><summary>View areas around line`,
   `<effect_calls>`, `<angle brackets>`) are unchanged.
-### Added
-- Tools: a tool call whose name misses only by decoration resolves to the one
-  tool it means: a `functions.`/`tools.` prefix and a `:<n>` counter are
-  dropped, case is ignored and `/` reads as `_`. The match must be unique among
-  the tools the session can see; MCP tool names are only ever matched exactly.
-  The engine resolves the name as the call arrives, so concurrency, timeouts,
-  approvals, stream events and the saved `tool_use` block use the real name.
-- Tools: arguments are validated against the tool's schema before hooks,
-  policy and approvals. Lossless mistakes (`"5"` for an integer, `"true"` for
-  a boolean, a JSON-encoded string for an array or object) are coerced;
-  anything else is rejected with `ToolArgumentsRejected`, naming each failing
-  argument path and the expected type, instead of a generic type error from
-  the handler. Coerced values are what the transcript keeps and what the
-  next request replays. A rejection is marked retryable (a corrected call
-  should run), and identical rejected calls still count toward the
-  repeated-failure guard.
-  `POST /api/v1/tools/invoke` answers such a call with `400 INVALID_REQUEST`.
+- Engine: the context compaction summary now has fixed sections (Goal,
+  Constraints and preferences, Done, In progress, Blocked, Key decisions,
+  Next steps, Critical context), and a later compaction revises the previous
+  summary instead of writing a new one; a long history split into chunks now
+  yields one revised summary rather than one per chunk. The files read and
+  modified by the compacted tool calls are appended by the engine, merged
+  across compactions and capped, so the model can neither drop nor invent
+  them. Applies to the in-turn, the proactive (between-turns) and the manual
+  (`/compact`, `sessions.compact`) compaction. A manual compaction revises
+  the newest stored summary and replaces it in replay, instead of adding a
+  second summary that knows nothing of the first.
+
 ### Fixed
+- Engine: a tool batch runs in the model's order again. Shared (`parallel` /
+  `keyed`) calls queued behind every exclusive call, so in `[write, read,
+  read, write]` the second write ran before the two reads.
+- Engine: the progress watchdog now acts instead of only logging. When a tool
+  call keeps returning the same result, or two calls alternate with nothing
+  new, the model gets a `[Loop check]` note on that result; the next repeat is
+  answered with "not run" results instead of being executed, and a second one
+  in the same turn ends it with `loop_detected` and a message for the user.
+  Calls whose results change, and status polls, are not refused (polls get a
+  much larger allowance). The guard and the repeated-failure streak both reset
+  on every new message. `[tools] loop_guard = "observe"` restores log-only.
+- Gateway: restart recovery now resumes a turn that a message was steered
+  into before the crash. The steered message's task (ended `steered`) no
+  longer counts as newer work that supersedes the turn it joined, so the turn
+  is resumed and the model sees the message once, where it came in. A steer
+  message still waiting when the process died is no longer lost: its text is
+  kept on its task's ledger row until written, and recovery writes it after
+  the interrupted turn so the resumed turn answers it. The resume turn's own
+  input is now written to the transcript before it runs, so the history load
+  no longer drops the user's newest unanswered (or restored) message in its
+  place.
+- Engine, gateway: a message steered into a running turn now shows where it
+  came in. `chat.history` (web console, desktop app) shows the work done
+  before the message, then the message, then the work after it, instead of
+  the message above one assistant reply that also held the earlier work with
+  the texts run together; the live view splits the same way when
+  `session.event.steering` arrives, and a reload mid-turn lists the settled
+  part above the message while `in_flight_run.text` restarts at it. A message
+  taken when the model answered is put on record before the next model call,
+  so a crash during that call no longer loses the answer or reads the two
+  user rows as a fresh, unanswered input. `classify_transcript_tail` no longer
+  counts rows steered into the turn as trailing input, and now does count a
+  follow-up queued mid-turn that sorts before the rewritten in-progress row.
+- Provider: each assistant message now records the provider, model and API
+  family that produced it (stored in the transcript record; older rows read
+  as unknown). After a model switch (router tier, failover, `/model`), a
+  request to a different model no longer replays the previous model's signed
+  thinking, `redacted_thinking`, OpenRouter `reasoning_details` or Gemini
+  `thought_signature`, and tool-call ids are rewritten to the target API's
+  format (Anthropic charset, OpenAI 40 characters, Mistral nine
+  alphanumerics) with their tool results kept paired. Plain text and
+  `reasoning_content` stay. Replays to the same model, and history without
+  provenance, are sent unchanged.
 - Engine: a turn's tool rounds are now durable while it runs. The turn keeps
   one in-progress transcript row, rewritten when a round's calls are issued
   and again when their results are in, and the final row replaces it in the
@@ -165,29 +182,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   error result saying its outcome is unknown and to check the current state
   before repeating it; a real result that sits elsewhere in the same step is
   moved next to its call.
-### Changed
-- Engine: the context compaction summary now has fixed sections (Goal,
-  Constraints and preferences, Done, In progress, Blocked, Key decisions,
-  Next steps, Critical context), and a later compaction revises the previous
-  summary instead of writing a new one; a long history split into chunks now
-  yields one revised summary rather than one per chunk. The files read and
-  modified by the compacted tool calls are appended by the engine, merged
-  across compactions and capped, so the model can neither drop nor invent
-  them. Applies to the in-turn, the proactive (between-turns) and the manual
-  (`/compact`, `sessions.compact`) compaction. A manual compaction revises
-  the newest stored summary and replaces it in replay, instead of adding a
-  second summary that knows nothing of the first.
-### Fixed
-- Provider: each assistant message now records the provider, model and API
-  family that produced it (stored in the transcript record; older rows read
-  as unknown). After a model switch (router tier, failover, `/model`), a
-  request to a different model no longer replays the previous model's signed
-  thinking, `redacted_thinking`, OpenRouter `reasoning_details` or Gemini
-  `thought_signature`, and tool-call ids are rewritten to the target API's
-  format (Anthropic charset, OpenAI 40 characters, Mistral nine
-  alphanumerics) with their tool results kept paired. Plain text and
-  `reasoning_content` stay. Replays to the same model, and history without
-  provenance, are sent unchanged.
 
 ## [2026.10.27] - 2026-10-27
 
