@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- Tools: a tool call whose name misses only by decoration resolves to the one
+  tool it means: a `functions.`/`tools.` prefix and a `:<n>` counter are
+  dropped, case is ignored and `/` reads as `_`. The match must be unique among
+  the tools the session can see; MCP tool names are only ever matched exactly.
+- Tools: arguments are validated against the tool's schema before hooks,
+  policy and approvals. Lossless mistakes (`"5"` for an integer, `"true"` for
+  a boolean, a JSON-encoded string for an array or object) are coerced;
+  anything else is rejected with `ToolArgumentsRejected`, naming each failing
+  argument path and the expected type, instead of a generic type error from
+  the handler. Rejections count toward the repeated-failure guard.
+  `POST /api/v1/tools/invoke` answers such a call with `400 INVALID_REQUEST`.
+
 ## [2026.10.27] - 2026-10-27
 
 ### Added
